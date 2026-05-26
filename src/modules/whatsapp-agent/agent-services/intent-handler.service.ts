@@ -8,8 +8,15 @@ import { WhatsAppLogService } from '../logging/log.service';
 import { QuoteService } from '../../quote/service';
 import { CustomerService } from '../../customer/service';
 import { calculateTotals } from '../../docs/utils';
-import { formatPrice, normalizeText, stemTerm } from '../utils';
+import {
+	formatPrice,
+	normalizeText,
+	stemTerm,
+	PRODUCT_FAMILY_WORDS,
+	normalizeRagQuery,
+} from '../utils';
 import { SESSION_TTL_SECONDS, MAX_PRODUCT_RESULTS } from '../constants';
+import { RagDocService } from '../../rag-docs/service';
 import {
 	ProductListEntry,
 	CartItem,
@@ -63,9 +70,22 @@ export class IntentHandlerService {
 		private paymentLinkService: PaymentLinkService,
 		private customerService: CustomerService,
 		private logService: WhatsAppLogService,
+		private ragDocService: RagDocService,
 	) {}
 
 	handle = async (intent: string, ctx: IntentContext): Promise<string> => {
+		// Si el producto discutido vía RAG no está disponible y el cliente intenta comprarlo,
+		// redirigir al handler de afirmación para que informe que no hay stock + alternativas.
+		if (
+			ctx.session.outOfStockRagProductName &&
+			!ctx.session.selectedProduct &&
+			(intent === 'affirmation' ||
+				intent === 'select_product' ||
+				intent === 'product_followup')
+		) {
+			return this.handleIntentAffirmation(ctx);
+		}
+
 		if (intent === 'resumption') {
 			return this.handleIntentResumption(ctx);
 		} else if (intent === 'select_product') {
@@ -744,32 +764,273 @@ export class IntentHandlerService {
 					products: session.lastProductList?.length
 						? session.lastProductList
 						: undefined,
+					outOfStockProductName: session.outOfStockRagProductName,
 					currency,
 				})
 				.catch(() => 'Claro, ¿en qué le puedo ayudar?');
 		}
 	};
 
+	/**
+	 * Extrae palabras clave de producto del texto del usuario para el fallback de búsqueda
+	 * por título. Busca el primer término específico (longitud > 3, no en PRODUCT_FAMILY_WORDS)
+	 * que siga a una palabra de categoría (aceite, cera, etc.), saltando preposiciones cortas.
+	 * Ejemplo: "aceite de aguacate" → ["aguacate"]
+	 */
+	private extractProductTitleKeywords = (text: string): string[] => {
+		const words = normalizeText(text).split(/\s+/);
+		const keywords: string[] = [];
+		for (let i = 0; i < words.length - 1; i++) {
+			if (PRODUCT_FAMILY_WORDS.has(words[i])) {
+				for (let j = i + 1; j <= Math.min(i + 3, words.length - 1); j++) {
+					if (words[j].length > 3 && !PRODUCT_FAMILY_WORDS.has(words[j])) {
+						keywords.push(words[j]);
+						break;
+					}
+				}
+			}
+		}
+		return [...new Set(keywords)];
+	};
+
 	private handleIntentGeneralQuestion = async (
 		ctx: IntentContext,
 	): Promise<string> => {
-		const { text, isFirstInteraction } = ctx;
+		const { text, isFirstInteraction, session, countryInfo, aiSearchQuery } =
+			ctx;
+
+		// Detectar si el usuario está preguntando por un producto distinto al contexto de sesión.
+		// Si el mensaje menciona una palabra de categoría (aceite, cera…) junto a un cualificador
+		// específico que NO aparece en lastRagDocTitle, se excluye el contexto de sesión para
+		// evitar que el embedding quede sesgado hacia el producto anterior.
+		let includeSessionContext = Boolean(session.lastRagDocTitle);
+		if (includeSessionContext && session.lastRagDocTitle) {
+			const lastDocNorm = normalizeText(session.lastRagDocTitle);
+			const normalizedUserText = normalizeText(text);
+			if (
+				normalizedUserText.split(/\s+/).some(w => PRODUCT_FAMILY_WORDS.has(w))
+			) {
+				const lastDocSpecific = lastDocNorm
+					.split(/\s+/)
+					.filter(
+						w =>
+							w.length > 3 &&
+							!PRODUCT_FAMILY_WORDS.has(w) &&
+							!/^[a-z]{1,2}$/.test(w),
+					);
+				if (lastDocSpecific.length > 0) {
+					const userMentionsLastProduct = lastDocSpecific.some(w =>
+						normalizedUserText.includes(w),
+					);
+					if (!userMentionsLastProduct) {
+						includeSessionContext = false;
+						console.log(
+							`[RAG] Product switch detected — dropping session context for query: "${text}"`,
+						);
+					}
+				}
+			}
+		}
+
+		// Construir ragQuery: si hay contexto de sesión válido (mismo producto), enriquecer
+		// la búsqueda para resolver follow-ups cortos ("¿Qué certificaciones tiene?").
+		// Si se detectó cambio de producto, usar solo el texto del usuario.
+		const contextParts = includeSessionContext
+			? [
+					session.lastRagDocTitle,
+					session.lastSearchQuery,
+					session.lastBotMessage?.slice(0, 150),
+				].filter((s): s is string => Boolean(s))
+			: [];
+		const normalizedText = normalizeRagQuery(text);
+		// Si el clasificador resolvió el follow-up a una consulta concreta, usarla directo (sin ruido de contexto)
+		const ragQuery = aiSearchQuery
+			? normalizeRagQuery(aiSearchQuery)
+			: contextParts.length > 0
+				? `${contextParts.join(' ')} ${normalizedText}`
+				: normalizedText;
+
+		let ragContext: string | undefined;
+		let ragType: 'faq' | 'datasheet' | undefined;
+		let isFirstRagMention = false;
+		let ragBaseTitle = '';
+		// Umbral relajado para general_question: el intent classifier ya certificó que
+		// la pregunta es FAQ/política, no búsqueda de producto. Un umbral más bajo (0.50)
+		// cubre variaciones de vocabulario (ej: "empresas de mensajería" ≈ "transportadoras")
+		// sin riesgo de falsos positivos en búsqueda de catálogo.
+		const RAG_FAQ_THRESHOLD = 0.5;
+		try {
+			let ragResults = await this.ragDocService.search(
+				ragQuery,
+				undefined,
+				RAG_FAQ_THRESHOLD,
+			);
+
+			// Si la búsqueda con contexto no retorna resultados y el ragQuery fue enriquecido,
+			// reintentar con solo el texto del usuario. Esto cubre preguntas FAQ/generales en
+			// sesiones donde lastRagDocTitle/lastBotMessage diluyeron el embedding.
+			if (ragResults.length === 0 && ragQuery !== normalizedText) {
+				console.log(
+					`[RAG] Retrying with plain normalized text: "${normalizedText}"`,
+				);
+				ragResults = await this.ragDocService.search(
+					normalizedText,
+					undefined,
+					RAG_FAQ_THRESHOLD,
+				);
+			}
+
+			// Fallback FAQ-only con umbral relajado (0.38): seguro aquí porque el intent
+			// classifier ya descartó que sea búsqueda de producto. Cubre variaciones de
+			// vocabulario no capturadas por las paráfrasis (ej: "transportadoras" ≈ "mensajería").
+			if (ragResults.length === 0) {
+				console.log(
+					`[RAG] Retrying FAQ-only search with relaxed threshold: "${normalizedText}"`,
+				);
+				ragResults = await this.ragDocService.searchFaqs(normalizedText);
+			}
+
+			// Si la búsqueda semántica no retorna resultados, intentar fallback por título.
+			// Cubre documentos cuyo contenido está en otro idioma (ej: ficha técnica en inglés).
+			if (ragResults.length === 0) {
+				const titleKeywords = this.extractProductTitleKeywords(text);
+				if (titleKeywords.length > 0) {
+					ragResults = await this.ragDocService.searchByTitle(titleKeywords);
+				}
+			}
+
+			if (ragResults.length > 0) {
+				ragContext = this.ragDocService.formatContext(ragResults);
+				ragType = ragResults[0].type as 'faq' | 'datasheet';
+				// Detectar si es la primera vez que el bot usa esta ficha en la conversación
+				ragBaseTitle =
+					(ragResults[0] as { title?: string }).title?.replace(
+						/ \[\d+\/\d+\]$/,
+						'',
+					) ?? '';
+				// Verificar si el producto ya fue mencionado en el último mensaje del bot.
+				// Cubre el caso donde el primer turno no encontró RAG (sin datos), pero el bot
+				// respondió con conocimiento general mencionando el nombre del producto. En ese
+				// caso lastRagDocTitle quedó vacío, pero el producto ya es conocido en la conv.
+				const alreadyMentionedInLastMessage =
+					Boolean(ragBaseTitle) &&
+					Boolean(session.lastBotMessage) &&
+					ragBaseTitle
+						.split(/\s+/)
+						.filter(w => w.length > 4)
+						.some(w =>
+							session.lastBotMessage!.toLowerCase().includes(w.toLowerCase()),
+						);
+				isFirstRagMention =
+					Boolean(ragBaseTitle) &&
+					ragBaseTitle !== session.lastRagDocTitle &&
+					!alreadyMentionedInLastMessage;
+				if (ragBaseTitle) session.lastRagDocTitle = ragBaseTitle;
+
+				// Para resultados FAQ: forzar la plantilla sin preguntas de cierre (isFirstRagMention=false
+				// activa "PROHIBIDO ABSOLUTO: No añadas ninguna pregunta al final"), y limpiar la lista
+				// de productos obsoleta para que un "Sí" posterior no dispare productos no relacionados.
+				if (ragResults[0].type === 'faq') {
+					isFirstRagMention = false;
+					if (!session.cart?.length) {
+						session.lastProductList = undefined;
+					}
+				}
+			}
+		} catch (err) {
+			console.error('[RAG] Error searching documents:', err);
+		}
+
+		// Limpiar el título del documento RAG (ej: "F.T. ACEITE ESENCIAL... MFM", "...MMTRR") para
+		// obtener un nombre de producto usable en la búsqueda de BD.
+		// El regex acepta hasta 10 letras para cubrir brand codes largos como "MMTRR" (5 letras).
+		const cleanRagProductName = ragBaseTitle
+			.replace(/^F\.T\.\s*/i, '')
+			.replace(/\s+[A-Z]{2,10}$/, '')
+			.trim();
+		const ragProductToSearch = cleanRagProductName || ragBaseTitle;
+
+		// Cuando RAG identifica un producto, buscarlo también en la base de datos para
+		// poblar session.lastProductList y session.selectedProduct. Esto permite que en
+		// el siguiente turno ("Sí", "2 de 20 ml", etc.) el bot conozca las variantes y
+		// stock disponibles sin necesidad de hacer otra búsqueda.
+		if (
+			ragContext &&
+			ragBaseTitle &&
+			session.lastSearchQuery !== ragProductToSearch
+		) {
+			try {
+				const dbResult = await this.productSearchService.buildProductReply(
+					normalizeText(ragProductToSearch),
+					countryInfo,
+					ragProductToSearch,
+				);
+				if (dbResult.products.length > 0) {
+					session.lastProductList = dbResult.products;
+					session.remainingProductList = dbResult.remainingProducts;
+					session.awaitingMoreProducts = dbResult.remainingProducts.length > 0;
+					session.lastSearchQuery = ragProductToSearch;
+					if (countryInfo) session.lastCountryInfo = countryInfo;
+					if (dbResult.products.length === 1) {
+						session.selectedProduct = dbResult.products[0].name;
+					}
+					// Detectar si el producto buscado está sin stock o no aparece entre los resultados.
+					// Se guarda en sesión para que el handler de "Sí" lo informe al cliente.
+					if (dbResult.outOfStockProductName) {
+						session.outOfStockRagProductName = dbResult.outOfStockProductName;
+					} else {
+						const reqWords = normalizeText(ragProductToSearch)
+							.split(/\s+/)
+							.filter(w => w.length > 4);
+						const exactInList =
+							reqWords.length > 0 &&
+							dbResult.products.some(p => {
+								const pNorm = normalizeText(p.name);
+								return reqWords.every(w => pNorm.includes(w));
+							});
+						session.outOfStockRagProductName = exactInList
+							? undefined
+							: ragProductToSearch;
+					}
+					console.log(
+						`[RAG] DB product lookup for "${ragProductToSearch}": found ${dbResult.products.length} product(s)` +
+							(session.outOfStockRagProductName
+								? ` (not available: ${session.outOfStockRagProductName})`
+								: ''),
+					);
+				}
+			} catch (err) {
+				console.error('[RAG] Error looking up product in DB:', err);
+			}
+		}
+
 		return this.openai
 			.generateReply({
 				userMessage: text,
 				intent: 'general_question',
 				isFirstInteraction,
+				ragContext,
+				ragType,
+				lastBotMessage: session.lastBotMessage,
+				isFirstRagMention,
 			})
 			.catch(
 				() =>
-					'Para esa consulta le recomiendo hablar directamente con nuestro equipo. ¿Le ayudo con algo más?',
+					'No pude procesar esa consulta en este momento. ¿Le puedo ayudar con algo más del producto?',
 			);
 	};
 
 	private handleIntentProductFollowup = async (
 		ctx: IntentContext,
 	): Promise<string> => {
-		const { session, text, normalizedText, countryInfo, aiQuantity } = ctx;
+		const {
+			session,
+			text,
+			normalizedText,
+			countryInfo,
+			aiQuantity,
+			aiVariantHint,
+		} = ctx;
 		const selectedProductEntry = session.lastProductList?.find(
 			p => p.name === session.selectedProduct,
 		);
@@ -780,7 +1041,20 @@ export class IntentHandlerService {
 				? selectedProductEntry.variants.find(
 						v => v.name === session.selectedVariantName,
 					)
-				: undefined;
+				: selectedProductEntry && aiVariantHint
+					? (resolveVariant(
+							selectedProductEntry,
+							aiVariantHint,
+							normalizedText,
+						) ?? undefined)
+					: undefined;
+		if (
+			selectedProductEntry &&
+			sessionVariant &&
+			!session.selectedVariantName
+		) {
+			session.selectedVariantName = sessionVariant.name;
+		}
 		const productForReply =
 			selectedProductEntry && sessionVariant
 				? { ...selectedProductEntry, variants: [sessionVariant] }

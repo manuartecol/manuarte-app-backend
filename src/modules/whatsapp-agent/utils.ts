@@ -111,6 +111,71 @@ export const SYNONYMS: Record<string, string[]> = {
 	forma: ['molde'],
 };
 
+/**
+ * Normalizaciones de consultas RAG: variantes lexicales que los clientes usan para
+ * preguntar sobre temas de FAQ pero que el modelo de embeddings puntúa por debajo del
+ * umbral por diferencias lexicales (ej: "métodos de pago" vs "medios de pago").
+ * Cada entrada: [patrón regex, término canónico usado en los FAQ de BD].
+ */
+export const RAG_QUERY_NORMALIZATIONS: [RegExp, string][] = [
+	[/m[eé]todos?\s+de\s+pago/gi, 'medios de pago'],
+	[/formas?\s+de\s+pago/gi, 'medios de pago'],
+	[/m[eé]todos?\s+de\s+env[ií]o/gi, 'opciones de envío'],
+	[/formas?\s+de\s+env[ií]o/gi, 'opciones de envío'],
+	[/transportadoras?/gi, 'empresa de mensajería'],
+	[/courier/gi, 'empresa de mensajería'],
+	[/agencias?\s+de\s+transporte/gi, 'empresa de mensajería'],
+	[/empresas?\s+de\s+log[ií]stica/gi, 'empresa de mensajería'],
+	[/empresa(s)?\s+de\s+env[ií]os?/gi, 'empresa de mensajería'],
+	[
+		/con\s+qu[eé]\s+empresa(s)?\s+.{0,20}(env[ií]os?|pedidos?|despachos?)/gi,
+		'con cuáles empresas de mensajería realizan los despachos',
+	],
+	[/despachos?/gi, 'envío'],
+	[
+		/env[ií]o\s+gratis|env[ií]o\s+sin\s+costo|env[ií]o\s+gratuito/gi,
+		'costo de envío',
+	],
+	[/retirar|recoger.*tienda|retiro.*local/gi, 'recogida en tienda'],
+	[/domicilio/gi, 'envío a domicilio'],
+	[/factura\s+electr[oó]nica|facturaci[oó]n/gi, 'factura electrónica'],
+	[/garantia|garant[ií]a/gi, 'garantía de productos'],
+	[/devoluci[oó]n|cambio.*producto/gi, 'política de devoluciones'],
+];
+
+export function normalizeRagQuery(text: string): string {
+	let out = text;
+	for (const [re, rep] of RAG_QUERY_NORMALIZATIONS) out = out.replace(re, rep);
+	return out;
+}
+
+/**
+ * Palabras genéricas de categoría de producto (aceite, cera, manteca…) que no son
+ * identificadores únicos de un producto específico.
+ * Usadas para detectar cambios de producto en la búsqueda RAG.
+ */
+export const PRODUCT_FAMILY_WORDS = new Set([
+	'aceite',
+	'vegetal',
+	'esencial',
+	'mineral',
+	'natural',
+	'manteca',
+	'cera',
+	'pigmento',
+	'colorante',
+	'extracto',
+	'fragancia',
+	'jabon',
+	'crema',
+	'gel',
+	'base',
+	'emulsionante',
+	'conservante',
+	'polvo',
+	'liquido',
+]);
+
 export function formatPrice(price: string | null, currency: string): string {
 	if (!price) return 'precio no disponible';
 	const num = Number(price);

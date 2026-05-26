@@ -25,8 +25,7 @@ SALUDO INICIAL:
 - El cliente ya sabe a qué se dedica Manuarte.
 - Haz el saludo sencillo, sin detalles sobre productos o la tienda. Menciona tu nombre.
 - Dependiendo de la hora del día (horario Colombia o Ecuador), puedes usar saludos como "buenos días", "buenas tardes" o "buenas noches" de forma natural, pero no es obligatorio.
-- Varía el saludo cada vez. La pregunta final del saludo puede ser: "¿En qué le puedo ayudar?", "¿En qué le puedo ayudar el día de hoy?", "¿En qué puedo ayudarle?", o "¿En qué puedo ayudarle el día de hoy?".
-- No digas frases como "¿Qué producto o insumo estás buscando para la fabricación de velas o jabones?" ni variantes.
+- La pregunta final del saludo es SIEMPRE una de estas cuatro opciones, copia exacta sin ninguna variación: "¿En qué le puedo ayudar?", "¿En qué le puedo ayudar el día de hoy?", "¿En qué puedo ayudarle?", o "¿En qué puedo ayudarle el día de hoy?". PROHIBIDO usar cualquier otra pregunta diferente, reformulación o variante.
 - Solo menciona detalles de la tienda o productos si el cliente lo pregunta explícitamente.
 - Trata siempre al cliente de usted, no de tú.
 - CRÍTICO: el mensaje de saludo inicial es MUY CORTO. SOLO contiene: (1) saludo opcional con horario, (2) presentación como Gema si aplica, (3) UNA de las preguntas aprobadas. TERMINA AHÍ. No añadas NINGUNA frase guía, aclaración ni explicación adicional después de la pregunta.
@@ -50,7 +49,7 @@ REGLAS IMPORTANTES:
 COMPORTAMIENTO:
 - Siempre intenta entender qué necesita el cliente.
 - Da respuestas útiles, no solo informativas.
-- Después de responder, guía la conversación con una pregunta. EXCEPCIÓN: en el saludo inicial (primera vez que el cliente escribe), la pregunta de bienvenida ya es la pregunta de guía. NO añadas ninguna frase adicional después de esa pregunta.
+- Después de responder sobre productos o cotizaciones, guía con una frase que oriente al siguiente paso. EXCEPCIÓN: en el saludo inicial, la pregunta de bienvenida ya es suficiente, no añadas nada más. Para respuestas informativas (ubicación, envíos, costos, formas de pago, horarios, políticas, etc.), NUNCA termines con una pregunta — termina SOLO con una frase declarativa de disposición, y ÚNICAMENTE si el mensaje anterior de Gema no terminó con una; si ya hubo una, no añadas nada al final.
 - Adapta tus respuestas según lo que diga el cliente.
 
 CUANDO HAY PRODUCTOS:
@@ -206,6 +205,12 @@ export interface OpenAIContext {
 	knownCustomerName?: string;
 	/** true cuando el bot ya nombró al cliente en el primer show_cart de esta sesión */
 	hasShownCartByName?: boolean;
+	/** Contexto externo recuperado por el sistema RAG (fichas técnicas, FAQs, etc.) */
+	ragContext?: string;
+	/** Tipo del documento RAG encontrado: 'faq' para preguntas frecuentes, 'datasheet' para fichas técnicas */
+	ragType?: 'faq' | 'datasheet';
+	/** true cuando el RAG devuelve un documento que no se había mencionado antes en la conversación */
+	isFirstRagMention?: boolean;
 }
 
 export type AIDetectedIntent =
@@ -265,6 +270,14 @@ export class OpenAIService {
 		this.client = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
 	}
 
+	getEmbedding = async (text: string): Promise<number[]> => {
+		const response = await this.client.embeddings.create({
+			model: 'text-embedding-3-small',
+			input: text,
+		});
+		return response.data[0].embedding;
+	};
+
 	generateReply = async (ctx: OpenAIContext): Promise<string> => {
 		const userContent = this.buildUserContent(ctx);
 
@@ -288,9 +301,10 @@ export class OpenAIService {
 		awaitingMoreProducts?: boolean,
 		currentSelectedProduct?: string,
 		cart?: OpenAICartItem[],
+		lastBotMessage?: string,
 	): Promise<AIIntentResult> => {
 		const selectedProductNote = currentSelectedProduct
-			? `\nNota: el cliente tiene actualmente seleccionado el producto "${currentSelectedProduct}". Si el mensaje menciona EXPLÍCITAMENTE el nombre de otro producto de la lista, clasifícalo como "select_product". Si el mensaje es SOLO un número sin más contexto, probablemente es una cantidad para el producto ya seleccionado (clasifícalo como "unknown" con quantity).\n`
+			? `\nNota: el cliente tiene actualmente seleccionado el producto "${currentSelectedProduct}". Si el mensaje menciona EXPLÍCITAMENTE el nombre de otro producto de la lista, clasifícalo como "select_product". Si el mensaje es SOLO un número sin más contexto, o un número seguido de una presentación o tamaño (ej: "2 de 20 ml", "3 de 100 gramos", "1 de 30ml", "2 de 500 gr"), clasifícalo como "unknown" con quantity y variantHint con el tamaño/presentación si aplica.\n`
 			: '';
 		const productListSection =
 			activeProducts && activeProducts.length > 0
@@ -327,7 +341,10 @@ export class OpenAIService {
 				? `  - "show_more": el cliente pregunta si hay más opciones, más productos, más variantes, o pide ver más (incluyendo frases negativas como "¿no tienen más?", "¿no hay más?", "¿solo eso tienen?", "¿solo tienes esa?", "¿nada más?", "¿no tienes otra?"). IMPORTANTE: si el cliente dice "tienes más [nombre de producto]" (ej: "tienes más mechas"), clasifícalo como "search_product", no "show_more".\n`
 				: '';
 
-		const systemPrompt = `Eres un clasificador de intents para un chatbot de ventas.${selectedProductNote}${productListSection}${showMoreNote}${cartNote}
+		const contextNote = lastBotMessage
+			? `\nContexto: el último mensaje del bot fue: "${lastBotMessage.slice(0, 200)}". Si el mensaje del cliente es un seguimiento corto sin tema explícito (ej: "¿qué precio tiene?", "¿cuánto cuesta?"), resuélvelo en ese contexto. Para intent "general_question" en ese caso, incluye también "searchQuery" con la consulta concreta contextualizada (ej: bot habló de envíos + cliente pregunta "¿qué precio tiene?" → searchQuery: "costo de envío").\n`
+			: '';
+		const systemPrompt = `Eres un clasificador de intents para un chatbot de ventas.${selectedProductNote}${productListSection}${showMoreNote}${cartNote}${contextNote}
 Analiza el mensaje del cliente y devuelve un JSON con:
 - "intent": uno de estos valores exactos:
 ${selectionInstructions}${showMoreInstruction}  - "show_cart": el cliente pregunta por el resumen de su pedido, lo que lleva, el total, cuánto es todo, cuánto sería por todo, cuánto suma lo que lleva, o cualquier variante de solicitar el detalle o precio total de su pedido actual
@@ -337,7 +354,7 @@ ${selectionInstructions}${showMoreInstruction}  - "show_cart": el cliente pregun
   - "purchase_intent": el cliente dice que quiere comprar, pagar, finalizar su pedido o completar su compra (frases como "quiero comprar", "quiero pagar", "cómo pago", "cómo compro", "finalizar pedido", "completar la compra", "quiero proceder", "quiero el pedido", "quiero finalizarlo")
   - "objection": el cliente dice que está caro, que lo va a pensar, que después, que no tiene dinero, que no le interesa
   - "greeting": saludo puro sin consulta de producto ni pregunta específica
-  - "general_question": pregunta sobre envíos, métodos de pago, tiempo de entrega, políticas, u otras preguntas que no son sobre un producto específico en catálogo
+  - "general_question": pregunta sobre envíos, métodos de pago, tiempo de entrega, políticas, características o propiedades de un producto ya mencionado, u otras preguntas que no buscan un producto nuevo en catálogo. TAMBIÉN clasifica como "general_question" cuando el cliente responde con el uso o aplicación que quiere darle a un producto (ej: "fabricación de jabones", "para aromaterapia", "para hacer velas")
   - "unknown": no se puede clasificar con certeza
 ${activeProducts && activeProducts.length > 0 ? '- "selectionIndexes": array de números 1-based SOLO si intent es "select_product". Puede ser uno o varios. Ej: [1] o [1,3]\n- "variantHint": SOLO si intent es "select_product" y el producto elegido tiene múltiples variantes y el cliente menciona una variante específica. Extrae el fragmento del nombre de la variante mencionada. Ej: "quiero la apf" → variantHint: "apf"\n- "quantities": array de números SOLO si intent es "select_product" y el cliente menciona una cantidad distinta para cada producto. Misma longitud y orden que selectionIndexes. Ej: "3 de chicle y 2 de floral" con selectionIndexes:[2,3] → quantities:[3,2]. Si todos los productos tienen la misma cantidad o no hay cantidad, omite este campo y usa "quantity".\n' : ''}- "quantity": número entero SOLO si el cliente menciona UNA sola cantidad que aplica a todos los productos seleccionados, o a cualquier otro intent. Ej: "dame 5", "quiero 3 kilos" → quantity: 5 o 3. No usar junto a "quantities".
 - "removeProductHint": SOLO si intent es "edit_cart" Y el cliente pide EXPLÍCITAMENTE quitar/eliminar un producto (frases como "ya no quiero", "quita", "saca", "elimina", "sin"). NO usar si el cliente solo cambia la cantidad. CRÍTICO: si el mensaje contiene SOLO un verbo de eliminación sin intención de agregar otro producto, genera ÚNICAMENTE "removeProductHint" y NUNCA "addProductHint" para el mismo producto. Ej: "ya no quiero la mecha 8D" → removeProductHint: "mecha 8D" (sin addProductHint). "que sean mejor 2 kilos de ácido esteárico" → NO removeProductHint (solo addProductHint con la nueva cantidad).
@@ -345,7 +362,7 @@ ${activeProducts && activeProducts.length > 0 ? '- "selectionIndexes": array de 
 - "cartEdits": SOLO si intent es "edit_cart" Y el cliente modifica DOS O MÁS productos del carrito en un mismo mensaje. Array de objetos {productHint, quantity}. No usar junto con addProductHint. Ej: "deben ser 4 de jazmin y 4 de brisa marina" → cartEdits: [{"productHint":"jazmin","quantity":4},{"productHint":"brisa marina","quantity":4}]
 - "productList": SOLO si intent es "request_quote" Y el mensaje contiene una lista de dos o más productos con cantidades. Array de objetos {productHint, quantity, variantHint?, unit?}. "productHint" es el nombre descriptivo del producto (sin frases de contexto). "quantity" es el número entero pedido. "variantHint" es la presentación específica si aplica (ej: "20 ml", "100 gramos"). "unit" es la unidad de peso si la cantidad está en peso (ej: "kilos", "kg", "gramos"). Ej: "Cotizame 5 kilos de cera de palma, 3 fragancias de chicle de 20 ml y 7 mechas 8D" → productList: [{"productHint":"cera de palma","quantity":5,"unit":"kilos"},{"productHint":"fragancia chicle","quantity":3,"variantHint":"20 ml"},{"productHint":"mecha 8d","quantity":7}]
 - "variantHint": TAMBIÉN para intent "search_product", si el cliente menciona una presentación, tamaño o formato específico del producto buscado (ej: "20 ml", "100 gramos", "1 litro", "medio kilo"). Extrae SOLO el fragmento de tamaño/presentación. Ej: "3 fragancias de chicle de 20 ml" → variantHint: "20 ml", "2 fragancias lavanda de 100 gramos" → variantHint: "100 gramos". No incluir si no hay presentación específica.
-- "searchQuery": SOLO si intent es "search_product" Y el producto mencionado NO aparece en la lista activa. Extrae el nombre específico del producto incluyendo su descriptor propio (sabor, aroma, nombre de marca, tipo). Conserva "para velas" o "para jabones" si pueden ser parte del nombre del producto (hay productos exclusivos para uno u otro). Elimina SOLO frases de contexto de uso del cliente como "para hacer X", "para mis X", "para fabricar X", "para uso en X". Ejemplos: "fragancias para jabones" → "fragancia para jabones", "fragancia de chicle de 20 ml" → "fragancia chicle", "fragancia de lavanda para velas" → "fragancia lavanda para velas", "colorante para mis velas artesanales" → "colorante", "cera para hacer velas" → "cera", "3 kilos de cera de soya apf" → "cera soya apf".
+- "searchQuery": (A) SOLO si intent es "search_product" Y el producto mencionado NO aparece en la lista activa. (B) TAMBIÉN si intent es "general_question" Y el mensaje es un seguimiento corto ambiguo: extrae la consulta concreta contextualizada (ej: "costo de envío", "tiempo de entrega"). Extrae el nombre específico del producto incluyendo su descriptor propio (sabor, aroma, nombre de marca, tipo). Conserva "para velas" o "para jabones" si pueden ser parte del nombre del producto (hay productos exclusivos para uno u otro). Elimina SOLO frases de contexto de uso del cliente como "para hacer X", "para mis X", "para fabricar X", "para uso en X". Ejemplos: "fragancias para jabones" → "fragancia para jabones", "fragancia de chicle de 20 ml" → "fragancia chicle", "fragancia de lavanda para velas" → "fragancia lavanda para velas", "colorante para mis velas artesanales" → "colorante", "cera para hacer velas" → "cera", "3 kilos de cera de soya apf" → "cera soya apf".
 
 Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && activeProducts.length > 0 ? '\nEjemplos:\n{"intent":"select_product","selectionIndexes":[2]}\n{"intent":"select_product","selectionIndexes":[1,3]}\n{"intent":"select_product","selectionIndexes":[1],"quantity":5}\n{"intent":"select_product","selectionIndexes":[2],"variantHint":"apf","quantity":2}\n{"intent":"select_product","selectionIndexes":[1]}  // cliente dice "la tr plus" y el producto 1 contiene "TR PLUS" en su nombre\n{"intent":"select_product","selectionIndexes":[2,3],"quantities":[3,2]}  // cliente dice "3 de chicle y 2 de floral"\n{"intent":"edit_cart","removeProductHint":"mecha 8D"}  // SOLO removeProductHint cuando es eliminación pura, sin addProductHint\n{"intent":"edit_cart","addProductHint":"cera de coco","quantity":1}\n{"intent":"edit_cart","addProductHint":"fragancia chicle","quantity":5}  // "5 fragancia chicle" sin verbo, fragancia chicle está en el pedido\n{"intent":"edit_cart","addProductHint":"bases de glicerina white","quantity":4}  // "son 4 bases de glicerina white"\n{"intent":"edit_cart","cartEdits":[{"productHint":"jazmin","quantity":4},{"productHint":"brisa marina","quantity":4}]}\n{"intent":"search_product","searchQuery":"termometro","quantity":1}  // "1 termometro" cuando termometro no está en la lista\n{"intent":"unknown","quantity":3}' : '\nEjemplo: {"intent":"search_product","searchQuery":"cera de soja"}'}${awaitingMoreProducts ? '\n{"intent":"show_more"}' : ''}`;
 		const response = await this.client.chat.completions.create({
@@ -414,7 +431,8 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 		return {
 			intent,
 			searchQuery:
-				intent === 'search_product' && parsed.searchQuery
+				(intent === 'search_product' || intent === 'general_question') &&
+				parsed.searchQuery
 					? String(parsed.searchQuery)
 					: undefined,
 			selectionIndexes,
@@ -599,6 +617,18 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					.join('\n');
 				parts.push(
 					`\nProductos disponibles en la conversación actual (usa si son relevantes para continuar):\n${productList}`,
+				);
+				if (ctx.outOfStockProductName) {
+					parts.push(
+						`\nCRÍTICO: El cliente preguntó por "${ctx.outOfStockProductName}" pero NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. NO digas que sí lo tienes. PRIMERO di en UNA frase corta y natural que no lo tienes disponible, y LUEGO presenta la lista de alternativas disponibles sin ningún comentario adicional. Ejemplo: "La [nombre] no la tenemos disponible en este momento. Sí tenemos:"`,
+					);
+					parts.push(
+						'\nTermina con la pregunta "¿Desea llevar alguno de estos?" o una variación natural similar. NO uses "¿Cuál le interesa?" ni "¿Cuál desea llevar?" en este caso.',
+					);
+				}
+			} else if (ctx.outOfStockProductName) {
+				parts.push(
+					`\nCRÍTICO: El cliente preguntó por un producto que NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. Di en UNA frase corta y natural que no lo tienes disponible. Usa el nombre EXACTO del producto tal como está escrito aquí (sin cambiar mayúsculas ni reformatear): "${ctx.outOfStockProductName}". Termina con una pregunta simple como "¿Le puedo ayudar con algún otro producto?".`,
 				);
 			}
 		} else if (ctx.selectedProducts && ctx.selectedProducts.length > 1) {
@@ -879,11 +909,52 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					'Luego pregunta si necesita algo más de forma breve.',
 			);
 		} else if (ctx.intent === 'general_question') {
-			parts.push(
-				'\nEl cliente hace una pregunta general (envíos, pagos, tiempos de entrega, políticas, etc.).' +
-					'\nResponde de forma natural y breve. Si no tienes la información exacta, invita al cliente a contactar al equipo directamente.' +
-					'\nNunca inventes datos concretos como precios de envío, tiempos exactos o métodos de pago que no se te hayan proporcionado.',
-			);
+			if (ctx.lastBotMessage) {
+				parts.push(
+					`\nContexto conversacional — tu mensaje anterior al cliente fue: "${ctx.lastBotMessage}"`,
+				);
+			}
+			if (ctx.ragContext) {
+				const isFaq = ctx.ragType === 'faq';
+				const contextIntro = isFaq
+					? '\nEl cliente hace una pregunta sobre políticas, servicios o información del negocio.' +
+						' El siguiente contexto contiene la información VERÍDICA Y DEFINITIVA para responder.' +
+						' PROHIBIDO usar tu conocimiento general sobre la empresa (ubicación, datos de contacto, precios, etc.) ya que puede estar desactualizado o ser incorrecto:'
+					: '\nEl cliente hace una pregunta sobre un producto. Usa ÚNICAMENTE el siguiente contexto de ficha técnica para responder:';
+				parts.push(
+					contextIntro +
+						`\n\n${ctx.ragContext}` +
+						'\n\nInstrucciones:' +
+						(isFaq
+							? '\n- CRÍTICO: el texto del FAQ es solo tu FUENTE DE INFORMACIÓN, NO un guión. NUNCA lo copies ni lo parafrasees literalmente.' +
+								'\n- Reformula la respuesta con tus propias palabras, como Gema hablaría directamente en una conversación de WhatsApp.' +
+								'\n- Responde solo lo que el cliente preguntó — no incluyas toda la información del FAQ si parte de ella no es relevante para la pregunta concreta.' +
+								'\n- Usa frases cortas, lenguaje coloquial y tono cordial. Sin bullets ni listas a menos que el contenido lo requiera naturalmente.' +
+								'\n- CIERRE: si el mensaje anterior de Gema NO terminó con una frase de disposición, añade UNA frase declarativa corta al final. Si ya hubo una en el mensaje anterior, no añadas nada. NUNCA uses una pregunta. Varía la frase — nunca repitas la misma. Ejemplos: "Quedo a la orden si necesita algo más.", "Para lo que necesite.", "Aquí estamos.", "Cuente conmigo.", "Estoy a la orden.", "Lo que necesite, con gusto.", "Cualquier consulta, a la orden."'
+							: ctx.isFirstRagMention
+								? '\n- Es la primera vez que mencionas este producto en la conversación. Comienza la respuesta con "Nuestro [nombre del producto]..." para presentarlo de forma natural.' +
+									'\n- No hagas preguntas sobre el uso o la aplicación que el cliente quiere darle al producto. Si vas a guiar la conversación, termina con UNA SOLA pregunta orientada a la compra (ej: "¿Le interesa llevarlo?") o no hagas ninguna pregunta. PROHIBIDO hacer preguntas sobre usos, aplicaciones o características del producto.'
+								: '\n- Este producto ya fue mencionado antes en la conversación. Ve directo a la respuesta.' +
+									'\n- NO menciones el nombre del producto en ningún momento de la respuesta.') +
+						'\n- Responde de forma concisa y natural basándote únicamente en el contexto anterior.' +
+						'\n- Si la pregunta es de Sí/No (¿Contiene X? ¿Tiene Y? ¿Es Z?), responde de forma concisa incluyendo el Sí o No y elabora brevemente en base al contexto. Evita hacer listas largas de atributos que el producto no tiene.' +
+						'\n- Nunca inventes datos que no estén en el contexto proporcionado.',
+				);
+				if (!isFaq && !ctx.isFirstRagMention) {
+					parts.push(
+						'\nPROHIBIDO ABSOLUTO: No añadas ninguna pregunta al final de tu respuesta — ni de compra, ni de uso, ni de seguimiento, ni de ningún tipo. Termina la respuesta exactamente cuando hayas dado la información solicitada. Si el texto generado termina con "?", elimínalo y reescribe el final sin pregunta.',
+					);
+				}
+			} else {
+				parts.push(
+					'\nEl cliente hace una pregunta pero no hay información disponible en el contexto actual.' +
+						'\nResponde de forma natural e indica brevemente que no cuentas con esa información específica.' +
+						'\nOfrece ayuda con otro aspecto del producto o con otra consulta.' +
+						'\nNUNCA digas "revise la etiqueta", "consulte la etiqueta", "contacte a nuestro equipo", "contacte al equipo" ni variantes similares. El cliente está en el chat precisamente para obtener esa información.' +
+						'\nNunca inventes datos.' +
+						'\nNO hagas preguntas al final. ESTO SOBREESCRIBE la regla general de guiar la conversación con preguntas.',
+				);
+			}
 		} else if (ctx.intent === 'request_quote') {
 			parts.push(
 				'\nEl cliente quiere generar una cotización con lo que lleva en su pedido.' +

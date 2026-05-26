@@ -147,4 +147,8 @@ export interface UserSession {
 	hasIntroducedByName?: boolean;
 	/** true después de que el bot ya mencionó al cliente por nombre en el primer show_cart de esta sesión */
 	hasShownCartByName?: boolean;
+	/** Título base del documento RAG usado en el último turno. Se usa para detectar si el producto ya fue presentado. */
+	lastRagDocTitle?: string;
+	/** Nombre del producto RAG que no está disponible en stock (pero sí tiene alternativas). Se usa para informar al cliente cuando dice "Sí" en el siguiente turno. */
+	outOfStockRagProductName?: string;
 }

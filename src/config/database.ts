@@ -1,10 +1,11 @@
 import { Sequelize } from 'sequelize';
 import { ENV } from './env';
 
-const { DB_NAME, DB_USER, DB_PASSWORD, DB_HOST } = ENV;
+const { DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT } = ENV;
 
 export const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASSWORD, {
 	host: DB_HOST,
+	port: DB_PORT,
 	dialect: 'postgres',
 	pool: {
 		max: 5,

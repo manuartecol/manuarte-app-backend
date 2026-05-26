@@ -179,5 +179,7 @@ service_backup.js
 service_backup.js.map
 tmp_head_service.js
 tmp_head_service.js.map
+/docs
+/scripts
 
 # End of https://www.toptal.com/developers/gitignore/api/node,windows

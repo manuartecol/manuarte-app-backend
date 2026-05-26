@@ -46,6 +46,8 @@ import {
 	IntentHandlerService,
 	IntentContext,
 } from './agent-services/intent-handler.service';
+import { RagDocService } from '../rag-docs/service';
+import { RagDocModel } from '../rag-docs/model';
 
 export class WhatsAppAgentService {
 	private messageBuffer = new Map<string, BufferEntry>();
@@ -75,6 +77,7 @@ export class WhatsAppAgentService {
 	);
 	private mediaHandlerService!: MediaHandlerService;
 	private intentHandlerService!: IntentHandlerService;
+	private ragDocService = new RagDocService(RagDocModel, this.openai);
 
 	constructor() {
 		this.mediaHandlerService = new MediaHandlerService(
@@ -90,6 +93,7 @@ export class WhatsAppAgentService {
 			this.paymentLinkService,
 			this.customerService,
 			this.logService,
+			this.ragDocService,
 		);
 	}
 
@@ -1064,6 +1068,7 @@ export class WhatsAppAgentService {
 						session.awaitingMoreProducts,
 						session.selectedProduct,
 						session.cart,
+						session.lastBotMessage,
 					);
 
 					// unknown + producto activo → continuar conversación del producto

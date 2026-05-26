@@ -677,10 +677,17 @@ export class FlowsService {
 
 		// ── Paso 0: confirmar si procede desde la cotización existente ──
 		if (flow.step === 'awaiting_quote_confirmation') {
-			const isConfirm =
-				/^(si|sí|vale|ok|dale|claro|listo|perfecto|bueno|confirmo|de acuerdo|va|venga|correcto|todo bien|esta bien|nada|quiero|proceder|procede)\b/i.test(
+			// Los datos ya fueron confirmados en el flujo de cotización.
+			// Solo se aborta si el cliente rechaza explícitamente o pide una corrección.
+			const isExplicitRefusal =
+				/^(no\b|cancelar|cancela|no\s+quiero|no\s+gracias|olvidalo|dejalo|no\s+me)\b/i.test(
 					normalizedText.trim(),
 				);
+			const hasCorrectionRequest =
+				/\b(cambiar|cambio|cambia|corregir|corrige|modificar|modifica|pero|mal|error|falta|no es|en vez de|en lugar de|la cedula|el nombre|la direccion|el telefono)\b/i.test(
+					normalizedText,
+				);
+			const isConfirm = !isExplicitRefusal && !hasCorrectionRequest;
 
 			if (isConfirm) {
 				// Cargar items de la cotización
@@ -761,6 +768,29 @@ export class FlowsService {
 				);
 			} else {
 				// El cliente no quiere usar la cotización → iniciar flujo con datos nuevos
+				// Cargar ítems de la cotización antes de limpiar la referencia para que
+				// estén disponibles en el paso awaiting_confirmation (el carrito fue vaciado
+				// al generar la cotización y session.cart = [] en este punto).
+				if (flow.quoteSerial && (!flow.items || flow.items.length === 0)) {
+					const savedSerial = flow.quoteSerial;
+					const quoteResult = await this.quoteService.getOne(savedSerial);
+					if (quoteResult.status === 200 && quoteResult.quote) {
+						const quote = quoteResult.quote;
+						flow.items = (quote.quoteItems ?? []).map(
+							(qi: { name: string; quantity: number; price: number }) => ({
+								productId: '',
+								productName: qi.name,
+								quantity: qi.quantity,
+								unitPrice: String(qi.price),
+								currency,
+							}),
+						);
+						const { total } = calculateTotals(quote);
+						flow.total = total;
+						flow.currency = currency;
+					}
+				}
+
 				const localPhone = stripCallingCode(phoneNumber);
 				flow.purchaseFromQuote = false;
 				flow.quoteId = undefined;
