@@ -861,10 +861,16 @@ export class WhatsAppAgentService {
 				}
 			}
 
-			// Texto sin conjunción inicial ("y", "e") para matching de patrones.
+			// Texto sin conjunción inicial ("y", "e") ni verbo de acción inicial para matching de patrones.
 			// "y 5 kilos de easy soap white" → "5 kilos de easy soap white".
+			// "necesito 4 kilos de cera de palma" → "4 kilos de cera de palma".
 			// El normalizedText original se preserva para el llamado a la IA.
-			const patternText = normalizedText.replace(/^(?:y|e)\s+/i, '');
+			const patternText = normalizedText
+				.replace(/^(?:y|e)\s+/i, '')
+				.replace(
+					/^(?:dame|quiero|necesito|llevame|llevo|mandame|enviame|pon|ponme|agregar?)\s+/i,
+					'',
+				);
 
 			// Detección del patrón "[N] kilos/gramos de [producto]" como búsqueda de nuevo producto.
 			// Maneja mensajes como "y 5 kilos de easy soap white" (tras quitar la conjunción).
@@ -1171,6 +1177,30 @@ export class WhatsAppAgentService {
 			);
 			intent = 'search_product';
 			session.selectedProduct = undefined;
+			// Extraer nombre del producto: quitar verbo inicial + cantidad + unidad de peso
+			const extractedForSearch = normalizedText
+				.replace(
+					/^(?:dame|quiero|necesito|llevame|llevo|mandame|enviame|pon|ponme|agregar?)\s+/i,
+					'',
+				)
+				.replace(
+					/^\d+(?:[.,]\d+)?\s*(?:kilo[s]?|kg|gramo[s]?|gr|g\b)\s*(?:de\s+)?/i,
+					'',
+				)
+				.trim();
+			const cleanedForSearch = extractedForSearch
+				.split(/\s+/)
+				.filter(w => w.length > 1)
+				.join(' ');
+			if (cleanedForSearch) aiSearchQuery = cleanedForSearch;
+			// Si la IA no retornó quantity (habitual en request_quote sin productList), extraerla del texto
+			if (aiQuantity === undefined) {
+				const qtyMatch = normalizedText.match(/\b(\d+)\b/);
+				if (qtyMatch) {
+					const n = parseInt(qtyMatch[1], 10);
+					if (n > 0 && n <= 10000) aiQuantity = n;
+				}
+			}
 		}
 
 		console.log(

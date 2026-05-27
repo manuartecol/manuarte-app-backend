@@ -379,9 +379,12 @@ export class IntentHandlerService {
 		let autoAddedRequestedQty: number | undefined;
 		let autoAddedStockExceededNote: string | undefined;
 
+		// Usar el producto con mayor score (primero en la lista, ya ordenada por relevancia+stock).
+		// Cuando hay varios resultados para la misma búsqueda (ej: "cera de palma" devuelve
+		// "Cera de Palma / de Vaso" y "Cera de palma para Moldes - APF"), se toma el primero.
 		if (
 			aiQuantity !== undefined &&
-			result.products.length === 1 &&
+			result.products.length >= 1 &&
 			result.productFound
 		) {
 			const product = result.products[0];
