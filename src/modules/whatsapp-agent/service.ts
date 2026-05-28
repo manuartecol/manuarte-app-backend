@@ -56,10 +56,8 @@ export class WhatsAppAgentService {
 	private openai = new OpenAIService();
 	private paymentLinkService = new PaymentLinkService();
 	private quoteService = new QuoteService(QuoteModel);
-	private docsService = new DocsService(
-		this.quoteService,
-		new BillingService(BillingModel),
-	);
+	private billingService = new BillingService(BillingModel);
+	private docsService = new DocsService(this.quoteService, this.billingService);
 	private whatsAppService = new WhatsAppService();
 	private customerService = new CustomerService(CustomerModel);
 	private cityService = new CityService(CityModel);
@@ -85,6 +83,7 @@ export class WhatsAppAgentService {
 			this.quoteService,
 			this.whatsAppService,
 			this.sendReply,
+			this.billingService,
 		);
 		this.intentHandlerService = new IntentHandlerService(
 			this.openai,

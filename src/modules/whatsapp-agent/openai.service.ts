@@ -45,6 +45,7 @@ REGLAS IMPORTANTES:
 - Evita estructuras rígidas tipo sistema.
 - Prioriza fluidez sobre formalidad.
 - Si una frase suena como interfaz o software, reescríbela de forma conversacional.
+- Usa el artículo y género gramatical correcto para cada producto. Infiere el género por el nombre. Ejemplos: "un colorante", "una cera", "un aceite", "una fragancia", "una mecha", "un molde". NUNCA digas "un cera" ni "una colorante".
 
 COMPORTAMIENTO:
 - Siempre intenta entender qué necesita el cliente.
@@ -55,15 +56,15 @@ COMPORTAMIENTO:
 CUANDO HAY PRODUCTOS:
 -No uses asteriscos ni markdown para resaltar.
 -No agregues información descriptiva ni promocional que no se haya pedido. Nombre, precio y cantidad: nada más.
--Si hay UN SOLO producto con UNA SOLA variante, no hagas lista: preséntalo en una frase breve y directa. Ejemplo: "Tenemos [nombre] a [precio] ([X] disponibles)." No añadas descripciones, ventajas ni texto de relleno. Usa preguntas en singular: "¿Le interesa?" o "¿Lo lleva?".
+-Si hay UN SOLO producto con UNA SOLA variante, no hagas lista: preséntalo en una frase breve y directa. Ejemplo: "Tenemos [nombre] a [precio]." No añadas descripciones, ventajas ni texto de relleno. Usa preguntas en singular: "¿Le interesa?" o "¿Lo lleva?".
 -Si un producto tiene VARIAS variantes, muéstralas SIEMPRE como sub-ítems bajo el nombre del producto, NUNCA como ítems numerados separados. Formato obligatorio:
 	Nombre del producto:
-	- Variante 1 – precio (X disponibles)
-	- Variante 2 – precio (X disponibles)
+	- Variante 1 – precio
+	- Variante 2 – precio
 	CRÍTICO: NUNCA pongas cada variante como "1. Nombre – precio" y "2. Nombre – precio". Las variantes del MISMO producto van con guion (-), no numeradas.
 -Si hay VARIOS productos distintos, preséntalos en lista numerada:
-	1. Nombre – precio (X disponibles)
-	2. Nombre – precio (X disponibles)
+	1. Nombre – precio
+	2. Nombre – precio
 -Si hay VARIOS productos, haz una sola pregunta directa para que el cliente elija, por ejemplo: "¿Cuál le interesa?" o "¿Cuál desea llevar?".
 -No preguntes si quiere saber más sobre los productos ni des opciones para preguntar.
 -Guía siempre hacia la elección y cotización.
@@ -542,10 +543,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 			if (ctx.selectedProduct) {
 				const p = ctx.selectedProduct;
 				const variantDetails = p.variants
-					.map(
-						v =>
-							`  - ${v.name}: ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`,
-					)
+					.map(v => `  - ${v.name}: ${formatPrice(v.price, currency)}`)
 					.join('\n');
 				parts.push(
 					`\nProducto sobre el que hay objeción:\nNombre: ${p.name}` +
@@ -563,12 +561,12 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 								: p.description
 									? `${p.name} (${p.description})`
 									: p.name;
-							return `${i + 1}. ${label} – ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`;
+							return `${i + 1}. ${label} – ${formatPrice(v.price, currency)}`;
 						}
 						const variantLines = p.variants
 							.map((v, idx) => {
 								const varLabel = v.name || `Opción ${idx + 1}`;
-								return `  - ${varLabel}: ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`;
+								return `  - ${varLabel}: ${formatPrice(v.price, currency)}`;
 							})
 							.join('\n');
 						return `${i + 1}. ${p.name}\n${variantLines}`;
@@ -604,12 +602,12 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 								: p.description
 									? `${p.name} (${p.description})`
 									: p.name;
-							return `${i + 1}. ${label} – ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`;
+							return `${i + 1}. ${label} – ${formatPrice(v.price, currency)}`;
 						}
 						const variantLines = p.variants
 							.map((v, idx) => {
 								const varLabel = v.name || `Opción ${idx + 1}`;
-								return `  - ${varLabel}: ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`;
+								return `  - ${varLabel}: ${formatPrice(v.price, currency)}`;
 							})
 							.join('\n');
 						return `${i + 1}. ${p.name}\n${variantLines}`;
@@ -636,10 +634,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 			const productList = ctx.selectedProducts
 				.map((p, i) => {
 					const variantDetails = p.variants
-						.map(
-							v =>
-								`  - ${v.name}: ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`,
-						)
+						.map(v => `  - ${v.name}: ${formatPrice(v.price, currency)}`)
 						.join('\n');
 					return (
 						`${i + 1}. ${p.name}` +
@@ -653,7 +648,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					(ctx.quantity
 						? `\nEl cliente mencionó una cantidad de ${ctx.quantity} unidades.`
 						: '') +
-					'\nPreséntalos brevemente de forma natural, menciona precios y disponibilidad, y pregunta cómo quiere continuar.',
+					'\nPreséntalos brevemente de forma natural, menciona precios y pregunta cómo quiere continuar.',
 			);
 			parts.push(
 				'\nNo anuncies la selección como sistema. Integra los productos de forma conversacional.',
@@ -662,10 +657,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 			const p = ctx.selectedProduct;
 			const totalQty = p.variants.reduce((sum, v) => sum + v.totalQty, 0);
 			const variantDetails = p.variants
-				.map(
-					v =>
-						`  - ${v.name}: ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`,
-				)
+				.map(v => `  - ${v.name}: ${formatPrice(v.price, currency)}`)
 				.join('\n');
 			if (ctx.quantity) {
 				const singleVariant =
@@ -718,7 +710,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 				);
 				if (totalQty === 1) {
 					parts.push(
-						'\nSolo hay 1 unidad disponible. El cliente ya confirmó que quiere llevarlo. No preguntes por cantidad. Confirma el producto y precio de forma natural y guía hacia el siguiente paso (datos de envío, método de pago, etc.).',
+						'\nEl cliente ya eligió este producto. No preguntes por cantidad. Confirma el producto y precio de forma natural y guía hacia el siguiente paso (datos de envío, método de pago, etc.).',
 					);
 				} else if (ctx.lastBotMessage) {
 					parts.push(
@@ -726,7 +718,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					);
 				} else {
 					parts.push(
-						'\nMenciona el nombre del producto, el precio y las unidades disponibles en UNA sola frase corta. No describas el producto ni añadas texto de relleno. Luego haz UNA pregunta directa como "¿Cuántas quiere?" o "¿Cuántas necesita?".',
+						'\nMenciona el nombre del producto y el precio en UNA sola frase corta. No describas el producto ni añadas texto de relleno. Luego haz UNA pregunta directa como "¿Cuántas quiere?" o "¿Cuántas necesita?".',
 					);
 				}
 			}
@@ -762,12 +754,12 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 							: p.description
 								? `${p.name} (${p.description})`
 								: p.name;
-						return `${i + 1}. ${label} – ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`;
+						return `${i + 1}. ${label} – ${formatPrice(v.price, currency)}`;
 					}
 					const variantLines = p.variants
 						.map((v, idx) => {
 							const varLabel = v.name || `Opción ${idx + 1}`;
-							return `  - ${varLabel}: ${formatPrice(v.price, currency)} (${v.totalQty} disponibles)`;
+							return `  - ${varLabel}: ${formatPrice(v.price, currency)}`;
 						})
 						.join('\n');
 					return `${i + 1}. ${p.name}\n${variantLines}`;
@@ -811,7 +803,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 				ctx.products[0].variants.length === 1
 			) {
 				parts.push(
-					'\nSolo hay un producto con una sola variante. Preséntalo en UNA sola frase breve: nombre, precio y unidades disponibles. NO añadas descripción, ventajas ni texto de relleno. Al final haz una pregunta corta en singular como "¿Le interesa?" o "¿Lo lleva?". NO uses preguntas en plural.',
+					'\nSolo hay un producto con una sola variante. Preséntalo en UNA sola frase breve: nombre y precio. NO añadas descripción, ventajas ni texto de relleno. Al final haz una pregunta corta en singular como "¿Le interesa?" o "¿Lo lleva?". NO uses preguntas en plural.',
 				);
 			} else if (
 				ctx.products.length === 1 &&
@@ -1005,6 +997,15 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 							})
 							.join('\n')
 					: '';
+			const grandTotal = (ctx.cart ?? []).reduce(
+				(sum, item) =>
+					sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
+				0,
+			);
+			const grandTotalFormatted =
+				grandTotal > 0
+					? formatPrice(String(grandTotal), ctx.cart?.[0]?.currency ?? currency)
+					: '';
 			parts.push(
 				`\nEl cliente ya está registrado en el sistema. Llámalo por su nombre (sin apellido) (${d?.fullName ?? ''}) de forma natural y dile que ya tienes sus datos. Ejemplo: "Sr. Carlos, me aparece registrado en el sistema con estos datos:". Ten en cuenta si es hombre o mujer.` +
 					`\nMuéstrale el siguiente resumen:` +
@@ -1013,7 +1014,8 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					`\nDirección: ${d?.location ?? ''}` +
 					`\nCiudad: ${d?.cityName ?? ''}` +
 					(cartSummary ? `\n\nPedido:\n${cartSummary}` : '') +
-					'\n\nPregúntale si con estos datos y este pedido procedemos a generar la cotización. Si quiere cambiar algo, que te indique qué corregir. Sé natural y cercano, no suenes a sistema.',
+					(grandTotalFormatted ? `\nTotal: ${grandTotalFormatted}` : '') +
+					'\n\nPregúntale si con estos datos y este pedido procedemos a generar la cotización. Sé natural y cercano, no suenes a sistema.',
 			);
 		} else if (ctx.intent === 'awaiting_confirmation') {
 			const d = ctx.quoteFlowData;
@@ -1034,6 +1036,15 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 							})
 							.join('\n')
 					: '';
+			const grandTotal = (ctx.cart ?? []).reduce(
+				(sum, item) =>
+					sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
+				0,
+			);
+			const grandTotalFormatted =
+				grandTotal > 0
+					? formatPrice(String(grandTotal), ctx.cart?.[0]?.currency ?? currency)
+					: '';
 			parts.push(
 				`\nMuéstrale al cliente el resumen actualizado para que confirme. Usa una frase de apertura natural con su nombre (sin apellido) si parece nombre de persona. Si el nombre contiene palabras de empresa (S.A.S., SAS, Corp, Ltda, Distribuciones, Comercializadora, etc.) empieza con "Tengo esto en el sistema:". Varía las frases de apertura ("Listo [nombre]", "Perfecto [nombre], aquí está el resumen actualizado:", etc.).` +
 					`\n\nIncluye literalmente en el mensaje los siguientes datos:` +
@@ -1043,7 +1054,8 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					`\nDirección: ${d?.location ?? ''}` +
 					`\nCiudad: ${d?.cityName ?? ''}` +
 					(cartSummary ? `\n\nPedido:\n${cartSummary}` : '') +
-					'\n\nAl final pregunta si todo está correcto para generar la cotización o si desea cambiar algo. Varía la frase de cierre.',
+					(grandTotalFormatted ? `\nTotal: ${grandTotalFormatted}` : '') +
+					'\n\nAl final pregunta si todo está correcto para generar la cotización. Varía la frase de cierre.',
 			);
 		} else if (ctx.intent === 'purchase_intent') {
 			parts.push(
@@ -1071,6 +1083,18 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 							})
 							.join('\n')
 					: '';
+			const grandTotalPurchase = (ctx.cart ?? []).reduce(
+				(sum, item) =>
+					sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
+				0,
+			);
+			const grandTotalPurchaseFormatted =
+				grandTotalPurchase > 0
+					? formatPrice(
+							String(grandTotalPurchase),
+							ctx.cart?.[0]?.currency ?? currency,
+						)
+					: '';
 			parts.push(
 				`\nEl cliente ya está registrado en el sistema. Llámalo por su nombre (sin apellido) (${d?.fullName ?? ''}) de forma natural y dile que ya tienes sus datos. Ten en cuenta si es hombre o mujer.` +
 					`\nMuéstrale el siguiente resumen:` +
@@ -1079,6 +1103,9 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					`\nDirección: ${d?.location ?? ''}` +
 					`\nCiudad: ${d?.cityName ?? ''}` +
 					(cartSummaryPurchase ? `\n\nPedido:\n${cartSummaryPurchase}` : '') +
+					(grandTotalPurchaseFormatted
+						? `\nTotal: ${grandTotalPurchaseFormatted}`
+						: '') +
 					'\n\nPregúntale si con estos datos y este pedido procedemos con el pago. Sé natural y cercano.',
 			);
 		} else if (ctx.intent === 'awaiting_purchase_confirmation') {
@@ -1100,6 +1127,18 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 							})
 							.join('\n')
 					: '';
+			const grandTotalPurchase = (ctx.cart ?? []).reduce(
+				(sum, item) =>
+					sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
+				0,
+			);
+			const grandTotalPurchaseFormatted =
+				grandTotalPurchase > 0
+					? formatPrice(
+							String(grandTotalPurchase),
+							ctx.cart?.[0]?.currency ?? currency,
+						)
+					: '';
 			parts.push(
 				`\nMuéstrale al cliente el resumen actualizado para que confirme antes de generar el pago. Usa una frase de apertura natural con su nombre (sin apellido) si parece nombre de persona. Varía las frases de apertura.` +
 					`\n\nIncluye literalmente en el mensaje los siguientes datos:` +
@@ -1111,7 +1150,10 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 					(cartSummaryPurchase
 						? `\n\nProductos:\n${cartSummaryPurchase}`
 						: '') +
-					'\n\nAl final pregunta si todo está correcto para proceder con el pago o si desea cambiar algo. Varía la frase de cierre.',
+					(grandTotalPurchaseFormatted
+						? `\nTotal: ${grandTotalPurchaseFormatted}`
+						: '') +
+					'\n\nAl final pregunta si todo está correcto para proceder con el pago. Varía la frase de cierre.',
 			);
 		} else if (ctx.intent === 'awaiting_payment_confirmation') {
 			parts.push(

@@ -1724,16 +1724,29 @@ export class IntentHandlerService {
 			);
 			if (quoteResult.status === 200 && quoteResult.quote) {
 				const quote = quoteResult.quote;
-				flow.items = (quote.quoteItems ?? []).map(
-					(qi: { name: string; quantity: number; price: number }) => ({
-						productId: '',
-						productName: qi.name,
-						quantity: qi.quantity,
-						unitPrice: String(qi.price),
-						currency,
-					}),
-				);
+				const quoteItemsForFlow = (
+					(quote.items ?? quote.quoteItems ?? []) as Array<{
+						name: string;
+						quantity: number;
+						price: number;
+						productVariantId?: string;
+						stockItemId?: string;
+					}>
+				).map(qi => ({
+					productId: '',
+					productVariantId: qi.productVariantId ?? '',
+					stockItemId: qi.stockItemId ?? undefined,
+					productName: qi.name,
+					quantity: qi.quantity,
+					unitPrice: String(qi.price),
+					currency,
+				}));
+				flow.items = quoteItemsForFlow;
 				flow.total = calculateTotals(quote).total;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				flow.quoteStockId = (quote as any).stockId ?? undefined;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				flow.quoteShopId = (quote as any).shopId ?? undefined;
 				flow.collectedData = {
 					fullName: quote.fullName,
 					dni: quote.dni,
@@ -1745,6 +1758,9 @@ export class IntentHandlerService {
 						: undefined,
 					customerId: String(quote.customerId ?? ''),
 				};
+				console.log(
+					`[WhatsApp Agent] PurchaseIntent hasQuote: ${quoteItemsForFlow.length} items, stockId=${flow.quoteStockId}, shopId=${flow.quoteShopId}`,
+				);
 			}
 
 			const paymentRef = crypto.randomUUID();

@@ -3,9 +3,13 @@ import { ENV } from '../../../config/env';
 import { WhatsAppService } from '../../whatsapp/service';
 import { QuoteService } from '../../quote/service';
 import { CountryService } from './country.service';
+import { BillingService } from '../../billing/service';
+import { BillingStatus, PaymentMethod } from '../../billing/types';
 import { SESSION_TTL_SECONDS } from '../constants';
 import { formatPrice, isWithinOfficeHours } from '../utils';
 import { PendingPurchaseFlow, UserSession } from '../types';
+import { StockItemModel } from '../../stock-item/model';
+import { ProductVariantModel } from '../../product-variant/model';
 
 type SendReplyFn = (
 	to: string,
@@ -19,6 +23,7 @@ export class MediaHandlerService {
 		private quoteService: QuoteService,
 		private whatsAppService: WhatsAppService,
 		private sendReply: SendReplyFn,
+		private billingService: BillingService,
 	) {}
 
 	handleIncomingImage = (
@@ -78,19 +83,154 @@ export class MediaHandlerService {
 		const countryInfo = await this.countryService.detectFromPhone(phoneNumber);
 		const isoCode = countryInfo?.isoCode ?? 'CO';
 
-		// Notify vendor with the attached receipt
+		const shopId =
+			flow.quoteShopId ??
+			session.lastCountryInfo?.shopId ??
+			countryInfo?.shopId ??
+			'';
+		const stockId =
+			flow.quoteStockId ??
+			session.lastCountryInfo?.stockIds?.[0] ??
+			countryInfo?.stockIds?.[0] ??
+			'';
+
+		console.log(
+			`[WhatsApp Agent] Receipt received: phoneNumber=${phoneNumber}, shopId=${shopId}, stockId=${stockId}, itemCount=${flow.items?.length ?? 0}, quoteId=${flow.quoteId ?? 'N/A'}`,
+		);
+
+		// Enriquecer items: para items con productVariantId pero sin stockItemId, buscar stockItemId
+		const enrichedItems = await Promise.all(
+			(flow.items ?? []).map(async item => {
+				if (!item.stockItemId && item.productVariantId && stockId) {
+					try {
+						const si = await StockItemModel.findOne({
+							where: { stockId, active: true },
+							include: [
+								{
+									model: ProductVariantModel,
+									as: 'productVariants',
+									where: { id: item.productVariantId },
+									required: true,
+									attributes: [],
+									through: { attributes: [] },
+								},
+							],
+							attributes: ['id'],
+						});
+						if (si) {
+							return { ...item, stockItemId: si.getDataValue('id') as string };
+						}
+					} catch (e) {
+						console.error('[WhatsApp Agent] Error looking up stockItemId:', e);
+					}
+				}
+				return item;
+			}),
+		);
+
+		// Intentar crear la factura automáticamente si los ítems tienen los IDs necesarios
+		const validItems = enrichedItems.filter(
+			i => i.stockItemId && i.productVariantId,
+		);
+		const allItemsValid =
+			validItems.length > 0 && validItems.length === enrichedItems.length;
+
+		let billSerial: string | undefined;
+		if (allItemsValid && shopId && stockId && flow.paymentRef) {
+			try {
+				const billingResult = await this.billingService.create({
+					billingData: {
+						shopId,
+						stockId,
+						status: BillingStatus.PAID,
+						payments: [
+							{
+								paymentMethod: (flow.paymentMethod ??
+									'BANK_TRANSFER_RT') as PaymentMethod,
+								amount: flow.total ?? 0,
+								paymentReference: flow.paymentRef,
+							},
+						],
+						subtotal: flow.total ?? 0,
+						discountType: 'FIXED',
+						discount: 0,
+						shipping: '0',
+						comments: 'Pedido realizado por WhatsApp',
+						currency: flow.currency ?? 'USD',
+						requestedBy: ENV.WHATSAPP_BOT_USER_ID,
+						clientRequestId: flow.paymentRef,
+						...(flow.quoteId ? { quoteId: flow.quoteId } : {}),
+						items: validItems.map(i => ({
+							stockItemId: i.stockItemId!,
+							productVariantId: i.productVariantId!,
+							billingId: '',
+							stockId,
+							name: i.variantName
+								? `${i.productName} ${i.variantName}`
+								: i.productName,
+							quantity: i.quantity,
+							price: parseFloat(i.unitPrice ?? '0'),
+							totalPrice: parseFloat(i.unitPrice ?? '0') * i.quantity,
+							currency: (i.currency ?? flow.currency ?? 'USD') as 'COP' | 'USD',
+						})),
+					},
+					customerData: {
+						fullName: flow.collectedData?.fullName ?? '',
+						dni: flow.collectedData?.dni ?? '',
+						email: '',
+						phoneNumber: flow.collectedData?.phoneNumber ?? phoneNumber,
+						location: flow.collectedData?.location ?? '',
+						cityId: String(flow.collectedData?.cityId ?? ''),
+						customerId: flow.collectedData?.customerId,
+						personId: flow.collectedData?.personId,
+					},
+				});
+				billSerial = billingResult.newBilling?.serialNumber;
+				console.log(`[WhatsApp Agent] Billing created: serial=${billSerial}`);
+			} catch (billingErr) {
+				console.error('[WhatsApp Agent] Error creating billing:', billingErr);
+			}
+		} else if (!allItemsValid) {
+			const itemDetails = enrichedItems
+				.map(
+					i =>
+						`{name=${i.productName}, variantId=${i.productVariantId || 'MISSING'}, stockItemId=${i.stockItemId || 'MISSING'}}`,
+				)
+				.join(', ');
+			console.warn(
+				`[WhatsApp Agent] Skipping billing: allItemsValid=false. stockId=${stockId}, shopId=${shopId}, quoteId=${flow.quoteId ?? 'N/A'}, items=[${itemDetails}]`,
+			);
+		}
+
+		// Notificar al vendedor (después del billing para incluir el serial)
 		await this.notifyVendor(
 			botPhoneNumberId,
 			isoCode,
 			flow,
 			mediaId,
 			mediaType,
+			billSerial,
 		).catch(err =>
 			console.error(
 				'[WhatsApp Agent] Error notifying vendor with receipt:',
 				err,
 			),
 		);
+
+		// Eliminar cotización si se creó la factura exitosamente
+		if (billSerial && flow.quoteId) {
+			await this.quoteService
+				.delete(flow.quoteId)
+				.catch(e =>
+					console.error(
+						'[WhatsApp Agent] Error deleting quote after billing:',
+						e,
+					),
+				);
+			console.log(
+				`[WhatsApp Agent] Quote ${flow.quoteId} deleted after billing ${billSerial}`,
+			);
+		}
 
 		// Clear flow and cart
 		session.pendingPurchaseFlow = null;
@@ -109,6 +249,7 @@ export class MediaHandlerService {
 
 		const reply =
 			`✅ ¡Comprobante recibido! Nuestro equipo lo verificará y le confirmará el pedido en breve.` +
+			`\n\n📦 *Nota importante*: El flete (envío) no está incluido en el pago. Nuestro equipo se pondrá en contacto con usted para coordinar el envío y confirmar el costo.` +
 			offHoursNote +
 			`\n\n¡Gracias por su compra! 🎉`;
 
@@ -121,6 +262,7 @@ export class MediaHandlerService {
 		flow: PendingPurchaseFlow,
 		receiptMediaId?: string,
 		receiptMediaType?: 'image' | 'document',
+		billSerial?: string,
 	): Promise<void> => {
 		const vendorPhone =
 			isoCode === 'CO' ? ENV.SHOP_CO_PHONE_NUMBER : ENV.SHOP_EC_PHONE_NUMBER;
@@ -143,7 +285,7 @@ export class MediaHandlerService {
 							return `  • ${item.quantity}x ${name}`;
 						})
 						.join('\n')
-				: `• Revisar Cotización #${flow.quoteSerial}`;
+				: `• Revisar factura${billSerial ? ` #${billSerial}` : ''}`;
 
 		const totalLine =
 			flow.total != null
@@ -151,10 +293,7 @@ export class MediaHandlerService {
 				: '';
 
 		const refLine = flow.paymentRef ? `\nRef pago: ${flow.paymentRef}` : '';
-		const quoteRefLine =
-			flow.purchaseFromQuote && flow.quoteSerial
-				? `\nCotización: #${flow.quoteSerial}`
-				: '';
+		const quoteRefLine = billSerial ? `\nFactura: #${billSerial}` : '';
 
 		const message =
 			`📦 *Nueva orden de compra*` +

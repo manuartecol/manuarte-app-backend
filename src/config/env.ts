@@ -41,4 +41,14 @@ export const ENV = {
 	// Útil para probar el bot de Ecuador desde un número colombiano.
 	// ⚠️ Dejar en '' o eliminar en producción.
 	TEST_FORCE_COUNTRY_ISO: process.env.TEST_FORCE_COUNTRY_ISO ?? '',
+	// Información de pago por QR (placeholder hasta tener imagen real)
+	PAYMENT_QR_CO_INFO:
+		process.env.PAYMENT_QR_CO_INFO ??
+		'[QR de transferencia Colombia - pendiente de configurar]',
+	PAYMENT_QR_EC_INFO:
+		process.env.PAYMENT_QR_EC_INFO ??
+		'[QR de transferencia Ecuador - pendiente de configurar]',
+	// Datos de cuenta Nequi para Colombia
+	NEQUI_PHONE_NUMBER: process.env.NEQUI_PHONE_NUMBER ?? '',
+	NEQUI_ACCOUNT_HOLDER: process.env.NEQUI_ACCOUNT_NAME ?? 'Manuarte',
 };

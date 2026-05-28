@@ -86,6 +86,12 @@ export interface PendingPurchaseFlow {
 	paymentRef?: string;
 	/** Link de pago enviado al cliente */
 	paymentLink?: string;
+	/** Método de pago utilizado (se guarda al confirmar el pago) */
+	paymentMethod?: string;
+	/** stockId de la tienda obtenido directamente desde la cotización (para no depender de lastCountryInfo) */
+	quoteStockId?: string;
+	/** shopId de la tienda obtenido directamente desde la cotización */
+	quoteShopId?: string;
 	/** Ítems con stock insuficiente pendientes de resolución por el cliente */
 	blockedItemsContext?: Array<{
 		item: CartItem;

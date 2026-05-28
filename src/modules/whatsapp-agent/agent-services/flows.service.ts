@@ -694,20 +694,40 @@ export class FlowsService {
 				const quoteResult = await this.quoteService.getOne(flow.quoteSerial!);
 				if (quoteResult.status === 200 && quoteResult.quote) {
 					const quote = quoteResult.quote;
-					const items: CartItem[] = (quote.quoteItems ?? []).map(
-						(qi: { name: string; quantity: number; price: number }) => ({
-							productId: '',
-							productName: qi.name,
-							quantity: qi.quantity,
-							unitPrice: String(qi.price),
-							currency,
-						}),
-					);
+					const quoteItemsArr: Array<{
+						name: string;
+						quantity: number;
+						price: number;
+						productVariantId?: string;
+						stockItemId?: string;
+					}> = (quote.items ?? quote.quoteItems ?? []) as Array<{
+						name: string;
+						quantity: number;
+						price: number;
+						productVariantId?: string;
+						stockItemId?: string;
+					}>;
+					const items: CartItem[] = quoteItemsArr.map(qi => ({
+						productId: '',
+						productVariantId: qi.productVariantId ?? '',
+						stockItemId: qi.stockItemId ?? undefined,
+						productName: qi.name,
+						quantity: qi.quantity,
+						unitPrice: String(qi.price),
+						currency,
+					}));
 					const { total } = calculateTotals(quote);
 					flow.items = items;
 					flow.total = total;
 					flow.currency = currency;
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					flow.quoteStockId = (quote as any).stockId ?? undefined;
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					flow.quoteShopId = (quote as any).shopId ?? undefined;
 					flow.purchaseFromQuote = true;
+					console.log(
+						`[WhatsApp Agent] Quote items loaded for purchase: ${items.length} items, stockId=${flow.quoteStockId}, shopId=${flow.quoteShopId}`,
+					);
 					// Usar datos del cliente de la cotización si los hay
 					flow.collectedData = flow.collectedData ?? {
 						fullName: quote.fullName,
@@ -722,25 +742,14 @@ export class FlowsService {
 					};
 				}
 
-				// Generar link y transitar a awaiting_payment_confirmation
+				// Mostrar QR de transferencia y esperar comprobante
 				const paymentRef = crypto.randomUUID();
-				const paymentLink = await this.paymentLinkService.getLinkForCountry(
-					isoCode,
-					flow.total ??
-						flow.items?.reduce(
-							(sum, i) =>
-								sum + (i.unitPrice ? parseFloat(i.unitPrice) * i.quantity : 0),
-							0,
-						) ??
-						0,
-					flow.currency ?? currency,
-					paymentRef,
-				);
-				const provider = this.paymentLinkService.getProviderName(isoCode);
 				flow.paymentRef = paymentRef;
-				flow.paymentLink = paymentLink;
+				flow.paymentMethod = 'BANK_TRANSFER_RT';
 				flow.step = 'awaiting_receipt';
 
+				const qrInfo =
+					isoCode === 'CO' ? ENV.PAYMENT_QR_CO_INFO : ENV.PAYMENT_QR_EC_INFO;
 				const itemLines =
 					flow.items && flow.items.length > 0
 						? flow.items
@@ -759,12 +768,11 @@ export class FlowsService {
 						: '';
 
 				return (
-					`¡Perfecto! 🎉 Aquí tiene su link de pago con ${provider}:\n\n` +
-					`🔗 ${paymentLink}\n\n` +
+					`Para completar su pedido, realice el pago por transferencia:\n\n${qrInfo}\n\n` +
 					(itemLines ? `Pedido:\n${itemLines}\n\n` : '') +
 					(totalStr ? `Total: ${totalStr}\n\n` : '') +
 					`Ref: ${paymentRef}\n\n` +
-					`Cuando realice el pago, envíenos el comprobante (imagen o PDF) para que nuestro equipo lo verifique. 📸`
+					`Cuando realice el pago, envíenos el comprobante (imagen o PDF) 📸`
 				);
 			} else {
 				// El cliente no quiere usar la cotización → iniciar flujo con datos nuevos
@@ -776,15 +784,28 @@ export class FlowsService {
 					const quoteResult = await this.quoteService.getOne(savedSerial);
 					if (quoteResult.status === 200 && quoteResult.quote) {
 						const quote = quoteResult.quote;
-						flow.items = (quote.quoteItems ?? []).map(
-							(qi: { name: string; quantity: number; price: number }) => ({
-								productId: '',
-								productName: qi.name,
-								quantity: qi.quantity,
-								unitPrice: String(qi.price),
-								currency,
-							}),
-						);
+						const rejectedQuoteItems: Array<{
+							name: string;
+							quantity: number;
+							price: number;
+							productVariantId?: string;
+							stockItemId?: string;
+						}> = (quote.items ?? quote.quoteItems ?? []) as Array<{
+							name: string;
+							quantity: number;
+							price: number;
+							productVariantId?: string;
+							stockItemId?: string;
+						}>;
+						flow.items = rejectedQuoteItems.map(qi => ({
+							productId: '',
+							productVariantId: qi.productVariantId ?? '',
+							stockItemId: qi.stockItemId ?? undefined,
+							productName: qi.name,
+							quantity: qi.quantity,
+							unitPrice: String(qi.price),
+							currency,
+						}));
 						const { total } = calculateTotals(quote);
 						flow.total = total;
 						flow.currency = currency;
@@ -959,19 +980,14 @@ export class FlowsService {
 				flow.currency = currency;
 			}
 
-			// Generar link de pago
+			// Mostrar QR de transferencia y esperar comprobante
 			const paymentRef = crypto.randomUUID();
-			const paymentLink = await this.paymentLinkService.getLinkForCountry(
-				isoCode,
-				flow.total,
-				flow.currency ?? currency,
-				paymentRef,
-			);
-			const provider = this.paymentLinkService.getProviderName(isoCode);
 			flow.paymentRef = paymentRef;
-			flow.paymentLink = paymentLink;
+			flow.paymentMethod = 'BANK_TRANSFER_RT';
 			flow.step = 'awaiting_receipt';
 
+			const qrInfo =
+				isoCode === 'CO' ? ENV.PAYMENT_QR_CO_INFO : ENV.PAYMENT_QR_EC_INFO;
 			const itemLines =
 				flow.items.length > 0
 					? flow.items
@@ -989,12 +1005,11 @@ export class FlowsService {
 			);
 
 			return (
-				`¡Perfecto! 🎉 Aquí tiene su link de pago con ${provider}:\n\n` +
-				`🔗 ${paymentLink}\n\n` +
+				`Para completar su pedido, realice el pago por transferencia:\n\n${qrInfo}\n\n` +
 				(itemLines ? `Pedido:\n${itemLines}\n\n` : '') +
 				`Total: ${totalStr}\n\n` +
 				`Ref: ${paymentRef}\n\n` +
-				`Cuando realice el pago, envíenos el comprobante (imagen o PDF) para que nuestro equipo lo verifique. 📸`
+				`Cuando realice el pago, envíenos el comprobante (imagen o PDF) 📸`
 			);
 		}
 
@@ -1007,6 +1022,76 @@ export class FlowsService {
 
 		// ── Paso 6: esperando recibo ──
 		if (flow.step === 'awaiting_receipt') {
+			// CO: solicitud de Bold / tarjeta
+			if (
+				isoCode === 'CO' &&
+				/bold|tarjeta|pagar\s+con\s+tarjeta|débito|crédito/i.test(
+					normalizedText,
+				)
+			) {
+				try {
+					const link = await this.paymentLinkService.getBoldLink(
+						flow.total ?? 0,
+						flow.currency ?? currency,
+						flow.paymentRef ?? crypto.randomUUID(),
+					);
+					flow.paymentMethod = 'BOLD';
+					flow.paymentLink = link;
+					const boldTotal = flow.total
+						? formatPrice(String(flow.total), flow.currency ?? currency)
+						: '';
+					return (
+						`Aquí tiene su link de pago con Bold:\n\n🔗 ${link}\n\n` +
+						`Ref: ${flow.paymentRef}\n` +
+						(boldTotal ? `Total: ${boldTotal}\n\n` : '') +
+						`Cuando realice el pago, envíenos el comprobante. 📸`
+					);
+				} catch {
+					return 'Hubo un problema generando el link de pago. Inténtelo de nuevo o contáctenos.';
+				}
+			}
+			// CO: solicitud de Nequi
+			if (isoCode === 'CO' && /nequi/i.test(normalizedText)) {
+				const nequiInfo = this.paymentLinkService.getNequiInfo();
+				const nequiTotal = flow.total
+					? formatPrice(String(flow.total), flow.currency ?? currency)
+					: '';
+				flow.paymentMethod = 'NEQUI';
+				return (
+					`Para pagar por Nequi:\n\n${nequiInfo}\n\n` +
+					`Concepto/Ref: ${flow.paymentRef}\n` +
+					(nequiTotal ? `Total: ${nequiTotal}\n\n` : '') +
+					`Envíenos el comprobante cuando complete el pago. 📸`
+				);
+			}
+			// EC: solicitud de PayPhone / tarjeta
+			if (
+				isoCode === 'EC' &&
+				/payphone|pay\s*phone|tarjeta|pagar\s+con\s+tarjeta/i.test(
+					normalizedText,
+				)
+			) {
+				try {
+					const link = await this.paymentLinkService.getPayPhoneLink(
+						flow.total ?? 0,
+						flow.currency ?? currency,
+						flow.paymentRef ?? crypto.randomUUID(),
+					);
+					flow.paymentMethod = 'PAYPHONE';
+					flow.paymentLink = link;
+					const ppTotal = flow.total
+						? formatPrice(String(flow.total), flow.currency ?? currency)
+						: '';
+					return (
+						`Aquí tiene su link de pago con PayPhone:\n\n🔗 ${link}\n\n` +
+						`Ref: ${flow.paymentRef}\n` +
+						(ppTotal ? `Total: ${ppTotal}\n\n` : '') +
+						`Cuando realice el pago, envíenos el comprobante. 📸`
+					);
+				} catch {
+					return 'Hubo un problema generando el link de pago. Inténtelo de nuevo o contáctenos.';
+				}
+			}
 			return 'Para continuar necesitamos el comprobante de pago. Por favor envía una imagen o PDF del comprobante. 📸';
 		}
 

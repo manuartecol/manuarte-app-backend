@@ -221,6 +221,19 @@ export class QuoteService {
 							'quantity',
 							'price',
 							'totalPrice',
+							// Obtener stockItemId del stock de la tienda
+							[
+								sequelize.literal(`(
+                SELECT si.id
+                FROM stock_item_product_variant sipv
+                INNER JOIN stock_item si ON sipv."stockItemId" = si.id
+                INNER JOIN stock s ON si."stockId" = s.id
+                WHERE sipv."productVariantId" = "quoteItems"."productVariantId"
+                AND s."shopId" = "QuoteModel"."shopId"
+                LIMIT 1
+            )`),
+								'stockItemId',
+							],
 							// Obtener precio PVP
 							[
 								sequelize.literal(`(

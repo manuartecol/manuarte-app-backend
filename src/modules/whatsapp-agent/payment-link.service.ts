@@ -165,4 +165,14 @@ export class PaymentLinkService {
 		if (ENV.TEST_PAYPHONE_IN_CO === 'true') return 'PayPhone';
 		return isoCode === 'CO' ? 'Bold' : 'PayPhone';
 	}
+
+	/**
+	 * Devuelve los datos de pago por Nequi para Colombia.
+	 */
+	getNequiInfo(): string {
+		const phone = ENV.NEQUI_PHONE_NUMBER;
+		const holder = ENV.NEQUI_ACCOUNT_HOLDER;
+		if (!phone) return '[Datos Nequi pendientes de configurar]';
+		return `Nequi: ${phone}\nTitular: ${holder}`;
+	}
 }
