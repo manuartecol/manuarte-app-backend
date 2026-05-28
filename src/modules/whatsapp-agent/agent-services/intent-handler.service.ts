@@ -1503,7 +1503,7 @@ export class IntentHandlerService {
 							`Lo sentimos, "${outOfStockFromList[0]}" no está disponible en este momento. ¿Le puedo ayudar con otra cosa?`,
 					);
 			}
-			return 'Todavía no tiene productos en su pedido. Primero agregue lo que necesite y luego le armo la cotización.';
+			return '¿Qué le gustaría cotizar?';
 		} else if (isSingleProductFromList) {
 			const currency =
 				session.lastCountryInfo?.currency ?? countryInfo?.currency ?? 'USD';
@@ -1682,8 +1682,25 @@ export class IntentHandlerService {
 		);
 		const grandTotalFormatted = formatPrice(String(grandTotal), currency);
 		let reply = `Listo, aquí está su pedido:\n${cartLines}\n\nTotal: ${grandTotalFormatted}`;
-		if (result.outOfStock.length > 0) {
-			reply += `\n\n⚠️ Los siguientes productos no están disponibles: ${result.outOfStock.join(', ')}.`;
+		if (result.outOfStockDetails.length > 0) {
+			const trueOutOfStock = result.outOfStockDetails
+				.filter(p => p.currentStock === 0)
+				.map(p => p.name);
+			const insufficient = result.outOfStockDetails.filter(
+				p => p.currentStock > 0,
+			);
+			if (trueOutOfStock.length > 0) {
+				reply += `\n\n⚠️ Los siguientes productos no están disponibles: ${trueOutOfStock.join(', ')}.`;
+			}
+			if (insufficient.length > 0) {
+				const lines = insufficient
+					.map(
+						p =>
+							`Solo tenemos ${p.currentStock} disponible${p.currentStock !== 1 ? 's' : ''} de ${p.name}`,
+					)
+					.join('\n');
+				reply += `\n\n⚠️ ${lines}.`;
+			}
 		}
 		reply += '\n\n¿Necesita algo más?';
 		await redis.set(
@@ -1707,7 +1724,7 @@ export class IntentHandlerService {
 		const hasCartItems = cartItems.length > 0;
 
 		if (!hasCartItems && !hasQuote) {
-			return 'Todavía no tiene productos en su pedido. Primero agregue lo que necesite y luego le ayudo a completar la compra.';
+			return '¿Qué productos desea adquirir? Con gusto le ayudo.';
 		} else if (hasQuote) {
 			const currency =
 				session.lastCountryInfo?.currency ?? countryInfo?.currency ?? 'USD';
