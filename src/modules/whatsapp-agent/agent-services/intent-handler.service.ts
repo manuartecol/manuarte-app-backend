@@ -23,7 +23,7 @@ import {
 	PendingPurchaseFlow,
 	UserSession,
 } from '../types';
-import { stripCallingCode } from '../helpers/intent-detection';
+import { stripCallingCode, isFarewellOnly } from '../helpers/intent-detection';
 import {
 	buildSelectionReply,
 	buildResumptionReply,
@@ -112,7 +112,15 @@ export class IntentHandlerService {
 			return this.handleIntentMultiProductAdd(ctx);
 		} else if (intent === 'purchase_intent') {
 			return this.handleIntentPurchaseIntent(ctx);
+		} else if (intent === 'farewell') {
+			return this.handleIntentFarewell(ctx);
 		} else {
+			// Para intents 'greeting' que llegan con historial de sesión y son
+			// cierres de conversación ("gracias", "listo gracias", "perfecto gracias"),
+			// redirigir a farewell en lugar de responder con bienvenida
+			if (ctx.session.lastBotMessage && isFarewellOnly(ctx.normalizedText)) {
+				return this.handleIntentFarewell(ctx);
+			}
 			return this.openai
 				.generateReply({
 					userMessage: ctx.text,
@@ -1936,5 +1944,17 @@ export class IntentHandlerService {
 				SESSION_TTL_SECONDS,
 			);
 		}
+	};
+
+	private handleIntentFarewell = async (
+		ctx: IntentContext,
+	): Promise<string> => {
+		return this.openai
+			.generateReply({
+				userMessage: ctx.text,
+				intent: 'farewell',
+				lastBotMessage: ctx.session.lastBotMessage ?? undefined,
+			})
+			.catch(() => 'Con gusto 😊 Cuando necesite algo más, aquí estaré.');
 	};
 }

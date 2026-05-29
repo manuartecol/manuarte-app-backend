@@ -13,7 +13,7 @@ import { calculateTotals, formatCurrency } from '../../docs/utils';
 import { ENV } from '../../../config/env';
 import { formatPrice, normalizeText } from '../utils';
 import { ProductSearchService } from './product-search.service';
-import { stripCallingCode } from '../helpers/intent-detection';
+import { stripCallingCode, isFarewellOnly } from '../helpers/intent-detection';
 import { mapCartToQuoteItems } from '../helpers/cart-helpers';
 import { CartItem, CollectionFlow, UserSession } from '../types';
 
@@ -222,6 +222,25 @@ export class FlowsService {
 		if (/\b(cancelar|cancelalo|dejalo|olvidalo)\b/i.test(normalizedText)) {
 			session.pendingQuoteFlow = null;
 			return 'Listo, cancelé el proceso de cotización. ¿Necesitas algo más?';
+		}
+
+		// Si el cliente agradece en medio del flujo, reconocer y retomar el paso actual
+		if (isFarewellOnly(normalizedText)) {
+			const stepPrompts: Record<string, string> = {
+				awaiting_cart_confirmation:
+					'¡Con gusto! Para generar su cotización, ¿confirma los productos en su pedido?',
+				awaiting_customer_data:
+					'¡Con gusto! Para continuar necesito su nombre completo y número de cédula.',
+				awaiting_address:
+					'¡Con gusto! Para continuar necesito su dirección y ciudad de entrega.',
+				awaiting_city_selection:
+					'¡Con gusto! Por favor indíqueme la ciudad de entrega para continuar.',
+				awaiting_confirmation:
+					'¡Con gusto! Por favor confirme si los datos están correctos para generar la cotización.',
+			};
+			return (
+				stepPrompts[flow.step] ?? '¡Con gusto! Continuamos con su cotización.'
+			);
 		}
 
 		// Manejar el paso de confirmación del carrito antes de iniciar el flujo de datos
@@ -544,6 +563,29 @@ export class FlowsService {
 		) {
 			session.pendingPurchaseFlow = null;
 			return 'Listo, cancelé el proceso de compra. ¿Necesitas algo más?';
+		}
+
+		// Si el cliente agradece en medio del flujo, reconocer y retomar el paso actual
+		if (isFarewellOnly(normalizedText)) {
+			const stepPrompts: Record<string, string> = {
+				awaiting_out_of_stock_resolution:
+					'¡Con gusto! ¿Desea continuar con los productos disponibles o prefiere una alternativa?',
+				awaiting_quote_confirmation:
+					'¡Con gusto! Por favor confirme si desea proceder con la compra a partir de su cotización.',
+				awaiting_customer_data:
+					'¡Con gusto! Para continuar necesito su nombre completo y número de cédula.',
+				awaiting_address:
+					'¡Con gusto! Para continuar necesito su dirección y ciudad de entrega.',
+				awaiting_city_selection:
+					'¡Con gusto! Por favor indíqueme la ciudad de entrega para continuar.',
+				awaiting_confirmation:
+					'¡Con gusto! Por favor confirme si los datos están correctos para procesar su compra.',
+				awaiting_payment_confirmation:
+					'¡Con gusto! Por favor confirme cuando haya realizado el pago.',
+				awaiting_receipt:
+					'¡Con gusto! Por favor envíeme el comprobante de pago para confirmar su pedido.',
+			};
+			return stepPrompts[flow.step] ?? '¡Con gusto! Continuamos con su compra.';
 		}
 
 		// ── Paso 0b: resolución de ítems sin stock suficiente ──

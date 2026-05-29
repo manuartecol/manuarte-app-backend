@@ -225,6 +225,7 @@ export type AIDetectedIntent =
 	| 'greeting'
 	| 'objection'
 	| 'general_question'
+	| 'farewell'
 	| 'unknown';
 
 export interface QuoteCorrectionResult {
@@ -354,6 +355,7 @@ ${selectionInstructions}${showMoreInstruction}  - "show_cart": el cliente pregun
   - "request_quote": el cliente quiere cotizar o pide una cotización, presupuesto o proforma. Incluye el verbo "cotizar" y sus variantes (cotizame, cotíceme, me cotizas, me cotices, necesito cotizar, quiero cotizar, cotiza esto), y también frases como "quiero una cotización", "necesito una cotización", "quiero que me armen una cotización", "envíame la cotización", "genera la cotización"
   - "purchase_intent": el cliente dice que quiere comprar, pagar, finalizar su pedido o completar su compra (frases como "quiero comprar", "quiero pagar", "cómo pago", "cómo compro", "finalizar pedido", "completar la compra", "quiero proceder", "quiero el pedido", "quiero finalizarlo"). IMPORTANTE: si el mensaje contiene "voy a llevar [producto/cantidad]", "me llevo [producto]", "quiero llevar [producto]", "voy a llevar [número]" u otras frases donde "llevar" acompaña un nombre de producto o una cantidad, NO es "purchase_intent" — clasificar como "search_product" (si el producto no está en la lista activa) o "select_product" (si está en la lista activa). Ejemplos: "Voy a llevar 5 kilos de cera de palma" → search_product; "Me llevo esa" → select_product si hay lista activa
   - "objection": el cliente dice que está caro, que lo va a pensar, que después, que no tiene dinero, que no le interesa
+  - "farewell": el cliente cierra la conversación con agradecimiento o despedida sin hacer ninguna solicitud adicional (ej: "muchas gracias", "muy amable", "mil gracias", "te agradezco", "quedo pendiente", "quedamos", "perfecto gracias"). Usar SOLO cuando el mensaje completo es de cierre puro, sin ninguna pregunta ni búsqueda de producto implícita
   - "greeting": saludo puro sin consulta de producto ni pregunta específica
   - "general_question": pregunta sobre envíos, métodos de pago, tiempo de entrega, políticas, características o propiedades de un producto ya mencionado, u otras preguntas que no buscan un producto nuevo en catálogo. TAMBIÉN clasifica como "general_question" cuando el cliente responde con el uso o aplicación que quiere darle a un producto (ej: "fabricación de jabones", "para aromaterapia", "para hacer velas")
   - "unknown": no se puede clasificar con certeza
@@ -402,6 +404,7 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 			'greeting',
 			'objection',
 			'general_question',
+			'farewell',
 			'unknown',
 		];
 		const intent: AIDetectedIntent = validIntents.includes(
@@ -539,7 +542,11 @@ Responde ÚNICAMENTE con el JSON, sin texto adicional.${activeProducts && active
 			);
 		}
 
-		if (ctx.intent === 'objection') {
+		if (ctx.intent === 'farewell') {
+			parts.push(
+				'\nEl cliente está cerrando la conversación con un agradecimiento o despedida. Responde con calidez y naturalidad, deseándole éxito o buena jornada. No ofrezcas nada nuevo, no hagas preguntas. Una sola frase breve y cálida.',
+			);
+		} else if (ctx.intent === 'objection') {
 			if (ctx.selectedProduct) {
 				const p = ctx.selectedProduct;
 				const variantDetails = p.variants
