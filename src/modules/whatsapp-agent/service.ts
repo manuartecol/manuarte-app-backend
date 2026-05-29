@@ -1029,6 +1029,36 @@ export class WhatsAppAgentService {
 				}
 			}
 
+			// Pre-chequeo determinista: si awaitingMoreProducts=true y el cliente pregunta
+			// por un tipo específico de producto (ej: "qué ceras tienes disponible"),
+			// forzar search_product antes de la IA para evitar falsos positivos de show_more.
+			if (!intent! && session.awaitingMoreProducts) {
+				const specificProductQuestionRegex =
+					/^(?:que|cuales?|cuantos?)\s+(.{2,40})\s+(?:tienes?|tienen|hay|manejan|venden|tienes?\s+disponible|tienen\s+disponible)[?¿\s]*$/i;
+				const spmMatch = normalizedText.match(specificProductQuestionRegex);
+				if (spmMatch) {
+					const capturedTerm = spmMatch[1].trim();
+					const showCartTokens = new Set([
+						'llevamos',
+						'llevo',
+						'carrito',
+						'pedido',
+					]);
+					const termTokens = capturedTerm.split(/\s+/);
+					if (
+						capturedTerm.length >= 2 &&
+						!termTokens.some(t => showCartTokens.has(t))
+					) {
+						intent = 'search_product';
+						aiSearchQuery = capturedTerm;
+						session.selectedProduct = undefined;
+						console.log(
+							`[WhatsApp Agent] Specific product question (awaitingMore): "${capturedTerm}" → search_product`,
+						);
+					}
+				}
+			}
+
 			if (!intent!) {
 				// Pasar siempre la lista activa al clasificador de IA.
 				// Cuando hay un producto seleccionado se añade nota para que la IA distinga

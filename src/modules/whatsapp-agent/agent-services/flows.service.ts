@@ -477,13 +477,25 @@ export class FlowsService {
 				session.lastQuoteId = result.newQuote.id;
 				session.lastQuoteSerial = result.newQuote.serialNumber;
 
-				// Iniciar flujo de compra en paso de confirmación de cotización
+				// Iniciar flujo de compra en paso de confirmación de cotización.
+				// Se lleva collectedData (con personId) para que media-handler pueda
+				// llamar a customerService.update sin recibir personId=undefined.
 				session.pendingPurchaseFlow = {
 					step: 'awaiting_quote_confirmation',
 					purchaseFromQuote: true,
 					quoteId: result.newQuote.id,
 					quoteSerial: result.newQuote.serialNumber,
 					currency,
+					collectedData: {
+						fullName: data.fullName,
+						dni: data.dni,
+						phoneNumber: data.phoneNumber ?? phoneNumber,
+						location: data.location,
+						cityId: data.cityId,
+						cityName: data.cityName,
+						customerId: data.customerId,
+						personId: data.personId,
+					},
 				};
 
 				const serial = result.newQuote.serialNumber;

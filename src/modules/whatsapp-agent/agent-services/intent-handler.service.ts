@@ -367,6 +367,7 @@ export class IntentHandlerService {
 		const countryPrefix = phoneNumber.replace(/\d+$/, '');
 
 		session.selectedProduct = undefined;
+		session.outOfStockRagProductName = undefined;
 		const result = await this.productSearchService.buildProductReply(
 			normalizedText,
 			countryInfo,
