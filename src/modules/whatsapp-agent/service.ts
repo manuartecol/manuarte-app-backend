@@ -109,7 +109,6 @@ export class WhatsAppAgentService {
 	};
 
 	receiveMessage = async (body: unknown) => {
-		console.log('**************** receiving message ****************');
 		const payload = body as {
 			entry?: Array<{
 				changes?: Array<{
@@ -164,8 +163,6 @@ export class WhatsAppAgentService {
 					return { status: 200, message: 'Mensaje antiguo ignorado.' };
 				}
 			}
-
-			console.log(botPhoneNumberId);
 
 			if (!botPhoneNumberId) {
 				console.warn(
