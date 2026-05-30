@@ -477,9 +477,24 @@ export class FlowsService {
 				session.lastQuoteId = result.newQuote.id;
 				session.lastQuoteSerial = result.newQuote.serialNumber;
 
+				// Resolver customerId y personId finales.
+				// Para clientes nuevos, quoteService.create() crea la persona internamente
+				// y solo devuelve customerId; necesitamos buscar personId para que
+				// billing/service pueda llamar a customerService.update correctamente.
+				const finalCustomerId =
+					data.customerId ?? result.newQuote.customerId ?? undefined;
+				let finalPersonId = data.personId;
+				if (!finalPersonId && finalCustomerId) {
+					const customerRecord = await CustomerModel.findByPk(finalCustomerId, {
+						attributes: ['personId'],
+					});
+					if (customerRecord)
+						finalPersonId = customerRecord.get('personId') as string;
+				}
+
 				// Iniciar flujo de compra en paso de confirmación de cotización.
-				// Se lleva collectedData (con personId) para que media-handler pueda
-				// llamar a customerService.update sin recibir personId=undefined.
+				// Se lleva collectedData (con customerId + personId resueltos) para que
+				// billing/service pueda llamar a customerService.update correctamente.
 				session.pendingPurchaseFlow = {
 					step: 'awaiting_quote_confirmation',
 					purchaseFromQuote: true,
@@ -493,8 +508,8 @@ export class FlowsService {
 						location: data.location,
 						cityId: data.cityId,
 						cityName: data.cityName,
-						customerId: data.customerId,
-						personId: data.personId,
+						customerId: finalCustomerId,
+						personId: finalPersonId,
 					},
 				};
 
@@ -792,7 +807,7 @@ export class FlowsService {
 						cityName: quote.cityName
 							? `${quote.cityName}${quote.regionName ? `, ${quote.regionName}` : ''}`
 							: undefined,
-						customerId: String(quote.customerId ?? ''),
+						customerId: quote.customerId ?? undefined,
 					};
 				}
 

@@ -1782,7 +1782,7 @@ export class IntentHandlerService {
 					cityName: quote.cityName
 						? `${quote.cityName}${quote.regionName ? `, ${quote.regionName}` : ''}`
 						: undefined,
-					customerId: String(quote.customerId ?? ''),
+					customerId: quote.customerId ?? undefined,
 				};
 				console.log(
 					`[WhatsApp Agent] PurchaseIntent hasQuote: ${quoteItemsForFlow.length} items, stockId=${flow.quoteStockId}, shopId=${flow.quoteShopId}`,
