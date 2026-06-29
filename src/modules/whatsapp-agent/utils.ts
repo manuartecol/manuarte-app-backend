@@ -21,6 +21,12 @@ export function stemTerm(word: string): string {
 		) {
 			return word.slice(0, -2);
 		}
+		// Plurales de consonante en -ones/-ores: jabones→jabon, colores→color.
+		// El singular termina en consonante (jabón, color), por eso se quita "es"
+		// y no solo la "s" (que dejaría "jabone" y no matchearía "jabon" en BD).
+		if (word.endsWith('ones') || word.endsWith('ores')) {
+			return word.slice(0, -2);
+		}
 	}
 	if (word.length > 3 && word.endsWith('s')) return word.slice(0, -1);
 	return word;
@@ -36,6 +42,8 @@ export const SYNONYM_REPLACEMENTS: Record<string, string[]> = {
 	esencia: ['fragancia'],
 	perfume: ['fragancia'],
 	aroma: ['fragancia'],
+	// El cliente dice "castor" pero en BD el producto es "ricino"
+	castor: ['ricino'],
 };
 
 export const SYNONYMS: Record<string, string[]> = {
