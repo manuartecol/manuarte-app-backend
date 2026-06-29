@@ -4,7 +4,7 @@ import { redis } from '../../config/redis';
 import { WhatsAppLogService } from './logging/log.service';
 import { CountryService } from './agent-services/country.service';
 import { MediaHandlerService } from './agent-services/media-handler.service';
-import { OpenAIService } from './openai.service';
+import { OpenAIService, NLUIntent } from './openai.service';
 import { PaymentLinkService } from './payment-link.service';
 import { ProductSearchService } from './agent-services/product-search.service';
 import { FlowsService } from './agent-services/flows.service';
@@ -26,21 +26,16 @@ import {
 	BUFFER_WAIT_MS,
 	REPLY_DELAY_MS,
 	SESSION_TTL_SECONDS,
+	CONVERSATION_HISTORY_MAX_TURNS,
+	CONVERSATION_HISTORY_MESSAGE_MAX_CHARS,
 } from './constants';
-import { BufferEntry, UserSession } from './types';
 import {
-	detectDeterministicIntent,
-	detectIntent,
-	detectSelection,
-	detectSelectionByName,
-	stripCallingCode,
-} from './helpers/intent-detection';
-import {
-	resolveVariant,
-	parseVariantWeightGrams,
-	detectRequestedWeightGrams,
-	resolveVariantByWeight,
-} from './helpers/product-helpers';
+	BufferEntry,
+	CartChange,
+	ConversationTurn,
+	UserSession,
+} from './types';
+import { stripCallingCode } from './helpers/intent-detection';
 
 import {
 	IntentHandlerService,
@@ -93,18 +88,37 @@ export class WhatsAppAgentService {
 			this.customerService,
 			this.logService,
 			this.ragDocService,
+			this.flowsService,
 		);
 	}
 
 	verifyWebhook = (mode: string, token: string, challenge: string) => {
+		console.log('[WhatsApp Webhook] Verification attempt', {
+			mode,
+			tokenProvided: token,
+			expectedToken: ENV.WHATSAPP_VERIFY_TOKEN,
+			challenge,
+			timestamp: new Date().toISOString(),
+		});
+
 		if (mode !== 'subscribe') {
+			console.log('[WhatsApp Webhook] Invalid mode:', mode);
 			return { status: 403, message: 'Modo inválido' };
 		}
 
 		if (token !== ENV.WHATSAPP_VERIFY_TOKEN) {
+			console.log(
+				'[WhatsApp Webhook] Invalid token. Expected:',
+				ENV.WHATSAPP_VERIFY_TOKEN,
+				'Got:',
+				token,
+			);
 			return { status: 403, message: 'Token de verificación inválido' };
 		}
 
+		console.log(
+			'[WhatsApp Webhook] Validation successful, returning challenge',
+		);
 		return { status: 200, challenge };
 	};
 
@@ -176,10 +190,10 @@ export class WhatsAppAgentService {
 				botPhoneNumberId !== ENV.WHATSAPP_AGENT_PHONE_NUMBER_ID
 			) {
 				console.log(
-					'[WhatsApp Agent] phoneNumberId no coincide con el configurado, ignorando mensaje de:',
+					'[WhatsApp Agent] botPhoneNumberId no coincide con el configurado, ignorando mensaje de:',
 					phoneNumber,
 				);
-				return { status: 200, message: 'phoneNumberId no autorizado.' };
+				return { status: 200, message: 'botPhoneNumberId no autorizado.' };
 			}
 
 			console.log('[WhatsApp Agent] Incoming message:', {
@@ -302,13 +316,20 @@ export class WhatsAppAgentService {
 		text: string,
 	) => {
 		const normalizedText = normalizeText(text);
-		const countryInfo = await this.countryService.detectFromPhone(phoneNumber);
-		const countryPrefix = countryInfo
-			? `+${phoneNumber.startsWith('593') ? '593' : '57'}`
-			: null;
 
+		// Read session first so we can reuse cached countryInfo
 		const raw = await redis.get(`session:${phoneNumber}`);
 		const session: UserSession = raw ? JSON.parse(raw) : {};
+
+		// Use cached country info from session if available — avoids a DB query on every message
+		const countryInfo =
+			session.lastCountryInfo ??
+			(await this.countryService.detectFromPhone(phoneNumber));
+		const countryPrefix = phoneNumber.startsWith('593')
+			? '+593'
+			: phoneNumber.startsWith('57')
+				? '+57'
+				: null;
 		const now = Date.now();
 		const RESUMPTION_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutos
 		const hasActiveList = (session.lastProductList?.length ?? 0) > 0;
@@ -330,9 +351,40 @@ export class WhatsAppAgentService {
 			if (existingCustomer?.fullName) {
 				session.knownCustomerName = existingCustomer.fullName;
 			}
+			// Si no hay datos del cliente, el bot va a pedir nombre y ciudad en su respuesta
+			if (!existingCustomer) {
+				session.awaitingNameAndCity = true;
+			}
 			console.log(
 				`[WhatsApp Agent] isFirstEverInteraction=${session.isFirstEverInteraction}, knownCustomerName=${session.knownCustomerName ?? 'none'}`,
 			);
+		}
+
+		// ── Extracción de nombre y ciudad cuando el cliente los da informalmente ──
+		let nameJustCollected = false;
+		if (
+			!isFirstInteraction &&
+			session.awaitingNameAndCity &&
+			!session.collectedCustomerName &&
+			!session.pendingQuoteFlow &&
+			!session.pendingPurchaseFlow
+		) {
+			try {
+				const extracted = await this.openai.extractNameAndCity(text);
+				if (extracted.name) {
+					session.collectedCustomerName = extracted.name;
+					session.awaitingNameAndCity = false;
+					nameJustCollected = true;
+					console.log(
+						`[WhatsApp Agent] Collected customer name: "${extracted.name}"${extracted.city ? `, city: "${extracted.city}"` : ''}`,
+					);
+				}
+				if (extracted.city) {
+					session.collectedCity = extracted.city;
+				}
+			} catch (err) {
+				console.warn('[WhatsApp Agent] Failed to extract name/city:', err);
+			}
 		}
 
 		session.lastActivityAt = now;
@@ -354,21 +406,27 @@ export class WhatsAppAgentService {
 				countryInfo,
 			);
 			if (purchaseReply !== null) {
-				session.lastBotMessage = purchaseReply;
+				// Cadena vacía: handlePurchaseFlowStep ya envió todo en un solo
+				// mensaje (ej. imagen del QR con caption) y no requiere texto adicional.
+				if (purchaseReply) {
+					session.lastBotMessage = purchaseReply;
+				}
 				await redis.set(
 					`session:${phoneNumber}`,
 					JSON.stringify(session),
 					'EX',
 					SESSION_TTL_SECONDS,
 				);
-				await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
-				await this.sendReply(phoneNumber, botPhoneNumberId, purchaseReply);
+				if (purchaseReply) {
+					await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
+					await this.sendReply(phoneNumber, botPhoneNumberId, purchaseReply);
+				}
 				this.logService
 					.logMessage({
 						phoneNumber,
 						botPhoneNumberId,
 						direction: 'outbound',
-						text: purchaseReply,
+						text: purchaseReply || session.lastBotMessage || '',
 						intent: 'purchase_flow',
 						countryPrefix: countryInfo
 							? `+${phoneNumber.startsWith('593') ? '593' : '57'}`
@@ -420,813 +478,132 @@ export class WhatsAppAgentService {
 			}
 		}
 
-		const selectionIndex = detectSelection(normalizedText);
-		const nameSelectionIndex =
-			selectionIndex === null && hasActiveList
-				? detectSelectionByName(normalizedText, session.lastProductList ?? [])
-				: null;
-		const effectiveSelectionIndex = selectionIndex ?? nameSelectionIndex;
-
-		// Checks determinísticos: show_more y affirmation también los resuelve el backend
-		const deterministicIntent = detectDeterministicIntent(normalizedText);
-
+		// ── NLU: clasificación de intención y extracción de slots ──
+		// Única fuente de intención. Reemplaza el antiguo motor de reglas/regex: una
+		// sola llamada al LLM produce el intent y todos los slots estructurados.
 		let intent: string;
 		let aiSearchQuery: string | undefined;
 		let aiSelectionIndexes: number[] | undefined;
 		let aiVariantHint: string | undefined;
 		let aiQuantity: number | undefined;
 		let aiQuantities: number[] | undefined;
-		let aiRemoveProductHint: string | undefined;
-		let aiAddProductHint: string | undefined;
-		let aiCartEdits:
-			| Array<{ productHint: string; quantity: number }>
-			| undefined;
 		let aiProductList:
-			| Array<{
-					productHint: string;
-					quantity: number;
-					variantHint?: string;
-					unit?: string;
-			  }>
+			| Array<{ productHint: string; quantity: number; variantHint?: string }>
 			| undefined;
+		let aiReasoning: string | undefined;
+		let aiChanges: CartChange[] | undefined;
+		let aiNeedsClarification: boolean | undefined;
+		let aiRecommendFromList: boolean | undefined;
+		let aiSecondaryIntent: NLUIntent | undefined;
 
-		if (isResumption && deterministicIntent !== 'search_product') {
-			intent = 'resumption';
-		} else if (deterministicIntent !== null) {
-			intent = deterministicIntent;
-		} else {
-			// Helper: true si el texto menciona palabras de un producto DIFERENTE al selectedProduct,
-			// tanto en el carrito como en la lista activa.
-			const checkMentionsDifferentProduct = (): boolean =>
-				!!(
-					session.selectedProduct &&
-					(session.cart?.some(item => {
-						if (item.productName === session.selectedProduct) return false;
-						const words = normalizeText(item.productName)
-							.split(/\s+/)
-							.filter(w => w.length > 3);
-						return words.some(w => normalizedText.includes(w));
-					}) ||
-						session.lastProductList?.some(p => {
-							if (p.name === session.selectedProduct) return false;
-							const words = normalizeText(p.name)
-								.split(/\s+/)
-								.filter(w => w.length > 3);
-							return words.some(w => normalizedText.includes(w));
-						}))
-				);
+		try {
+			const activeProductsList = hasActiveList
+				? (session.lastProductList ?? []).map((p, i) => {
+						const variantNames = p.variants.map(v => v.name).filter(Boolean);
+						const label =
+							variantNames.length === 1
+								? `${p.name} – ${variantNames[0]}`
+								: variantNames.length > 1
+									? `${p.name} (variantes: ${variantNames.join(', ')})`
+									: p.name;
+						return { index: i + 1, label };
+					})
+				: undefined;
 
-			// Deterministic override (PRIORITARIO): si detectSelectionByName encontró un
-			// producto DIFERENTE al seleccionado, forzar select_product ANTES de los bloques
-			// de cantidad/peso. Esto evita que "6 kilos de la cca" se interprete como
-			// cantidad de KARITE cuando CCA es un producto diferente en la lista.
-			// Se ejecuta aquí porque checkMentionsDifferentProduct filtra palabras de <=3
-			// caracteres (ej: "cca") y no las detecta como producto diferente.
+			const nluResult = await this.openai.detectIntentWithAI(
+				text,
+				hasActiveList,
+				activeProductsList,
+				session.awaitingMoreProducts,
+				session.selectedProduct,
+				session.cart,
+				session.lastBotMessage,
+				session.conversationHistory,
+			);
+
+			const primaryIntent = nluResult.primary;
+			aiSearchQuery = primaryIntent.searchQuery;
+			aiSelectionIndexes = primaryIntent.selectionIndexes;
+			aiVariantHint = primaryIntent.variantHint;
+			aiQuantity = primaryIntent.quantity;
+			aiQuantities = primaryIntent.quantities;
+			aiProductList = primaryIntent.productList;
+			aiNeedsClarification = primaryIntent.needsClarification;
+			aiRecommendFromList = primaryIntent.recommendFromList;
+			// NUEVO: Razonamiento y cambios basados en modelo (más flexible que slots)
+			aiReasoning = primaryIntent.reasoning;
+			aiChanges = primaryIntent.changes;
+			aiSecondaryIntent = nluResult.secondary ?? undefined;
+
+			// unknown + producto seleccionado → seguir la conversación del producto.
+			// unknown + sin contexto → saludo genérico.
+			intent =
+				primaryIntent.intent === 'unknown'
+					? session.selectedProduct
+						? 'product_followup'
+						: 'greeting'
+					: primaryIntent.intent;
+
+			// Lista activa de un solo producto + cantidad sin selección previa →
+			// selección implícita del único producto (preserva comportamiento anterior).
 			if (
-				session.selectedProduct &&
+				(intent === 'product_followup' || intent === 'greeting') &&
+				!session.selectedProduct &&
+				aiQuantity !== undefined &&
 				hasActiveList &&
-				effectiveSelectionIndex !== null
+				(session.lastProductList?.length ?? 0) === 1
 			) {
-				const mentionedProduct =
-					session.lastProductList?.[effectiveSelectionIndex - 1];
-				if (
-					mentionedProduct &&
-					mentionedProduct.name !== session.selectedProduct
-				) {
-					intent = 'select_product';
-					aiSelectionIndexes = [effectiveSelectionIndex];
-
-					// Extraer cantidad del texto (ej: "tambien dame 2 de la de avena")
-					const qtyMatch = normalizedText.match(/\b(\d+)\b/);
-					if (qtyMatch) {
-						const parsedQty = parseInt(qtyMatch[1], 10);
-						if (parsedQty > 0 && parsedQty <= 1000) {
-							// Verificar si es peso (ej: "2 kilos") → convertir a unidades
-							const requestedGramsDet =
-								detectRequestedWeightGrams(normalizedText);
-							if (requestedGramsDet !== null) {
-								const resolvedV = resolveVariant(
-									mentionedProduct,
-									undefined,
-									normalizedText,
-								);
-								const vGrams = resolvedV
-									? parseVariantWeightGrams(resolvedV.name)
-									: null;
-								if (vGrams !== null) {
-									aiQuantity = Math.ceil(requestedGramsDet / vGrams);
-								} else {
-									aiQuantity = parsedQty;
-								}
-							} else {
-								aiQuantity = parsedQty;
-							}
-						}
-					}
-
-					console.log(
-						`[WhatsApp Agent] Deterministic select_product for different product: "${mentionedProduct.name}" (idx ${effectiveSelectionIndex})` +
-							(aiQuantity !== undefined ? `, qty: ${aiQuantity}` : ''),
-					);
-				}
+				intent = 'select_product';
+				aiSelectionIndexes = [1];
 			}
 
-			// Helper: true si el texto menciona nombres de variante de un producto
-			// multi-variante en la lista activa (útil para evitar que "quiero 1 rectangular"
-			// se interprete como qty=1 del producto ya seleccionado).
-			const mentionsMultiVariantNames = (): boolean => {
-				if (!hasActiveList) return false;
-				return (session.lastProductList ?? []).some(p => {
-					if (p.variants.length <= 1) return false;
-					return p.variants.some(v => {
-						const vWords = normalizeText(v.name)
-							.split(/\s+/)
-							.filter(w => w.length > 2);
-						return vWords.some(w => normalizedText.includes(w));
-					});
-				});
-			};
-
-			// Detección con contexto de sesión: "dame/quiero/ponme X" cuando hay producto activo
-			// Esto evita que la IA clasifique como "unknown" y pierda el contexto del producto
-			// NOTA: no aplica cuando el número va seguido de unidad de peso (ej: "quiero 1 kilo")
-			// NOTA: no aplica cuando el texto menciona variantes de un producto multi-variante
-			// Solo matchea "verbo N" sin texto adicional (ej: "dame 3", "agrega 2").
-			// Si hay texto de producto después del número (ej: "agrega 2 fragancias de chicle"),
-			// el bloque verbQtyHint más abajo se encarga de resolverlo via carrito.
-			const qtyCommandMatch = !intent!
-				? normalizedText.match(
-						/^(?:dame|quiero|pon|ponme|agrega|necesito|llevo|llevame|mandame|enviame)\s+(\d+)(?!\s*(?:kilo[s]?|kg|gramo[s]?|gr|g\b))\s*$/i,
-					)
-				: null;
-			if (qtyCommandMatch && !mentionsMultiVariantNames()) {
-				const extractedQty = parseInt(qtyCommandMatch[1], 10);
-				if (session.selectedProduct && hasActiveList) {
-					// Verificar que el mensaje no mencione un producto DIFERENTE al seleccionado.
-					// Si lo hace, dejar que la IA resuelva (puede ser edit_cart con otro producto).
-					if (!checkMentionsDifferentProduct()) {
-						// Producto ya en contexto: interpretar como cantidad de ese producto
-						intent = 'product_followup';
-						aiQuantity = extractedQty;
-						console.log(
-							`[WhatsApp Agent] Context qty for selected product: ${extractedQty}`,
-						);
-					}
-				} else if (
-					hasActiveList &&
-					(session.lastProductList?.length ?? 0) === 1
-				) {
-					// Un solo producto en lista: selección implícita con cantidad
-					intent = 'select_product';
-					aiSelectionIndexes = [1];
-					aiQuantity = extractedQty;
-					console.log(
-						`[WhatsApp Agent] Context qty → select_product [1] qty=${extractedQty}`,
-					);
-				}
+			// Búsqueda nueva → limpiar el producto seleccionado previo.
+			if (intent === 'search_product') {
+				session.selectedProduct = undefined;
 			}
 
-			// Detección de cantidad por peso (ej: "quiero 1 kilo", "dame 500 gramos")
-			// Aplica cuando hay producto seleccionado O cuando la lista activa tiene exactamente
-			// 1 producto (el cliente implícitamente se refiere a ese).
-			if (!intent! && hasActiveList) {
-				const weightProductEntry = session.selectedProduct
-					? session.lastProductList?.find(
-							p => p.name === session.selectedProduct,
-						)
-					: session.lastProductList?.length === 1
-						? session.lastProductList[0]
-						: undefined;
-				// No aplicar la conversión por peso si el mensaje menciona explícitamente
-				// un producto distinto al seleccionado (ej: "5 kilos de cera" cuando selectedProduct es Ácido Esteárico).
-				if (weightProductEntry && !checkMentionsDifferentProduct()) {
-					const requestedGrams = detectRequestedWeightGrams(normalizedText);
-					if (requestedGrams !== null) {
-						const resolved = resolveVariantByWeight(
-							weightProductEntry.variants,
-							requestedGrams,
-						);
-						if (resolved) {
-							intent = 'product_followup';
-							aiQuantity = resolved.units;
-							session.selectedProduct = weightProductEntry.name;
-							session.selectedVariantName = resolved.variant.name;
-							console.log(
-								`[WhatsApp Agent] Weight request: ${requestedGrams}g → ${resolved.units}x "${resolved.variant.name}" (product: ${weightProductEntry.name})`,
-							);
-						}
-					}
-				}
+			console.log(
+				`[WhatsApp Agent] AI intent: ${primaryIntent.intent}` +
+					(nluResult.secondary
+						? ` + secondary: ${nluResult.secondary.intent}`
+						: '') +
+					(aiSearchQuery ? `, searchQuery: "${aiSearchQuery}"` : '') +
+					(aiSelectionIndexes ? `, selection: [${aiSelectionIndexes}]` : '') +
+					(aiVariantHint ? `, variantHint: "${aiVariantHint}"` : '') +
+					(aiQuantity !== undefined ? `, qty: ${aiQuantity}` : '') +
+					(aiProductList
+						? `, productList: ${JSON.stringify(aiProductList)}`
+						: '') +
+					(aiNeedsClarification ? ', needsClarification' : '') +
+					(aiReasoning ? `, reasoning: "${aiReasoning}"` : '') +
+					(aiChanges ? `, changes: ${JSON.stringify(aiChanges)}` : ''),
+			);
+		} catch (err) {
+			// Red de seguridad mínima si falla la IA (no se reintroduce el motor de reglas).
+			console.warn('[WhatsApp Agent] AI intent detection failed:', err);
+			const loneInteger = normalizedText.match(/^\d+$/);
+			if (hasActiveList && loneInteger) {
+				intent = 'select_product';
+				aiSelectionIndexes = [parseInt(loneInteger[0], 10)];
+			} else if (session.selectedProduct) {
+				intent = 'product_followup';
+			} else {
+				intent = 'greeting';
 			}
-
-			// Detección multi-producto: "Necesito 4 kilos de cera de palma y 1 termometro".
-			// Si el mensaje (o la combinación de mensajes del buffer) contiene 2+ segmentos
-			// con formato "N [unidad?] [de?] producto", se procesa como multi_product_add.
-			// Esto evita que el buffer genere 2 respuestas separadas (una por producto).
-			if (!intent!) {
-				const stripped = normalizedText.replace(
-					/^(?:dame|quiero|necesito|llevame|llevo|mandame|enviame|pon|ponme|agregar?)\s+/i,
-					'',
-				);
-				let segments = stripped.split(/\s+y\s+|,\s*/i);
-				// Si no se encontraron múltiples segmentos por "y"/"," intentar dividir
-				// por saltos de línea del texto original (mensaje con shift+enter en WhatsApp)
-				if (segments.length < 2 && text.includes('\n')) {
-					const STRIP_VERB =
-						/^(?:dame|quiero|necesito|llevame|llevo|mandame|enviame|pon|ponme|agregar?)\s+/i;
-					segments = text
-						.split('\n')
-						.map(l => normalizeText(l).replace(STRIP_VERB, '').trim())
-						.filter(l => l.length > 0);
-				}
-				if (segments.length >= 2) {
-					const parsedItems: Array<{
-						productHint: string;
-						quantity: number;
-						unit?: string;
-					}> = [];
-					let allSegmentsValid = true;
-					for (const seg of segments) {
-						const m = seg
-							.trim()
-							.match(
-								/^(\d+)\s*(kilo[s]?|kg|gramo[s]?|gr|ml|litro[s]?)?\s*(?:de\s+)?(.{2,})$/i,
-							);
-						if (!m) {
-							allSegmentsValid = false;
-							break;
-						}
-						const qty = parseInt(m[1], 10);
-						const unit = m[2]?.toLowerCase() || undefined;
-						const productHint = m[3].trim();
-						if (qty <= 0 || productHint.length < 2) {
-							allSegmentsValid = false;
-							break;
-						}
-						parsedItems.push({ productHint, quantity: qty, unit });
-					}
-					if (allSegmentsValid && parsedItems.length >= 2) {
-						intent = 'multi_product_add';
-						aiProductList = parsedItems;
-						console.log(
-							`[WhatsApp Agent] Multi-product detected: ${parsedItems.map(i => `${i.quantity}x "${i.productHint}"`).join(', ')}`,
-						);
-					}
-				}
-			}
-
-			// Decremento parcial: "quita 1 cera de palma" / "quita una fragancia".
-			// Si se especifica una cantidad N menor que la cantidad actual en el carrito,
-			// se reduce en N en lugar de eliminar el ítem completo.
-			if (!intent! && session.cart?.length) {
-				const removeQtyMatch = normalizedText.match(
-					/^(?:quita[r]?|sac[ae][r]?)\s+(\d+|una?|un)\s+(.+)$/i,
-				);
-				if (removeQtyMatch) {
-					const rawQty = removeQtyMatch[1];
-					const removeQty = /^una?$|^un$/i.test(rawQty)
-						? 1
-						: parseInt(rawQty, 10);
-					const removeHintRaw = removeQtyMatch[2].trim();
-					const removeHintNorm = normalizeText(removeHintRaw);
-					const removeTokens = removeHintNorm
-						.split(/\s+/)
-						.filter(t => !/\d/.test(t) && t.length > 2);
-					if (removeTokens.length > 0) {
-						let bestRemoveItem: NonNullable<typeof session.cart>[0] | undefined;
-						let bestRemoveScore = 0;
-						for (const item of session.cart) {
-							const fullName = normalizeText(
-								item.variantName
-									? `${item.productName} ${item.variantName}`
-									: item.productName,
-							);
-							const score = removeTokens.filter(t =>
-								fullName.includes(t),
-							).length;
-							if (score > bestRemoveScore) {
-								bestRemoveScore = score;
-								bestRemoveItem = item;
-							}
-						}
-						if (bestRemoveItem && bestRemoveScore > 0) {
-							if (removeQty < bestRemoveItem.quantity) {
-								// Decremento parcial: establecer la nueva cantidad
-								intent = 'edit_cart';
-								aiAddProductHint = removeHintRaw;
-								aiQuantity = bestRemoveItem.quantity - removeQty;
-								console.log(
-									`[WhatsApp Agent] Partial remove: "${removeHintRaw}" -${removeQty} → new qty=${aiQuantity}`,
-								);
-							} else {
-								// Quitar todo (qty >= cantidad en carrito)
-								intent = 'edit_cart';
-								aiRemoveProductHint = removeHintRaw;
-								console.log(
-									`[WhatsApp Agent] Full remove (qty≥cart): "${removeHintRaw}"`,
-								);
-							}
-						}
-					}
-				}
-			}
-
-			// Detección del patrón "verbo N producto": "agrega 2 fragancias de chicle".
-			// Cuando el mensaje contiene verbo de acción + número + nombre, y el nombre
-			// coincide con un ítem del carrito, se fuerza edit_cart directo sin pasar por la IA.
-			// Esto evita que qtyCommandMatch interprete el número como cantidad del selectedProduct
-			// anterior en lugar del producto explícitamente mencionado.
-			if (!intent! && session.cart?.length) {
-				const verbQtyHintMatch = normalizedText.match(
-					/^(?:dame|quiero|pon|ponme|agrega[r]?|a[nñ]ade[r]?|sum[ae][r]?|necesito|llevo|llevame|mandame|enviame)\s+(\d+)\s+(.{2,})$/i,
-				);
-				if (verbQtyHintMatch) {
-					const vqhQty = parseInt(verbQtyHintMatch[1], 10);
-					const vqhHint = verbQtyHintMatch[2].trim();
-					const vqhNorm = normalizeText(vqhHint);
-					const vqhIdTokens = vqhNorm.split(/\s+/).filter(t => /\d/.test(t));
-					// Palabras de unidad de medida: no sirven para identificar un producto
-					// y pueden causar falsos positivos contra variantes que las contienen
-					// (ej: "kilos" matchea "KILO" en el nombre de variante de Cera de Palma).
-					const VQH_UNIT_WORDS = new Set([
-						'kilo',
-						'kilos',
-						'kg',
-						'gramo',
-						'gramos',
-						'gr',
-						'ml',
-						'litro',
-						'litros',
-						'unidad',
-						'unidades',
-						'libra',
-						'libras',
-						'onza',
-						'onzas',
-					]);
-					const vqhWordTokens = vqhNorm
-						.split(/\s+/)
-						.filter(
-							t => !/\d/.test(t) && t.length > 2 && !VQH_UNIT_WORDS.has(t),
-						);
-					if (vqhIdTokens.length > 0 || vqhWordTokens.length > 0) {
-						let bestVqhItem: NonNullable<typeof session.cart>[0] | undefined;
-						let bestVqhScore = 0;
-						for (const item of session.cart) {
-							const fullName = normalizeText(
-								item.variantName
-									? `${item.productName} ${item.variantName}`
-									: item.productName,
-							);
-							if (
-								vqhIdTokens.length > 0 &&
-								!vqhIdTokens.every(t => fullName.includes(t))
-							)
-								continue;
-							const score = vqhWordTokens.filter(t =>
-								fullName.includes(t),
-							).length;
-							if (score > bestVqhScore) {
-								bestVqhScore = score;
-								bestVqhItem = item;
-							}
-						}
-						// Requiere que al menos la mitad de los tokens significativos coincidan.
-						// Evita que una sola palabra genérica (ej: "cera") fuerce edit_cart
-						// contra un producto existente cuando el mensaje describe uno distinto.
-						const vqhMinScore = Math.max(
-							1,
-							Math.ceil(vqhWordTokens.length / 2),
-						);
-						if (bestVqhItem && bestVqhScore >= vqhMinScore) {
-							intent = 'edit_cart';
-							aiAddProductHint = vqhHint;
-							aiQuantity = vqhQty;
-							console.log(
-								`[WhatsApp Agent] Verb+qty+hint (cart): "${vqhHint}" x${vqhQty} → edit_cart (matched: ${bestVqhItem.productName})`,
-							);
-						}
-					}
-				}
-			}
-
-			// Detección de frases de corrección: "son N X", "deben ser N X", "mejor N X", etc.
-			// Cubre el caso en que el cliente corrige la cantidad de un producto del carrito
-			// sin usar verbos de acción explícitos.
-			if (!intent! && session.cart?.length) {
-				const correctionMatch = normalizedText.match(
-					/^(?:son|deben?\s+ser|mejor(?:\s+(?:son|sean))?|que\s+sean|en\s+realidad|mejor\s+dicho)\s+(\d+)\s+(.+)$/i,
-				);
-				if (correctionMatch) {
-					const corrQty = parseInt(correctionMatch[1], 10);
-					const corrHint = correctionMatch[2].trim();
-					const corrTokens = normalizeText(corrHint)
-						.split(/\s+/)
-						.filter(w => w.length > 1);
-					const matchedCartItem = session.cart.find(item => {
-						const fullName = normalizeText(
-							item.variantName
-								? `${item.productName} ${item.variantName}`
-								: item.productName,
-						);
-						const idTokens = corrTokens.filter(t => /\d/.test(t));
-						const wordTokens = corrTokens.filter(
-							t => !/\d/.test(t) && t.length > 1,
-						);
-						const idMatch =
-							idTokens.length === 0 ||
-							idTokens.every(t => fullName.includes(t));
-						const wordMatch =
-							wordTokens.length === 0 ||
-							wordTokens.some(t => fullName.includes(t));
-						return (
-							(idTokens.length > 0 || wordTokens.length > 0) &&
-							idMatch &&
-							wordMatch
-						);
-					});
-					if (matchedCartItem) {
-						intent = 'edit_cart';
-						aiAddProductHint = corrHint;
-						aiQuantity = corrQty;
-						console.log(
-							`[WhatsApp Agent] Correction phrase: "${corrHint}" x${corrQty} → edit_cart`,
-						);
-					}
-				}
-			}
-
-			// Texto sin conjunción inicial ("y", "e") ni verbo de acción inicial para matching de patrones.
-			// "y 5 kilos de easy soap white" → "5 kilos de easy soap white".
-			// "necesito 4 kilos de cera de palma" → "4 kilos de cera de palma".
-			// El normalizedText original se preserva para el llamado a la IA.
-			const patternText = normalizedText
-				.replace(/^(?:y|e)\s+/i, '')
-				.replace(
-					/^(?:dame|quiero|necesito|llevame|llevo|mandame|enviame|pon|ponme|agregar?)\s+/i,
-					'',
-				);
-
-			// Detección del patrón "[N] kilos/gramos de [producto]" como búsqueda de nuevo producto.
-			// Maneja mensajes como "y 5 kilos de easy soap white" (tras quitar la conjunción).
-			// Solo aplica cuando el producto NO está en el carrito ni en la lista activa.
-			if (!intent!) {
-				const weightedProductSearchMatch = patternText.match(
-					/^(\d+)\s+(?:kilo(?:s)?|kg|gramos?|gr)\s+(?:de\s+)?(.{2,})$/i,
-				);
-				if (weightedProductSearchMatch) {
-					const wpsQty = parseInt(weightedProductSearchMatch[1], 10);
-					const wpsProduct = weightedProductSearchMatch[2].trim();
-					const wpsTokens = normalizeText(wpsProduct)
-						.split(/\s+/)
-						.filter(w => w.length > 2);
-					if (wpsTokens.length > 0) {
-						const matchesCartWps = (session.cart ?? []).some(item => {
-							const fullName = normalizeText(
-								item.variantName
-									? `${item.productName} ${item.variantName}`
-									: item.productName,
-							);
-							return wpsTokens.some(w => fullName.includes(w));
-						});
-						const matchesActiveListWps = (session.lastProductList ?? []).some(
-							p => {
-								const pNorm = normalizeText(p.name);
-								return wpsTokens.some(w => pNorm.includes(w));
-							},
-						);
-						if (!matchesCartWps && !matchesActiveListWps) {
-							intent = 'search_product';
-							aiSearchQuery = wpsProduct;
-							aiQuantity = wpsQty;
-							session.selectedProduct = undefined;
-							console.log(
-								`[WhatsApp Agent] Weight+product search: "${wpsProduct}" x${wpsQty} → search_product`,
-							);
-						}
-					}
-				}
-			}
-
-			// Detección del patrón "[número] [nombre]" sin verbo de acción.
-			// Si el nombre coincide con el carrito → edit_cart.
-			// Si el nombre no está en la lista activa ni coincide con un índice → search_product.
-			if (!intent!) {
-				const bareQtyProductMatch = patternText.match(/^(\d{1,4})\s+(.{2,})$/);
-				if (bareQtyProductMatch) {
-					const bareQty = parseInt(bareQtyProductMatch[1], 10);
-					const bareNameRaw = bareQtyProductMatch[2].trim();
-					const bareTokens = normalizeText(bareNameRaw)
-						.split(/\s+/)
-						.filter(w => w.length > 2);
-					// Verificar si parece una selección de lista por índice:
-					// el número es un índice válido Y el producto en ese índice
-					// tiene palabras que coinciden con el texto restante.
-					const validIndex =
-						bareQty >= 1 && bareQty <= (session.lastProductList?.length ?? 0);
-					const indexMatchesName =
-						validIndex && session.lastProductList?.[bareQty - 1]
-							? bareTokens.some(t =>
-									normalizeText(
-										session.lastProductList![bareQty - 1].name,
-									).includes(t),
-								)
-							: false;
-					if (!indexMatchesName) {
-						const matchesCart = (session.cart ?? []).some(item => {
-							const fullName = normalizeText(
-								item.variantName
-									? `${item.productName} ${item.variantName}`
-									: item.productName,
-							);
-							return bareTokens.some(w => fullName.includes(w));
-						});
-						const matchesActiveList = (session.lastProductList ?? []).some(
-							p => {
-								const pNorm = normalizeText(p.name);
-								return bareTokens.some(w => pNorm.includes(w));
-							},
-						);
-						if (matchesCart && !matchesActiveList) {
-							intent = 'edit_cart';
-							aiAddProductHint = bareNameRaw;
-							aiQuantity = bareQty;
-							console.log(
-								`[WhatsApp Agent] Bare qty+name (cart): "${bareNameRaw}" x${bareQty} → edit_cart`,
-							);
-						} else if (!matchesActiveList && bareTokens.length > 0) {
-							intent = 'search_product';
-							aiSearchQuery = bareNameRaw;
-							aiQuantity = bareQty;
-							session.selectedProduct = undefined;
-							console.log(
-								`[WhatsApp Agent] Bare qty+name (new product): "${bareNameRaw}" x${bareQty} → search_product`,
-							);
-						}
-					}
-				}
-			}
-
-			// Detección determinista: "N de [variante]" cuando hay lista activa con variantes.
-			// Cubre el caso en que el cliente ya vio la lista de variantes y responde con
-			// cantidad + variante en un solo mensaje (ej: "4 de 20 ml", "2 de 100 gramos").
-			// Se ejecuta antes de la IA para evitar que clasifique incorrectamente.
-			if (!intent! && hasActiveList) {
-				const variantQtyMatch = normalizedText.match(
-					/^(\d+)\s+de\s+(?:la\s+de\s+)?(.{2,})$/i,
-				);
-				if (variantQtyMatch) {
-					const vqQty = parseInt(variantQtyMatch[1], 10);
-					const vqHint = variantQtyMatch[2].trim();
-					const vqHintNorm = normalizeText(vqHint);
-					const matchingProducts: Array<{
-						index: number;
-						variantName: string;
-					}> = [];
-					for (let pi = 0; pi < (session.lastProductList?.length ?? 0); pi++) {
-						const product = session.lastProductList![pi];
-						if (product.variants.length <= 1) continue;
-						const matchedVariant = product.variants.find(v => {
-							const vNorm = normalizeText(v.name);
-							return vNorm.includes(vqHintNorm) || vqHintNorm.includes(vNorm);
-						});
-						if (matchedVariant) {
-							matchingProducts.push({
-								index: pi + 1,
-								variantName: matchedVariant.name,
-							});
-						}
-					}
-					if (matchingProducts.length === 1) {
-						intent = 'select_product';
-						aiSelectionIndexes = [matchingProducts[0].index];
-						aiVariantHint = vqHint;
-						aiQuantity = vqQty;
-						console.log(
-							`[WhatsApp Agent] Variant+qty deterministic: "${vqHint}" x${vqQty} → select_product [${matchingProducts[0].index}] (variant: "${matchingProducts[0].variantName}")`,
-						);
-					} else if (matchingProducts.length > 1 && session.selectedProduct) {
-						const selIdx = session.lastProductList?.findIndex(
-							p => p.name === session.selectedProduct,
-						);
-						if (selIdx !== undefined && selIdx >= 0) {
-							const match = matchingProducts.find(m => m.index === selIdx + 1);
-							if (match) {
-								intent = 'select_product';
-								aiSelectionIndexes = [match.index];
-								aiVariantHint = vqHint;
-								aiQuantity = vqQty;
-								console.log(
-									`[WhatsApp Agent] Variant+qty deterministic (selected product): "${vqHint}" x${vqQty} → select_product [${match.index}] (variant: "${match.variantName}")`,
-								);
-							}
-						}
-					}
-				}
-			}
-
-			// Pre-chequeo determinista: si awaitingMoreProducts=true y el cliente pregunta
-			// por un tipo específico de producto (ej: "qué ceras tienes disponible"),
-			// forzar search_product antes de la IA para evitar falsos positivos de show_more.
-			if (!intent! && session.awaitingMoreProducts) {
-				const specificProductQuestionRegex =
-					/^(?:que|cuales?|cuantos?)\s+(.{2,40})\s+(?:tienes?|tienen|hay|manejan|venden|tienes?\s+disponible|tienen\s+disponible)[?¿\s]*$/i;
-				const spmMatch = normalizedText.match(specificProductQuestionRegex);
-				if (spmMatch) {
-					const capturedTerm = spmMatch[1].trim();
-					const showCartTokens = new Set([
-						'llevamos',
-						'llevo',
-						'carrito',
-						'pedido',
-					]);
-					const termTokens = capturedTerm.split(/\s+/);
-					if (
-						capturedTerm.length >= 2 &&
-						!termTokens.some(t => showCartTokens.has(t))
-					) {
-						intent = 'search_product';
-						aiSearchQuery = capturedTerm;
-						session.selectedProduct = undefined;
-						console.log(
-							`[WhatsApp Agent] Specific product question (awaitingMore): "${capturedTerm}" → search_product`,
-						);
-					}
-				}
-			}
-
-			if (!intent!) {
-				// Pasar siempre la lista activa al clasificador de IA.
-				// Cuando hay un producto seleccionado se añade nota para que la IA distinga
-				// entre "menciona otro producto de la lista" vs "dice una cantidad".
-				try {
-					// Suppress active product list when message clearly targets a cart item with an
-					// edit verb → prevents AI from picking "select_product" by index
-					const suppressActiveList = !!(
-						hasActiveList &&
-						session.cart?.length &&
-						/\b(agrega[r]?|a[nñ]ade[r]?|sum[ae][r]?|quita[r]?|saca[r]?)\b/i.test(
-							normalizedText,
-						) &&
-						session.cart.some(item => {
-							const words = normalizeText(item.productName)
-								.split(/\s+/)
-								.filter(w => w.length > 3);
-							return words.some(w => normalizedText.includes(w));
-						})
-					);
-
-					const activeProductsList =
-						hasActiveList && !suppressActiveList
-							? (session.lastProductList ?? []).map((p, i) => {
-									const variantNames = p.variants
-										.map(v => v.name)
-										.filter(Boolean);
-									const label =
-										variantNames.length === 1
-											? `${p.name} – ${variantNames[0]}`
-											: variantNames.length > 1
-												? `${p.name} (variantes: ${variantNames.join(', ')})`
-												: p.name;
-									return { index: i + 1, label };
-								})
-							: undefined;
-
-					const aiResult = await this.openai.detectIntentWithAI(
-						text,
-						hasActiveList && !suppressActiveList,
-						activeProductsList,
-						session.awaitingMoreProducts,
-						session.selectedProduct,
-						session.cart,
-						session.lastBotMessage,
-					);
-
-					// unknown + producto activo → continuar conversación del producto
-					// unknown + sin contexto → saludo genérico
-					intent =
-						aiResult.intent === 'unknown'
-							? session.selectedProduct
-								? 'product_followup'
-								: 'greeting'
-							: aiResult.intent;
-
-					aiSearchQuery = aiResult.searchQuery;
-					aiSelectionIndexes = aiResult.selectionIndexes;
-					aiVariantHint = aiResult.variantHint;
-					aiQuantity = aiResult.quantity;
-					aiQuantities = aiResult.quantities;
-					aiRemoveProductHint = aiResult.removeProductHint;
-					aiAddProductHint = aiResult.addProductHint;
-					aiCartEdits = aiResult.cartEdits;
-					aiProductList = aiResult.productList;
-					console.log(
-						`[WhatsApp Agent] AI intent: ${aiResult.intent}` +
-							(aiSearchQuery ? `, searchQuery: "${aiSearchQuery}"` : '') +
-							(aiSelectionIndexes
-								? `, selection: [${aiSelectionIndexes}]`
-								: '') +
-							(aiVariantHint ? `, variantHint: "${aiVariantHint}"` : '') +
-							(aiQuantity !== undefined ? `, qty: ${aiQuantity}` : '') +
-							(aiAddProductHint ? `, addHint: "${aiAddProductHint}"` : '') +
-							(aiRemoveProductHint
-								? `, removeHint: "${aiRemoveProductHint}"`
-								: '') +
-							(aiCartEdits
-								? `, cartEdits: ${JSON.stringify(aiCartEdits)}`
-								: ''),
-					);
-
-					// Si detectó búsqueda nueva → limpiar producto seleccionado
-					if (intent === 'search_product') {
-						session.selectedProduct = undefined;
-					}
-				} catch (err) {
-					console.warn(
-						'[WhatsApp Agent] AI intent detection failed, falling back to rules:',
-						err,
-					);
-					if (effectiveSelectionIndex !== null && hasActiveList) {
-						intent = 'select_product';
-						aiSelectionIndexes = [effectiveSelectionIndex];
-					} else if (session.selectedProduct) {
-						intent = 'product_followup';
-					} else {
-						intent = detectIntent(normalizedText);
-					}
-				}
-			} // end if (!intent!)
 		}
 
-		// Reclasificar: edit_cart + addProductHint sin coincidencia en carrito → search_product
-		// Ocurre cuando el cliente pide un producto con cantidad pero el carrito está vacío
-		// o no tiene ese producto (ej: "Necesito 4 kilos de cera de palma").
+		// Resumption: si el cliente vuelve tras una pausa larga y no trae una solicitud
+		// concreta nueva, retomar el contexto del producto anterior.
 		if (
-			intent === 'edit_cart' &&
-			aiAddProductHint &&
-			!session.cart?.some(item => {
-				const fullName = normalizeText(
-					item.variantName
-						? `${item.productName} ${item.variantName}`
-						: item.productName,
-				);
-				const tokens = normalizeText(aiAddProductHint)
-					.split(/\s+/)
-					.filter(t => t.length > 2);
-				return tokens.some(t => fullName.includes(t));
-			})
+			isResumption &&
+			(intent === 'greeting' || intent === 'product_followup')
 		) {
-			console.log(
-				`[WhatsApp Agent] Reclassifying edit_cart → search_product: hint "${aiAddProductHint}" not found in cart`,
-			);
-			intent = 'search_product';
-			// Filtrar preposiciones y palabras cortas del hint antes de usarlo como
-			// search query, para evitar que "de" contamine el fallback OR en buildProductReply
-			const cleanedHint = normalizeText(aiAddProductHint)
-				.split(/\s+/)
-				.filter(w => w.length > 1)
-				.join(' ');
-			aiSearchQuery = cleanedHint || undefined;
-			session.selectedProduct = undefined;
+			intent = 'resumption';
 		}
 
-		// Reclasificar: request_quote sin lista de productos y sin palabras clave de cotización → search_product
-		// Ocurre cuando el AI malinterpreta "Necesito X kilos de Y" como solicitud de cotización.
-		if (
-			intent === 'request_quote' &&
-			(!aiProductList || aiProductList.length === 0) &&
-			!/cotiz[ao]|cotizaci[oó]n|presupuesto|proforma/i.test(text)
-		) {
-			console.log(
-				'[WhatsApp Agent] Reclassifying request_quote → search_product: no quote keywords detected',
-			);
-			intent = 'search_product';
-			session.selectedProduct = undefined;
-			// Extraer nombre del producto: quitar verbo inicial + cantidad + unidad de peso
-			const extractedForSearch = normalizedText
-				.replace(
-					/^(?:dame|quiero|necesito|llevame|llevo|mandame|enviame|pon|ponme|agregar?)\s+/i,
-					'',
-				)
-				.replace(
-					/^\d+(?:[.,]\d+)?\s*(?:kilo[s]?|kg|gramo[s]?|gr|g\b)\s*(?:de\s+)?/i,
-					'',
-				)
-				.trim();
-			const cleanedForSearch = extractedForSearch
-				.split(/\s+/)
-				.filter(w => w.length > 1)
-				.join(' ');
-			if (cleanedForSearch) aiSearchQuery = cleanedForSearch;
-			// Si la IA no retornó quantity (habitual en request_quote sin productList), extraerla del texto
-			if (aiQuantity === undefined) {
-				const qtyMatch = normalizedText.match(/\b(\d+)\b/);
-				if (qtyMatch) {
-					const n = parseInt(qtyMatch[1], 10);
-					if (n > 0 && n <= 10000) aiQuantity = n;
-				}
-			}
+		// Si el cliente acaba de dar su nombre/ciudad, ignorar el intent detectado por NLU.
+		if (nameJustCollected) {
+			intent = 'name_collected';
 		}
 
 		console.log(
@@ -1273,12 +650,15 @@ export class WhatsAppAgentService {
 			aiVariantHint,
 			aiQuantity,
 			aiQuantities,
-			aiRemoveProductHint,
-			aiAddProductHint,
-			aiCartEdits,
 			aiProductList,
+			aiReasoning: aiReasoning,
+			aiChanges: aiChanges,
+			aiNeedsClarification,
+			aiRecommendFromList,
+			secondaryIntent: aiSecondaryIntent,
 			isFirstEverInteraction: session.isFirstEverInteraction,
-			knownCustomerName: session.knownCustomerName,
+			knownCustomerName:
+				session.knownCustomerName ?? session.collectedCustomerName,
 		};
 
 		const replyText = await this.intentHandlerService.handle(intent, ctx);
@@ -1292,8 +672,36 @@ export class WhatsAppAgentService {
 			session.hasIntroducedByName = true;
 		}
 
+		// Una respuesta vacía ('') significa que el handler ya envió todo por su cuenta
+		// (p. ej. el QR de pago como imagen con caption): no hay texto adicional que enviar.
+		// En ese caso, session.lastBotMessage ya fue fijado por el handler.
+		const handlerSentOwnMessage = replyText === '';
+
 		// Guardar último mensaje del bot en la sesión para contexto en próximas respuestas
-		session.lastBotMessage = replyText;
+		if (!handlerSentOwnMessage) {
+			session.lastBotMessage = replyText;
+		}
+
+		// Actualizar historial de conversación (máx CONVERSATION_HISTORY_MAX_TURNS entradas)
+		const botTurnText = handlerSentOwnMessage
+			? (session.lastBotMessage ?? '')
+			: replyText;
+		const userTurn: ConversationTurn = {
+			role: 'user',
+			text: text.slice(0, CONVERSATION_HISTORY_MESSAGE_MAX_CHARS),
+			ts: now,
+		};
+		const botTurn: ConversationTurn = {
+			role: 'bot',
+			text: botTurnText.slice(0, CONVERSATION_HISTORY_MESSAGE_MAX_CHARS),
+			ts: Date.now(),
+		};
+		session.conversationHistory = [
+			...(session.conversationHistory ?? []),
+			userTurn,
+			botTurn,
+		].slice(-CONVERSATION_HISTORY_MAX_TURNS * 2);
+
 		await redis.set(
 			`session:${phoneNumber}`,
 			JSON.stringify(session),
@@ -1301,15 +709,17 @@ export class WhatsAppAgentService {
 			SESSION_TTL_SECONDS,
 		);
 
-		await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
-		await this.sendReply(phoneNumber, botPhoneNumberId, replyText);
+		if (!handlerSentOwnMessage) {
+			await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
+			await this.sendReply(phoneNumber, botPhoneNumberId, replyText);
+		}
 
 		this.logService
 			.logMessage({
 				phoneNumber,
 				botPhoneNumberId,
 				direction: 'outbound',
-				text: replyText,
+				text: handlerSentOwnMessage ? (session.lastBotMessage ?? '') : replyText,
 				intent: null,
 				countryPrefix,
 			})

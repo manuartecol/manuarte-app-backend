@@ -37,6 +37,43 @@ export function buildResumptionReply(product: ProductListEntry): string {
 	);
 }
 
+/**
+ * Score de coincidencia (0..1) entre un hint del NLU y el nombre de un
+ * producto/ítem: proporción de palabras del hint que coinciden, donde la
+ * coincidencia exacta vale 1 y la parcial (substring) 0.5. Evita el falso
+ * positivo de "cualquier palabra matchea cualquier ítem".
+ */
+export function scoreNameMatch(hint: string, candidate: string): number {
+	const hintWords = normalizeText(hint)
+		.split(/\s+/)
+		.filter(w => w.length > 2);
+	if (hintWords.length === 0) return 0;
+	const candidateWords = normalizeText(candidate).split(/\s+/);
+	let score = 0;
+	for (const hw of hintWords) {
+		if (candidateWords.some(cw => cw === hw)) score += 1;
+		else if (candidateWords.some(cw => cw.includes(hw) || hw.includes(cw)))
+			score += 0.5;
+	}
+	return score / hintWords.length;
+}
+
+/**
+ * true si TODAS las palabras significativas del hint coinciden (al menos
+ * parcialmente) en el candidato. Determina identidad de producto: "aceite de
+ * coco" NO es "Aceite Vegetal Ricino" aunque compartan la palabra "aceite".
+ */
+export function allHintWordsMatch(hint: string, candidate: string): boolean {
+	const hintWords = normalizeText(hint)
+		.split(/\s+/)
+		.filter(w => w.length > 2);
+	if (hintWords.length === 0) return false;
+	const candidateWords = normalizeText(candidate).split(/\s+/);
+	return hintWords.every(hw =>
+		candidateWords.some(cw => cw === hw || cw.includes(hw) || hw.includes(cw)),
+	);
+}
+
 export function resolveVariant(
 	product: ProductListEntry,
 	hint?: string,

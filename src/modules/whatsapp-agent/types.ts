@@ -28,6 +28,44 @@ export interface CartItem {
 	currency: string;
 }
 
+/** Cambio al carrito extraído por el NLU. El modelo razona la instrucción del cliente y la traduce a una de estas acciones. */
+export interface CartChange {
+	action: 'set' | 'increase' | 'decrease' | 'new' | 'remove';
+	/** Índice 1-based del ítem en [carrito actual]; solo acciones sobre ítems existentes */
+	cartIndex?: number;
+	product?: string;
+	/** Cantidad en UNIDADES (exclusivo con weightText) */
+	quantity?: number;
+	/** Cantidad expresada en PESO, tal como la dijo el cliente ("1 kilo", "500 gramos") */
+	weightText?: string;
+	/** Cambio de PRESENTACIÓN deseada ("500 g", "2 kilos") — no es cantidad */
+	variant?: string;
+}
+
+/** Resultado de aplicar un CartChange. Permite que la respuesta al cliente refleje lo que realmente pasó. */
+export interface CartChangeResult {
+	change: CartChange;
+	status: 'applied' | 'not_found' | 'needs_search' | 'no_op';
+	/** Ítem del carrito afectado (referencia interna para recuperaciones del handler) */
+	item?: CartItem;
+	/** Nombre legible del ítem afectado ("Cera de Palma KILO") */
+	itemLabel?: string;
+	oldQuantity?: number;
+	newQuantity?: number;
+	/** true si el ítem fue eliminado del carrito */
+	removed?: boolean;
+	/** true si la cantidad fue limitada por stock disponible */
+	capped?: boolean;
+	requestedQuantity?: number;
+	availableStock?: number;
+	/** true si el cambio requiere reemplazar el ítem por otra presentación (lo resuelve el handler) */
+	variantSwitch?: boolean;
+	/** true si el mensaje nombra productos pero ninguno corresponde al ítem resuelto (el NLU arrastró un ítem de otro turno) */
+	mentionMismatch?: boolean;
+	/** Nota para la respuesta al cliente (ej. peso no múltiplo de la presentación) */
+	note?: string;
+}
+
 export interface PendingQuoteFlow {
 	step:
 		| 'awaiting_cart_confirmation'
@@ -121,6 +159,12 @@ export interface CollectionFlow {
 	cityCandidates?: Array<{ id: number; name: string; regionName: string }>;
 }
 
+export interface ConversationTurn {
+	role: 'user' | 'bot';
+	text: string;
+	ts: number;
+}
+
 export interface UserSession {
 	lastProductList?: ProductListEntry[];
 	remainingProductList?: ProductListEntry[];
@@ -157,4 +201,16 @@ export interface UserSession {
 	lastRagDocTitle?: string;
 	/** Nombre del producto RAG que no está disponible en stock (pero sí tiene alternativas). Se usa para informar al cliente cuando dice "Sí" en el siguiente turno. */
 	outOfStockRagProductName?: string;
+	/** Historial de los últimos turnos de conversación (user + bot). Máximo CONVERSATION_HISTORY_MAX_TURNS entradas. */
+	conversationHistory?: ConversationTurn[];
+	/** true cuando el bot le pidió nombre y ciudad al cliente y aún no los ha recibido */
+	awaitingNameAndCity?: boolean;
+	/** Nombre del cliente recogido informalmente en el chat (sin estar en BD) */
+	collectedCustomerName?: string;
+	/** Ciudad del cliente recogida informalmente en el chat */
+	collectedCity?: string;
+	/** Timestamp de la última compra COMPLETADA (comprobante recibido) en esta sesión.
+	 *  Se usa para dar un cierre/saludo acorde a "acaba de comprar" en vez de las frases
+	 *  genéricas de "me avisa cualquier cosa". */
+	lastPurchaseAt?: number;
 }

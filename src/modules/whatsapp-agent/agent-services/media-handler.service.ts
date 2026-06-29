@@ -232,9 +232,16 @@ export class MediaHandlerService {
 			);
 		}
 
-		// Clear flow and cart
+		// Clear flow, cart y la referencia a la cotización: la compra ya se completó
+		// (y la cotización fue eliminada). Si no limpiamos lastQuoteId/lastQuoteSerial,
+		// un saludo posterior re-ofrecería esa cotización ya consumida.
 		session.pendingPurchaseFlow = null;
 		session.cart = [];
+		session.lastQuoteId = undefined;
+		session.lastQuoteSerial = undefined;
+		// Marca la compra como recién completada: el cierre/saludo siguiente debe sonar a
+		// "gracias por su compra / un gusto atenderlo", no a "me avisa cualquier cosa".
+		session.lastPurchaseAt = Date.now();
 
 		await redis.set(
 			`session:${phoneNumber}`,

@@ -18,11 +18,12 @@ export class WhatsAppService {
 		buffer: Buffer,
 		filename: string,
 		phoneNumberId: string = ENV.WHATSAPP_PHONE_NUMBER_ID,
+		contentType: string = 'application/pdf',
 	): Promise<string> => {
 		const form = new FormData();
 		form.append('file', buffer, {
 			filename,
-			contentType: 'application/pdf',
+			contentType,
 			knownLength: buffer.length,
 		});
 		form.append('messaging_product', 'whatsapp');

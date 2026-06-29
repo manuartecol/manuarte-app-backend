@@ -25,6 +25,7 @@ export class WhatsAppAgentController {
 				return;
 			}
 
+			res.setHeader('Content-Type', 'text/plain');
 			res.status(200).send(result.challenge);
 		} catch (error) {
 			next(error);

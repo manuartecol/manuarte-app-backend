@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { PersonModel } from '../../person/model';
 import { CustomerModel } from '../../customer/model';
 import { OpenAIService } from '../openai.service';
@@ -17,6 +19,10 @@ import { stripCallingCode, isFarewellOnly } from '../helpers/intent-detection';
 import { mapCartToQuoteItems } from '../helpers/cart-helpers';
 import { CartItem, CollectionFlow, UserSession } from '../types';
 
+const PAYMENT_QR_CO_IMAGE = fs.readFileSync(
+	path.resolve(__dirname, '../../../../src/assets/QR-Bancolombia-Manuarte.jpg'),
+);
+
 export class FlowsService {
 	constructor(
 		private openai: OpenAIService,
@@ -28,6 +34,161 @@ export class FlowsService {
 		private paymentLinkService: PaymentLinkService,
 		private productSearchService: ProductSearchService,
 	) {}
+
+	/**
+	 * Envía en un solo mensaje la imagen del QR de transferencia Bancolombia
+	 * (Colombia) junto con el texto indicado como caption. Devuelve true si
+	 * el envío fue exitoso. Para Ecuador aún no hay imagen real, se sigue
+	 * usando el texto placeholder.
+	 */
+	private sendBancolombiaQrImage = async (
+		phoneNumber: string,
+		botPhoneNumberId: string,
+		caption: string,
+	): Promise<boolean> => {
+		try {
+			const mediaId = await this.whatsAppService.uploadMedia(
+				PAYMENT_QR_CO_IMAGE,
+				'QR-Bancolombia-Manuarte.jpg',
+				botPhoneNumberId,
+				'image/jpeg',
+			);
+			await this.whatsAppService.sendImage(
+				phoneNumber,
+				mediaId,
+				botPhoneNumberId,
+				caption,
+			);
+			return true;
+		} catch (err) {
+			console.error(
+				'[WhatsApp Agent] Error sending Bancolombia QR image:',
+				err,
+			);
+			return false;
+		}
+	};
+
+	/**
+	 * Presenta el pago por transferencia (QR para Colombia, texto para Ecuador) de una
+	 * compra a partir de una cotización y deja el flujo en `awaiting_receipt`.
+	 * Es el método ÚNICO y por defecto para mostrar el pago de una compra desde cotización:
+	 * el QR es el medio por defecto; el link de Bold/PayPhone solo se ofrece si el cliente
+	 * pide pagar con tarjeta (se maneja en el paso awaiting_receipt).
+	 * Carga los datos de la cotización (incluido personId) si el flujo aún no los tiene.
+	 * NO repite el resumen del pedido (el cliente ya lo vio y recibió la cotización): solo total.
+	 * Devuelve '' si el QR se envió como imagen (no hace falta texto adicional).
+	 */
+	presentQuotePurchasePayment = async (
+		session: UserSession,
+		phoneNumber: string,
+		botPhoneNumberId: string,
+		countryInfo: {
+			currency: string;
+			stockIds: string[];
+			shopId: string;
+			isoCode: string;
+		} | null,
+	): Promise<string> => {
+		const flow = session.pendingPurchaseFlow!;
+		const isoCode =
+			session.lastCountryInfo?.isoCode ?? countryInfo?.isoCode ?? 'CO';
+		const currency =
+			session.lastCountryInfo?.currency ??
+			countryInfo?.currency ??
+			flow.currency ??
+			'COP';
+
+		// Cargar items/datos de la cotización si el flujo aún no los tiene.
+		if ((!flow.items || flow.items.length === 0) && flow.quoteSerial) {
+			const quoteResult = await this.quoteService.getOne(flow.quoteSerial);
+			if (quoteResult.status === 200 && quoteResult.quote) {
+				const quote = quoteResult.quote;
+				const quoteItemsArr = (quote.items ?? quote.quoteItems ?? []) as Array<{
+					name: string;
+					quantity: number;
+					price: number;
+					productVariantId?: string;
+					stockItemId?: string;
+				}>;
+				flow.items = quoteItemsArr.map(qi => ({
+					productId: '',
+					productVariantId: qi.productVariantId ?? '',
+					stockItemId: qi.stockItemId ?? undefined,
+					productName: qi.name,
+					quantity: qi.quantity,
+					unitPrice: String(qi.price),
+					currency,
+				}));
+				flow.total = calculateTotals(quote).total;
+				flow.currency = currency;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				flow.quoteStockId = (quote as any).stockId ?? flow.quoteStockId;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				flow.quoteShopId = (quote as any).shopId ?? flow.quoteShopId;
+				flow.purchaseFromQuote = true;
+				if (!flow.collectedData) {
+					let resolvedPersonId: string | undefined;
+					if (quote.customerId) {
+						const customerRecord = await CustomerModel.findByPk(
+							quote.customerId,
+							{ attributes: ['personId'] },
+						);
+						if (customerRecord) {
+							resolvedPersonId = customerRecord.get('personId') as string;
+						}
+					}
+					flow.collectedData = {
+						fullName: quote.fullName,
+						dni: quote.dni,
+						phoneNumber: quote.phoneNumber,
+						location: quote.location,
+						cityId: quote.cityId,
+						cityName: quote.cityName
+							? `${quote.cityName}${quote.regionName ? `, ${quote.regionName}` : ''}`
+							: undefined,
+						customerId: quote.customerId ?? undefined,
+						personId: resolvedPersonId,
+					};
+				}
+			}
+		}
+
+		const paymentRef = crypto.randomUUID();
+		flow.paymentRef = paymentRef;
+		flow.paymentMethod = 'BANK_TRANSFER_RT';
+		flow.step = 'awaiting_receipt';
+
+		const totalStr =
+			flow.total != null
+				? formatPrice(String(flow.total), flow.currency ?? currency)
+				: '';
+
+		if (isoCode === 'CO') {
+			const caption =
+				`Le comparto el QR para que realice el pago por transferencia.\n\n` +
+				(totalStr ? `Total: ${totalStr}\n\n` : '') +
+				`Ref: ${paymentRef}\n\n` +
+				`Cuando realice el pago, envíenos el comprobante (imagen o PDF) 📸`;
+			const sent = await this.sendBancolombiaQrImage(
+				phoneNumber,
+				botPhoneNumberId,
+				caption,
+			);
+			if (sent) {
+				session.lastBotMessage = caption;
+				return '';
+			}
+			return caption;
+		}
+
+		return (
+			`Para completar su pedido, realice el pago por transferencia:\n\n${ENV.PAYMENT_QR_EC_INFO}\n\n` +
+			(totalStr ? `Total: ${totalStr}\n\n` : '') +
+			`Ref: ${paymentRef}\n\n` +
+			`Cuando realice el pago, envíenos el comprobante (imagen o PDF) 📸`
+		);
+	};
 
 	/**
 	 * Maneja los pasos comunes de recopilación de datos del cliente
@@ -102,7 +263,24 @@ export class FlowsService {
 			if (!cityText) return '¿Y en qué ciudad estás?';
 
 			const cityResult = await this.cityService.search(cityText);
-			const cityResults = cityResult?.cities ?? [];
+			let cityResults = cityResult?.cities ?? [];
+
+			// Fallback: "Fundacion Magdalena" won't match city "Fundacion" directly.
+			// Try each word individually and deduplicate by id.
+			if (cityResults.length === 0 && cityText.trim().includes(' ')) {
+				const words = cityText.trim().split(/\s+/);
+				const perWordResults = await Promise.all(
+					words.map(w => this.cityService.search(w).then(r => r?.cities ?? [])),
+				);
+				const seen = new Set<number>();
+				cityResults = perWordResults.flat().filter(c => {
+					const id = c.dataValues.id;
+					if (seen.has(id)) return false;
+					seen.add(id);
+					return true;
+				});
+			}
+
 			if (cityResults.length === 0) {
 				return `No encontré la ciudad "${cityText}". ¿Puedes escribirla de nuevo?`;
 			}
@@ -400,6 +578,7 @@ export class FlowsService {
 							cart: session.cart,
 							currency,
 							quoteFlowData: flow.collectedData,
+							lastBotMessage: session.lastBotMessage ?? undefined,
 						})
 						.catch(
 							() => '¿Confirmo la cotización con estos datos actualizados?',
@@ -548,7 +727,7 @@ export class FlowsService {
 					);
 				}
 
-				return 'Con gusto le ayudo a completar la compra 😊';
+				return 'Con gusto le ayudo a completar la compra ¿Desea proceder con el pago?';
 			} catch (error) {
 				console.error('[WhatsApp Agent] Error creating quote:', error);
 				session.pendingQuoteFlow = null;
@@ -746,17 +925,33 @@ export class FlowsService {
 
 		// ── Paso 0: confirmar si procede desde la cotización existente ──
 		if (flow.step === 'awaiting_quote_confirmation') {
-			// Los datos ya fueron confirmados en el flujo de cotización.
-			// Solo se aborta si el cliente rechaza explícitamente o pide una corrección.
-			const isExplicitRefusal =
-				/^(no\b|cancelar|cancela|no\s+quiero|no\s+gracias|olvidalo|dejalo|no\s+me)\b/i.test(
-					normalizedText.trim(),
-				);
-			const hasCorrectionRequest =
-				/\b(cambiar|cambio|cambia|corregir|corrige|modificar|modifica|pero|mal|error|falta|no es|en vez de|en lugar de|la cedula|el nombre|la direccion|el telefono)\b/i.test(
-					normalizedText,
-				);
-			const isConfirm = !isExplicitRefusal && !hasCorrectionRequest;
+			// Los datos ya fueron confirmados en el flujo de cotización. Interpretamos la
+			// respuesta del cliente con el modelo (no por regex) para distinguir entre
+			// aceptar, aplazar/rechazar o querer corregir algún dato.
+			const decision = await this.openai.classifyConfirmationReply(
+				text,
+				session.lastBotMessage ??
+					'Con gusto le ayudo a completar la compra. ¿Desea proceder con el pago?',
+			);
+
+			// El cliente aplaza o no desea continuar ahora → no mostrar el pago.
+			// Cerramos el flujo de compra para no quedar esperando un pago que no llega
+			// y nos despedimos con calidez, dejando la puerta abierta.
+			if (decision === 'decline') {
+				session.pendingPurchaseFlow = null;
+				return await this.openai
+					.generateReply({
+						userMessage: text,
+						intent: 'farewell',
+						lastBotMessage: session.lastBotMessage ?? undefined,
+					})
+					.catch(
+						() =>
+							'¡Claro que sí! Aquí estaré cuando decida. Que tenga un buen día 🙌',
+					);
+			}
+
+			const isConfirm = decision === 'confirm';
 
 			if (isConfirm) {
 				// Cargar items de la cotización
@@ -797,51 +992,43 @@ export class FlowsService {
 					console.log(
 						`[WhatsApp Agent] Quote items loaded for purchase: ${items.length} items, stockId=${flow.quoteStockId}, shopId=${flow.quoteShopId}`,
 					);
-					// Usar datos del cliente de la cotización si los hay
-					flow.collectedData = flow.collectedData ?? {
-						fullName: quote.fullName,
-						dni: quote.dni,
-						phoneNumber: quote.phoneNumber,
-						location: quote.location,
-						cityId: quote.cityId,
-						cityName: quote.cityName
-							? `${quote.cityName}${quote.regionName ? `, ${quote.regionName}` : ''}`
-							: undefined,
-						customerId: quote.customerId ?? undefined,
-					};
+					// Usar datos del cliente de la cotización si aún no los tenemos
+					// (caso típico: el cliente retomó la compra tras volver a escribir,
+					// el flujo solo traía quoteId/quoteSerial). Resolvemos personId desde
+					// customerId porque billing → customerService.update lo necesita; sin él
+					// la facturación falla y la cotización no se elimina.
+					if (!flow.collectedData) {
+						let resolvedPersonId: string | undefined;
+						if (quote.customerId) {
+							const customerRecord = await CustomerModel.findByPk(
+								quote.customerId,
+								{ attributes: ['personId'] },
+							);
+							if (customerRecord) {
+								resolvedPersonId = customerRecord.get('personId') as string;
+							}
+						}
+						flow.collectedData = {
+							fullName: quote.fullName,
+							dni: quote.dni,
+							phoneNumber: quote.phoneNumber,
+							location: quote.location,
+							cityId: quote.cityId,
+							cityName: quote.cityName
+								? `${quote.cityName}${quote.regionName ? `, ${quote.regionName}` : ''}`
+								: undefined,
+							customerId: quote.customerId ?? undefined,
+							personId: resolvedPersonId,
+						};
+					}
 				}
 
-				// Mostrar QR de transferencia y esperar comprobante
-				const paymentRef = crypto.randomUUID();
-				flow.paymentRef = paymentRef;
-				flow.paymentMethod = 'BANK_TRANSFER_RT';
-				flow.step = 'awaiting_receipt';
-
-				const qrInfo =
-					isoCode === 'CO' ? ENV.PAYMENT_QR_CO_INFO : ENV.PAYMENT_QR_EC_INFO;
-				const itemLines =
-					flow.items && flow.items.length > 0
-						? flow.items
-								.map(i => {
-									const name = i.variantName
-										? `${i.productName} – ${i.variantName}`
-										: i.productName;
-									return `  • ${i.quantity}x ${name}`;
-								})
-								.join('\n')
-						: '';
-
-				const totalStr =
-					flow.total != null
-						? formatPrice(String(flow.total), flow.currency ?? currency)
-						: '';
-
-				return (
-					`Para completar su pedido, realice el pago por transferencia:\n\n${qrInfo}\n\n` +
-					(itemLines ? `Pedido:\n${itemLines}\n\n` : '') +
-					(totalStr ? `Total: ${totalStr}\n\n` : '') +
-					`Ref: ${paymentRef}\n\n` +
-					`Cuando realice el pago, envíenos el comprobante (imagen o PDF) 📸`
+				// Mostrar el pago por transferencia (QR por defecto) y esperar comprobante.
+				return await this.presentQuotePurchasePayment(
+					session,
+					phoneNumber,
+					botPhoneNumberId,
+					countryInfo,
 				);
 			} else {
 				// El cliente no quiere usar la cotización → iniciar flujo con datos nuevos
@@ -1027,6 +1214,7 @@ export class FlowsService {
 							cart: flow.items ?? session.cart,
 							currency,
 							purchaseFlowData: flow.collectedData,
+							lastBotMessage: session.lastBotMessage ?? undefined,
 						})
 						.catch(() => '¿Confirmo la compra con estos datos actualizados?');
 				}
@@ -1055,8 +1243,29 @@ export class FlowsService {
 			flow.paymentMethod = 'BANK_TRANSFER_RT';
 			flow.step = 'awaiting_receipt';
 
-			const qrInfo =
-				isoCode === 'CO' ? ENV.PAYMENT_QR_CO_INFO : ENV.PAYMENT_QR_EC_INFO;
+			const totalStr = formatPrice(
+				String(flow.total),
+				flow.currency ?? currency,
+			);
+
+			if (isoCode === 'CO') {
+				const caption =
+					`Le comparto el QR para que realice el pago por transferencia.\n\n` +
+					`Total: ${totalStr}\n\n` +
+					`Ref: ${paymentRef}\n\n` +
+					`Cuando realice el pago, envíenos el comprobante (imagen o PDF) 📸`;
+				const sent = await this.sendBancolombiaQrImage(
+					phoneNumber,
+					botPhoneNumberId,
+					caption,
+				);
+				if (sent) {
+					session.lastBotMessage = caption;
+					return '';
+				}
+				return caption;
+			}
+
 			const itemLines =
 				flow.items.length > 0
 					? flow.items
@@ -1068,13 +1277,9 @@ export class FlowsService {
 							})
 							.join('\n')
 					: '';
-			const totalStr = formatPrice(
-				String(flow.total),
-				flow.currency ?? currency,
-			);
 
 			return (
-				`Para completar su pedido, realice el pago por transferencia:\n\n${qrInfo}\n\n` +
+				`Para completar su pedido, realice el pago por transferencia:\n\n${ENV.PAYMENT_QR_EC_INFO}\n\n` +
 				(itemLines ? `Pedido:\n${itemLines}\n\n` : '') +
 				`Total: ${totalStr}\n\n` +
 				`Ref: ${paymentRef}\n\n` +
@@ -1110,7 +1315,7 @@ export class FlowsService {
 						? formatPrice(String(flow.total), flow.currency ?? currency)
 						: '';
 					return (
-						`Aquí tiene su link de pago con Bold:\n\n🔗 ${link}\n\n` +
+						`Aquí tiene su link de pago:\n\n🔗 ${link}\n\n` +
 						`Ref: ${flow.paymentRef}\n` +
 						(boldTotal ? `Total: ${boldTotal}\n\n` : '') +
 						`Cuando realice el pago, envíenos el comprobante. 📸`
@@ -1152,7 +1357,7 @@ export class FlowsService {
 						? formatPrice(String(flow.total), flow.currency ?? currency)
 						: '';
 					return (
-						`Aquí tiene su link de pago con PayPhone:\n\n🔗 ${link}\n\n` +
+						`Aquí tiene su link de pago:\n\n🔗 ${link}\n\n` +
 						`Ref: ${flow.paymentRef}\n` +
 						(ppTotal ? `Total: ${ppTotal}\n\n` : '') +
 						`Cuando realice el pago, envíenos el comprobante. 📸`

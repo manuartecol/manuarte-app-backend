@@ -17,8 +17,14 @@ import {
 	detectRequestedWeightGrams,
 	resolveVariantByWeight,
 	resolveVariant,
+	allHintWordsMatch,
 } from '../helpers/product-helpers';
 import { addToCart } from '../helpers/cart-helpers';
+
+// Tokens de peso/medida que describen la PRESENTACIÓN (variante), no el producto.
+// Se excluyen de los términos OBLIGATORIOS de la búsqueda por nombre (ver buildProductReply).
+const MEASURE_TOKEN =
+	/^(kilos?|kgs?|gramos?|grs?|ml|mililitros?|litros?|lts?|cc|onzas?|oz)$/i;
 
 export class ProductSearchService {
 	constructor(private logService: WhatsAppLogService) {}
@@ -79,8 +85,85 @@ export class ProductSearchService {
 	};
 
 	/**
+	 * Resuelve un producto contra la lista activa de la conversación: cuando el
+	 * bot acaba de mostrar opciones, "la blanca" se refiere a una de ellas, no a
+	 * una búsqueda nueva en BD. Identidad estricta (todas las palabras del hint
+	 * deben coincidir) y pool de variantes entre entradas hermanas (las listas de
+	 * sugerencias vienen aplanadas: una entrada por variante).
+	 * Retorna null si nada coincide → el caller decide (p. ej. búsqueda en BD).
+	 */
+	resolveFromActiveList = (
+		list: ProductListEntry[] | undefined,
+		productHint: string,
+		variantHint?: string,
+	): {
+		product: ProductListEntry;
+		variant: ProductListEntry['variants'][0];
+		units: number;
+	} | null => {
+		if (!list?.length || !productHint) return null;
+		const matched = list.filter(e => allHintWordsMatch(productHint, e.name));
+		if (matched.length === 0) return null;
+
+		const pool = matched.flatMap(e =>
+			e.variants.map(v => ({ entry: e, variant: v })),
+		);
+		const inStock = pool.filter(p => p.variant.totalQty > 0);
+		const candidates = inStock.length > 0 ? inStock : pool;
+		if (candidates.length === 0) return null;
+
+		if (variantHint) {
+			// Peso ("2 kilos") → variante cuyo peso calce y unidades necesarias
+			const grams = detectRequestedWeightGrams(variantHint);
+			if (grams !== null) {
+				const byWeight = resolveVariantByWeight(
+					candidates.map(c => c.variant),
+					grams,
+				);
+				if (byWeight) {
+					const pair = candidates.find(c => c.variant === byWeight.variant);
+					if (pair) {
+						return {
+							product: pair.entry,
+							variant: byWeight.variant,
+							units: byWeight.units,
+						};
+					}
+				}
+			}
+			// Presentación como texto ("20 ml")
+			const normalizedHint = normalizeText(variantHint);
+			const byName = candidates.find(c => {
+				const vn = normalizeText(c.variant.name ?? '');
+				return (
+					vn.length > 0 &&
+					(vn.includes(normalizedHint) || normalizedHint.includes(vn))
+				);
+			});
+			if (byName) {
+				return { product: byName.entry, variant: byName.variant, units: 1 };
+			}
+			// La presentación pedida no está entre las opciones mostradas →
+			// dejar que la búsqueda en BD resuelva (puede haber otras)
+			return null;
+		}
+
+		// Sin hint de variante → la opción disponible de menor precio
+		const cheapest = [...candidates].sort(
+			(a, b) => Number(a.variant.price) - Number(b.variant.price),
+		)[0];
+		return {
+			product: cheapest.entry,
+			variant: cheapest.variant,
+			units: 1,
+		};
+	};
+
+	/**
 	 * Procesa una lista de productos y los agrega al carrito de la sesión.
 	 * Usado en request_quote y en los handlers de awaiting_confirmation.
+	 * Cada ítem se resuelve primero contra la lista activa de la conversación y,
+	 * si no está ahí, con búsqueda en BD.
 	 * @returns objecto con número de productos agregados, lista de productos sin stock
 	 *          y detalles de sin-stock con alternativas disponibles
 	 */
@@ -89,7 +172,6 @@ export class ProductSearchService {
 			productHint: string;
 			quantity: number;
 			variantHint?: string;
-			unit?: string;
 		}>,
 		session: UserSession,
 		currency: string,
@@ -134,8 +216,54 @@ export class ProductSearchService {
 			});
 		};
 
+		// Agrega una variante resuelta al carrito, gestionando stock y avisos de sin-stock.
+		const addResolved = (
+			product: ProductListEntry,
+			variant: ProductListEntry['variants'][0],
+			unitsRequested: number,
+		) => {
+			const stock = variant.totalQty;
+			const realName = [product.name, variant.name]
+				.filter(Boolean)
+				.join(' ')
+				.trim();
+			if (mode === 'purchase' && stock === 0) {
+				pushOutOfStock(realName, product.variants, variant.variantId, stock);
+				return;
+			}
+			const cartQty =
+				mode === 'quote' ? unitsRequested : Math.min(unitsRequested, stock);
+			addToCart(session, product, cartQty, currency, variant);
+			added++;
+			if (stock < unitsRequested) {
+				pushOutOfStock(realName, product.variants, variant.variantId, stock);
+			}
+		};
+
 		for (const item of items) {
 			try {
+				const qtyRequested = Math.max(1, item.quantity || 1);
+
+				// 1) Resolver contra la lista activa de la conversación: si el bot
+				//    acaba de mostrar opciones, el hint se refiere a una de ellas.
+				const fromList = this.resolveFromActiveList(
+					session.lastProductList,
+					item.productHint,
+					item.variantHint,
+				);
+				if (fromList) {
+					console.log(
+						`[WhatsApp Agent] Product list item "${item.productHint}" resolved from active list: ${fromList.product.name} – ${fromList.variant.name}`,
+					);
+					addResolved(
+						fromList.product,
+						fromList.variant,
+						fromList.units * qtyRequested,
+					);
+					continue;
+				}
+
+				// 2) Búsqueda en BD
 				const result = await this.buildProductReply(
 					normalizeText(item.productHint),
 					countryInfo ?? session.lastCountryInfo ?? null,
@@ -156,165 +284,51 @@ export class ProductSearchService {
 					continue;
 				}
 				const product = result.products[0];
-				const qty = Math.max(1, item.quantity || 1);
-				const weightText = item.unit ? `${qty} ${item.unit}` : '';
-				const requestedGrams = weightText
-					? detectRequestedWeightGrams(weightText)
-					: null;
+				const qty = qtyRequested;
 
-				if (requestedGrams !== null) {
-					const resolved = resolveVariantByWeight(
-						product.variants,
-						requestedGrams,
-					);
-					if (resolved) {
-						const stock = resolved.variant.totalQty;
-						const realName = [product.name, resolved.variant.name]
-							.filter(Boolean)
-							.join(' ')
-							.trim();
-						if (mode === 'purchase' && stock === 0) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								resolved.variant.variantId,
-								stock,
-							);
-							continue;
-						}
-						const cartQty =
-							mode === 'quote'
-								? resolved.units
-								: Math.min(resolved.units, stock);
-						addToCart(session, product, cartQty, currency, resolved.variant);
-						added++;
-						if (stock < resolved.units) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								resolved.variant.variantId,
-								stock,
-							);
-						}
-					}
-				} else if (item.variantHint) {
-					const resolved = resolveVariant(
-						product,
-						item.variantHint,
-						normalizeText(item.productHint),
-					);
-					if (resolved) {
-						const stock = resolved.totalQty;
-						const realName = [product.name, resolved.name]
-							.filter(Boolean)
-							.join(' ')
-							.trim();
-						if (mode === 'purchase' && stock === 0) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								resolved.variantId,
-								stock,
-							);
-							continue;
-						}
-						const cartQty = mode === 'quote' ? qty : Math.min(qty, stock);
-						addToCart(session, product, cartQty, currency, resolved);
-						added++;
-						if (stock < qty) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								resolved.variantId,
-								stock,
-							);
-						}
-					} else if (product.variants.length === 1) {
-						const stock = product.variants[0].totalQty;
-						const realName = [product.name, product.variants[0].name]
-							.filter(Boolean)
-							.join(' ')
-							.trim();
-						if (mode === 'purchase' && stock === 0) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								product.variants[0].variantId,
-								stock,
-							);
-							continue;
-						}
-						const cartQty = mode === 'quote' ? qty : Math.min(qty, stock);
-						addToCart(session, product, cartQty, currency, product.variants[0]);
-						added++;
-						if (stock < qty) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								product.variants[0].variantId,
-								stock,
-							);
+				if (item.variantHint) {
+					// El tamaño/presentación/peso viene como texto libre en variantHint
+					// (ej: "5 kilos", "20 ml").
+					// 1) Si el hint expresa un PESO (ej: "4 kilos"), resolver por peso PRIMERO.
+					//    Esto cubre el caso en que el producto se vende por kilo (variante "KILO")
+					//    y el cliente pide "4 kilos": son 4 unidades, no 1. resolveVariant no
+					//    puede inferir el multiplicador (devuelve la variante única tal cual).
+					const requestedGrams = detectRequestedWeightGrams(item.variantHint);
+					const byWeight =
+						requestedGrams !== null
+							? resolveVariantByWeight(product.variants, requestedGrams)
+							: null;
+					if (byWeight) {
+						// El peso YA expresa la cantidad total ("4 kilos" → 4 unidades de KILO).
+						// NO multiplicar por qty: el NLU suele repetir el mismo número en
+						// quantity y en el peso ("4 kilos" → quantity:4 + variantHint:"4 kilos"),
+						// lo que daría 16 (4×4). Mismo criterio que la búsqueda directa.
+						addResolved(product, byWeight.variant, byWeight.units);
+					} else {
+						// 2) Sin peso (ej: "20 ml"): match directo de la presentación contra
+						//    el texto libre de las variantes en BD.
+						const resolved = resolveVariant(
+							product,
+							item.variantHint,
+							normalizeText(item.productHint),
+						);
+						if (resolved) {
+							addResolved(product, resolved, qty);
+						} else if (product.variants.length === 1) {
+							addResolved(product, product.variants[0], qty);
 						}
 					}
 				} else if (product.variants.length === 1) {
-					const stock = product.variants[0].totalQty;
-					const realName = [product.name, product.variants[0].name]
-						.filter(Boolean)
-						.join(' ')
-						.trim();
-					if (mode === 'purchase' && stock === 0) {
-						pushOutOfStock(
-							realName,
-							product.variants,
-							product.variants[0].variantId,
-							stock,
-						);
-						continue;
-					}
-					const cartQty = mode === 'quote' ? qty : Math.min(qty, stock);
-					addToCart(session, product, cartQty, currency, product.variants[0]);
-					added++;
-					if (stock < qty) {
-						pushOutOfStock(
-							realName,
-							product.variants,
-							product.variants[0].variantId,
-							stock,
-						);
-					}
+					addResolved(product, product.variants[0], qty);
 				} else {
-					// Múltiples variantes sin hint ni unidad → usar la más pequeña disponible (menor precio).
-					// El cliente pidió cantidad sin especificar presentación; asumimos la de menor precio.
+					// Múltiples variantes sin hint → usar la disponible de menor precio.
+					// El cliente pidió cantidad sin especificar presentación.
 					const sortedByPrice = [...product.variants]
 						.filter(v => v.totalQty > 0)
 						.sort((a, b) => Number(a.price) - Number(b.price));
 					const defaultVariant = sortedByPrice[0] ?? product.variants[0];
 					if (defaultVariant) {
-						const stock = defaultVariant.totalQty;
-						const realName = [product.name, defaultVariant.name]
-							.filter(Boolean)
-							.join(' ')
-							.trim();
-						if (mode === 'purchase' && stock === 0) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								defaultVariant.variantId,
-								stock,
-							);
-							continue;
-						}
-						const cartQty = mode === 'quote' ? qty : Math.min(qty, stock);
-						addToCart(session, product, cartQty, currency, defaultVariant);
-						added++;
-						if (stock < qty) {
-							pushOutOfStock(
-								realName,
-								product.variants,
-								defaultVariant.variantId,
-								stock,
-							);
-						}
+						addResolved(product, defaultVariant, qty);
 					}
 				}
 			} catch (err) {
@@ -331,6 +345,10 @@ export class ProductSearchService {
 		normalizedText: string,
 		countryInfo: { currency: string; stockIds: string[] } | null,
 		aiSearchQuery?: string,
+		// Contexto del cliente (jabón/vela): cuando una categoría tiene productos "para
+		// jabon" y "para velas" (ej. colorantes), prioriza los que calzan con lo que el
+		// cliente está haciendo. Solo reordena (los demás quedan en remainingProducts).
+		craftContext?: 'jabon' | 'vela',
 	): Promise<{
 		replyText: string;
 		searchTerms: string[];
@@ -343,6 +361,9 @@ export class ProductSearchService {
 		const stopWords = [
 			// intención
 			'producto',
+			'productos',
+			'articulo',
+			'articulos',
 			'precio',
 			'tienes',
 			'tienen',
@@ -469,9 +490,19 @@ export class ProductSearchService {
 			};
 
 			// Búsqueda AND: todos los términos deben aparecer en el nombre.
+			// EXCEPCIÓN: los tokens de peso/medida (kilo, gramos, ml, etc.) describen la
+			// PRESENTACIÓN/variante, no el producto, y el peso se resuelve aparte por variante.
+			// Si se exigieran en el nombre, una frase como "cera de palma kilo" desviaría la
+			// búsqueda a un producto cuyo NOMBRE contenga "kilo" (ej: "Cera de palma - Caja x
+			// 15 kilos", sin stock) en vez del producto real "Cera de Palma / de Vaso". Por eso
+			// se excluyen del AND, pero se conservan en searchTerms para el scoring de relevancia.
+			const coreSearchTerms = searchTerms.filter(t => !MEASURE_TOKEN.test(t));
+			const andSearchTerms =
+				coreSearchTerms.length > 0 ? coreSearchTerms : searchTerms;
+
 			// Los términos en SYNONYM_REPLACEMENTS se reemplazan por su equivalente en BD
 			// (ej: "esencia" → "fragancia") para evitar falsos positivos por substring.
-			const effectiveTermsPerSearch = searchTerms.map(t => {
+			const effectiveTermsPerSearch = andSearchTerms.map(t => {
 				const stem = stemTerm(t);
 				return SYNONYM_REPLACEMENTS[stem] ?? [t];
 			});
@@ -552,6 +583,7 @@ export class ProductSearchService {
 			// Scoring: relevancia textual + disponibilidad
 			type ScoredProduct = {
 				score: number;
+				relevanceScore: number;
 				productId: string;
 				name: string;
 				description?: string;
@@ -637,6 +669,16 @@ export class ProductSearchService {
 					0,
 				);
 
+				// Bonus de contexto: si la categoría trae productos "para jabon" y "para
+				// velas", el que calza con lo que el cliente está haciendo sube de tier
+				// (los del otro uso bajan y quedan en "remaining" → "tienes más?").
+				let craftBonus = 0;
+				if (craftContext) {
+					const other = craftContext === 'jabon' ? 'vela' : 'jabon';
+					if (nameLower.includes(craftContext)) craftBonus = 60;
+					else if (nameLower.includes(other)) craftBonus = -60;
+				}
+
 				// Relevance score (primary): determines product ordering tier
 				const relevanceScore =
 					exactMatch +
@@ -645,6 +687,7 @@ export class ProductSearchService {
 					substringMatchCount * 3 +
 					descMatchCount * 3 +
 					startsWithMatch +
+					craftBonus +
 					availableVariants.length;
 
 				// Final score: relevance dominates, stock breaks ties within same tier
@@ -652,6 +695,7 @@ export class ProductSearchService {
 
 				scored.push({
 					score,
+					relevanceScore,
 					productId: String(p.id),
 					name: p.name,
 					description: description || undefined,
@@ -760,6 +804,16 @@ export class ProductSearchService {
 
 			// Re-sort collapsed list by score
 			collapsed.sort((a, b) => b.score - a.score);
+
+			// Dominance filter: when the top result's relevance score is ≥ 2× the next,
+			// the top result is the clear match and the rest are spurious (e.g. searching
+			// "cera de arena" matching "Pigmento para cera arena"). Keep only the top.
+			if (
+				collapsed.length >= 2 &&
+				collapsed[0].relevanceScore >= 2 * collapsed[1].relevanceScore
+			) {
+				collapsed.splice(1);
+			}
 
 			const displayedScored = collapsed.slice(0, MAX_PRODUCT_RESULTS);
 			const remainingScored = [
@@ -913,6 +967,95 @@ export class ProductSearchService {
 			});
 
 			if (suggestions.length === 0) {
+				// Fallback: buscar con el primer término significativo para mostrar
+				// productos relacionados del mismo tipo (ej: "cera de arena" sin stock
+				// → mostrar otras ceras disponibles).
+				const primaryTerm = searchTerms.find(t => t.length > 3);
+				if (primaryTerm) {
+					const fallbackResults = await ProductModel.findAll({
+						attributes: ['id', 'name', 'description'],
+						where: {
+							name: { [Op.notILike]: 'flete' },
+							[Op.or]: [
+								sequelize.where(
+									sequelize.fn(
+										'unaccent',
+										sequelize.col('ProductModel.name'),
+									),
+									{ [Op.iLike]: `%${stemTerm(primaryTerm)}%` },
+								),
+							],
+						},
+						include: [
+							{
+								model: ProductVariantModel,
+								as: 'productVariants',
+								attributes: ['id', 'name'],
+								include: [
+									{
+										model: StockItemModel,
+										as: 'stockItems',
+										attributes: ['id', 'quantity', 'price'],
+										where: { ...stockItemWhere, quantity: { [Op.gt]: 0 } },
+										required: true,
+									},
+								],
+								required: true,
+							},
+						],
+						limit: 20,
+					});
+
+					if (fallbackResults.length > 0) {
+						type FallbackVariant = {
+							id: string;
+							name: string;
+							stockItems: { id: string; quantity: number; price: string }[];
+						};
+						const fallbackList: (ProductListEntry & { totalQty: number })[] =
+							fallbackResults
+								.map(p => {
+									const variants = p.get('productVariants') as
+										| FallbackVariant[]
+										| undefined;
+									const availableVariants = (variants ?? []).map(v => ({
+										variantId: v.id,
+										stockItemId: v.stockItems[0]?.id ?? null,
+										name: v.name,
+										totalQty: v.stockItems.reduce(
+											(sum, si) => sum + Number(si.quantity),
+											0,
+										),
+										price: v.stockItems[0]?.price ?? null,
+									}));
+									return {
+										productId: String(p.id),
+										name: p.name,
+										description:
+											(p.get('description') as string | undefined) ||
+											undefined,
+										variants: availableVariants,
+										totalQty: availableVariants.reduce(
+											(s, v) => s + v.totalQty,
+											0,
+										),
+									};
+								})
+								.sort((a, b) => b.totalQty - a.totalQty);
+						return {
+							replyText: '',
+							products: fallbackList
+								.slice(0, MAX_PRODUCT_RESULTS)
+								// eslint-disable-next-line @typescript-eslint/no-unused-vars
+								.map(({ totalQty: _, ...p }) => p),
+							remainingProducts: fallbackList
+								.slice(MAX_PRODUCT_RESULTS)
+								// eslint-disable-next-line @typescript-eslint/no-unused-vars
+								.map(({ totalQty: _, ...p }) => p),
+						};
+					}
+				}
+
 				return {
 					replyText:
 						'Ese producto no lo tenemos disponible ahora. ¿Puede contarme más sobre lo que necesita? 😊',

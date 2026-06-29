@@ -41,10 +41,7 @@ export const ENV = {
 	// Útil para probar el bot de Ecuador desde un número colombiano.
 	// ⚠️ Dejar en '' o eliminar en producción.
 	TEST_FORCE_COUNTRY_ISO: process.env.TEST_FORCE_COUNTRY_ISO ?? '',
-	// Información de pago por QR (placeholder hasta tener imagen real)
-	PAYMENT_QR_CO_INFO:
-		process.env.PAYMENT_QR_CO_INFO ??
-		'[QR de transferencia Colombia - pendiente de configurar]',
+	// Información de pago por QR Ecuador (placeholder hasta tener imagen real)
 	PAYMENT_QR_EC_INFO:
 		process.env.PAYMENT_QR_EC_INFO ??
 		'[QR de transferencia Ecuador - pendiente de configurar]',
