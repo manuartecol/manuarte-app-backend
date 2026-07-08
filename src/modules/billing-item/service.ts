@@ -1,4 +1,4 @@
-import { Op, Transaction } from 'sequelize';
+import { Op, QueryTypes, Transaction } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { CreateBillingItemDto, MonthlySalesData } from './types';
 import { BillingItemModel } from './model';
@@ -14,6 +14,7 @@ import { ProductCategoryGroupModel } from '../product-category-group/model';
 import { StockOperation } from '../stock-item/types';
 
 const FLETE = 'e0490768-3cdb-4abe-9a3d-c87cda126f45';
+const DESCUENTO = '07d7284f-547e-4bbd-a4bb-2cf94b0c2e1a';
 
 export class BillingItemService {
 	private billingItemModel;
@@ -183,36 +184,29 @@ export class BillingItemService {
 
 			// Ejecutar consultas COP y USD en paralelo
 			const [topCOP, topUSD] = await Promise.all([
-				this.getGroupByCurrencyAndProductCategoryGroup(
-					'COP',
-					targetYear,
-					targetMonth,
-				),
-				this.getGroupByCurrencyAndProductCategoryGroup(
-					'USD',
-					targetYear,
-					targetMonth,
-				),
+				this.getTopSellingProducts('COP', targetYear, targetMonth),
+				this.getTopSellingProducts('USD', targetYear, targetMonth),
 			]);
 
 			const formatResults = (
-				data: BillingItemModel[],
-			): {
-				productCategoryGroupId: string;
-				productCategoryGroupName: string;
-				totalQuantity: number;
-			}[] =>
+				data: Array<{
+					productVariantId: string;
+					productName: string;
+					baseProductName: string;
+					totalQuantity: string;
+				}>,
+			) =>
 				data.map(item => ({
-					productCategoryGroupId: item.dataValues.productCategoryGroupId,
-					productCategoryGroupName: item.dataValues.productCategoryGroupName,
-					totalQuantity: parseFloat(item.dataValues.totalQuantity),
+					productVariantId: item.productVariantId,
+					productName: `${item.baseProductName} - ${item.productName}`,
+					totalQuantity: parseFloat(item.totalQuantity),
 				}));
 
 			return {
 				month: monthNames[targetMonth],
 				year: targetYear,
-				topCOP: topCOP && formatResults(topCOP),
-				topUSD: topUSD && formatResults(topUSD),
+				topCOP: formatResults(topCOP),
+				topUSD: formatResults(topUSD),
 			};
 		} catch (error) {
 			console.error(error);
@@ -220,10 +214,11 @@ export class BillingItemService {
 		}
 	};
 
-	private getGroupByCurrencyAndProductCategoryGroup = async (
+	private getTopSellingProducts = async (
 		currency: string,
 		targetYear: number,
 		targetMonth: number,
+		limit = 15,
 	) => {
 		try {
 			const startOfMonth = new Date(targetYear, targetMonth, 1);
@@ -232,24 +227,15 @@ export class BillingItemService {
 			const result = await this.billingItemModel.findAll({
 				where: {
 					currency,
-					productVariantId: {
-						[Op.ne]: FLETE,
-					},
+					productVariantId: { [Op.notIn]: [FLETE, DESCUENTO] },
 				},
 				attributes: [
-					'currency',
 					[
-						sequelize.col(
-							'productVariant.product.productCategory.productCategoryGroup.id',
-						),
-						'productCategoryGroupId',
+						sequelize.col('BillingItemModel.productVariantId'),
+						'productVariantId',
 					],
-					[
-						sequelize.col(
-							'productVariant.product.productCategory.productCategoryGroup.name',
-						),
-						'productCategoryGroupName',
-					],
+					[sequelize.col('productVariant.name'), 'productName'],
+					[sequelize.col('productVariant.product.name'), 'baseProductName'],
 					[
 						sequelize.fn('SUM', sequelize.col('BillingItemModel.quantity')),
 						'totalQuantity',
@@ -279,30 +265,14 @@ export class BillingItemService {
 								as: 'product',
 								required: true,
 								attributes: [],
-								include: [
-									{
-										model: ProductCategoryModel,
-										as: 'productCategory',
-										required: true,
-										attributes: [],
-										include: [
-											{
-												model: ProductCategoryGroupModel,
-												as: 'productCategoryGroup',
-												required: true,
-												attributes: [],
-											},
-										],
-									},
-								],
 							},
 						],
 					},
 				],
 				group: [
-					'currency',
-					'productVariant.product.productCategory.productCategoryGroup.id',
-					'productVariant.product.productCategory.productCategoryGroup.name',
+					'BillingItemModel.productVariantId',
+					'productVariant.name',
+					'productVariant.product.name',
 				],
 				order: [
 					[
@@ -310,10 +280,16 @@ export class BillingItemService {
 						'DESC',
 					],
 				],
-				limit: 5,
+				limit,
+				raw: true,
 			});
 
-			return result;
+			return result as unknown as Array<{
+				productVariantId: string;
+				productName: string;
+				baseProductName: string;
+				totalQuantity: string;
+			}>;
 		} catch (error) {
 			console.error(error);
 			throw error;
@@ -343,8 +319,8 @@ export class BillingItemService {
 			// 	endDate,
 			// );
 
-			// 4. Top 5 grupos de categorías y sus productos más vendidos
-			const topGroupsWithProducts = await this.getTopGroupsWithProducts(
+			// 4. Todos los productos activos con sus ventas del período (incluyendo ventas en cero), ordenados de mayor a menor
+			const products = await this.getAllProductsSales(
 				currency,
 				startDate,
 				endDate,
@@ -363,7 +339,7 @@ export class BillingItemService {
 					end: endDate,
 					currency,
 				},
-				topGroupsWithProducts,
+				products,
 				comparison,
 			};
 		} catch (error) {
@@ -674,217 +650,96 @@ export class BillingItemService {
 		return result;
 	};
 
-	private getTopGroupsWithProducts = async (
+	private getAllProductsSales = async (
 		currency: string,
 		startDate: Date,
 		endDate: Date,
 	) => {
-		// 1. Obtener el top 5 de grupos de categorías
-		const topGroups = await this.billingItemModel.findAll({
-			where: {
-				currency,
-				productVariantId: { [Op.ne]: FLETE },
-			},
-			attributes: [
-				[
-					sequelize.col(
-						'productVariant.product.productCategory.productCategoryGroup.id',
-					),
-					'groupId',
-				],
-				[
-					sequelize.col(
-						'productVariant.product.productCategory.productCategoryGroup.name',
-					),
-					'groupName',
-				],
-				[
-					sequelize.fn('SUM', sequelize.col('BillingItemModel.quantity')),
-					'totalQuantity',
-				],
-				[
-					sequelize.literal(`
-						SUM(
-							CASE
-								WHEN "billing"."discountType" = 'PERCENTAGE'
-									THEN "BillingItemModel"."totalPrice" * (1 - "billing"."discount" / 100)
-								WHEN "billing"."discountType" = 'FIXED'
-									THEN "BillingItemModel"."totalPrice" * (1 - "billing"."discount" / NULLIF("billing"."subtotal", 0))
-								ELSE "BillingItemModel"."totalPrice"
-							END
-						)
-					`),
-					'totalRevenue',
-				],
-			],
-			include: [
-				{
-					model: BillingModel,
-					as: 'billing',
-					attributes: [],
-					where: {
-						effectiveDate: { [Op.between]: [startDate, endDate] },
-						status: BillingStatus.PAID,
-					},
-				},
-				{
-					model: ProductVariantModel,
-					as: 'productVariant',
-					required: true,
-					attributes: [],
-					include: [
-						{
-							model: ProductModel,
-							as: 'product',
-							required: true,
-							attributes: [],
-							include: [
-								{
-									model: ProductCategoryModel,
-									as: 'productCategory',
-									required: true,
-									attributes: [],
-									include: [
-										{
-											model: ProductCategoryGroupModel,
-											as: 'productCategoryGroup',
-											required: true,
-											attributes: [],
-										},
-									],
-								},
-							],
-						},
-					],
-				},
-			],
-			group: [
-				'productVariant.product.productCategory.productCategoryGroup.id',
-				'productVariant.product.productCategory.productCategoryGroup.name',
-			],
-			order: [
-				[
-					sequelize.fn('SUM', sequelize.col('BillingItemModel.quantity')),
-					'DESC',
-				],
-			],
-			limit: 5,
-			raw: true,
-		});
-
-		// 2. Para cada grupo, obtener sus productos más vendidos
-		const topGroupsData = topGroups as unknown as Array<{
-			groupId: string;
+		const products = await sequelize.query<{
+			productVariantId: string;
+			productName: string;
+			baseProductName: string;
+			categoryName: string;
 			groupName: string;
 			totalQuantity: string;
+			avgUnitPrice: string;
+			pricePvp: string;
+			priceDis: string;
 			totalRevenue: string;
-		}>;
-
-		const groupsWithProducts = await Promise.all(
-			topGroupsData.map(async group => {
-				const topProducts = await this.billingItemModel.findAll({
-					where: {
-						currency,
-						productVariantId: {
-							[Op.ne]: FLETE,
-						},
-					},
-					attributes: [
-						[
-							sequelize.col('BillingItemModel.productVariantId'),
-							'productVariantId',
-						],
-						[sequelize.col('productVariant.name'), 'productName'],
-						[sequelize.col('productVariant.product.name'), 'baseProductName'],
-						[
-							sequelize.col('productVariant.product.productCategory.name'),
-							'categoryName',
-						],
-						[
-							sequelize.fn('SUM', sequelize.col('BillingItemModel.quantity')),
-							'totalQuantity',
-						],
-						[
-							sequelize.literal(`
-								SUM("BillingItemModel"."totalPrice") / NULLIF(SUM("BillingItemModel"."quantity"), 0)
-							`),
-							'avgUnitPrice',
-						],
-						[
-							sequelize.fn('SUM', sequelize.col('BillingItemModel.totalPrice')),
-							'totalRevenue',
-						],
-					],
-					include: [
-						{
-							model: BillingModel,
-							as: 'billing',
-							attributes: [],
-							where: {
-								effectiveDate: { [Op.between]: [startDate, endDate] },
-								status: BillingStatus.PAID,
-							},
-						},
-						{
-							model: ProductVariantModel,
-							as: 'productVariant',
-							required: true,
-							attributes: [],
-							where: { deletedDate: null },
-							include: [
-								{
-									model: ProductModel,
-									as: 'product',
-									required: true,
-									attributes: [],
-									include: [
-										{
-											model: ProductCategoryModel,
-											as: 'productCategory',
-											required: true,
-											attributes: [],
-											include: [
-												{
-													model: ProductCategoryGroupModel,
-													as: 'productCategoryGroup',
-													required: true,
-													attributes: [],
-													where: { id: group.groupId },
-												},
-											],
-										},
-									],
-								},
-							],
-						},
-					],
-					group: [
-						'BillingItemModel.productVariantId',
-						'productVariant.name',
-						'productVariant.product.name',
-						'productVariant.product.productCategory.name',
-					],
-					order: [
-						[
-							sequelize.fn('SUM', sequelize.col('BillingItemModel.quantity')),
-							'DESC',
-						],
-					],
-					limit: 10,
-					raw: true,
-				});
-
-				return {
-					groupId: group.groupId,
-					groupName: group.groupName,
-					totalQuantity: parseFloat(group.totalQuantity),
-					totalRevenue: parseFloat(group.totalRevenue),
-					topProducts,
-				};
-			}),
+		}>(
+			`
+				WITH sales AS (
+					SELECT
+						bi."productVariantId" AS "productVariantId",
+						SUM(bi.quantity) AS "totalQuantity",
+						SUM(bi."totalPrice") AS "totalRevenue"
+					FROM billing_item bi
+					INNER JOIN billing b ON b.id = bi."billingId"
+					WHERE bi.currency = :currency
+						AND bi."deletedDate" IS NULL
+						AND b."effectiveDate" BETWEEN :startDate AND :endDate
+						AND b.status = :status
+						AND b."deletedDate" IS NULL
+					GROUP BY bi."productVariantId"
+				),
+				catalog_prices AS (
+					SELECT
+						sipv."productVariantId" AS "productVariantId",
+						AVG(CASE WHEN pt.code = 'PVP' THEN sip.price END) AS "pricePvp",
+						AVG(CASE WHEN pt.code = 'DIS' THEN sip.price END) AS "priceDis"
+					FROM stock_item_product_variant sipv
+					INNER JOIN stock_item si ON si.id = sipv."stockItemId"
+						AND si.currency = :currency
+						AND si."deletedDate" IS NULL
+					INNER JOIN stock_item_price sip ON sip."stockItemId" = si.id
+					INNER JOIN price_type pt ON pt.id = sip."priceTypeId"
+					GROUP BY sipv."productVariantId"
+				)
+				SELECT
+					pv.id AS "productVariantId",
+					pv.name AS "productName",
+					p.name AS "baseProductName",
+					pc.name AS "categoryName",
+					COALESCE(pcg.name, '--') AS "groupName",
+					COALESCE(s."totalQuantity", 0) AS "totalQuantity",
+					CASE
+						WHEN COALESCE(s."totalQuantity", 0) = 0 THEN 0
+						ELSE s."totalRevenue" / s."totalQuantity"
+					END AS "avgUnitPrice",
+					COALESCE(cp."pricePvp", 0) AS "pricePvp",
+					COALESCE(cp."priceDis", 0) AS "priceDis",
+					COALESCE(s."totalRevenue", 0) AS "totalRevenue"
+				FROM product_variant pv
+				INNER JOIN product p ON p.id = pv."productId" AND p."deletedDate" IS NULL
+				INNER JOIN product_category pc ON pc.id = p."productCategoryId" AND pc."deletedDate" IS NULL
+				LEFT JOIN product_category_group pcg ON pcg.id = pc."productCategoryGroupId" AND pcg."deletedDate" IS NULL
+				LEFT JOIN sales s ON s."productVariantId" = pv.id
+				LEFT JOIN catalog_prices cp ON cp."productVariantId" = pv.id
+				WHERE pv."deletedDate" IS NULL
+					AND pv.id NOT IN (:flete, :descuento)
+				ORDER BY "totalQuantity" DESC, pv.name ASC
+			`,
+			{
+				replacements: {
+					currency,
+					startDate,
+					endDate,
+					status: BillingStatus.PAID,
+					flete: FLETE,
+					descuento: DESCUENTO,
+				},
+				type: QueryTypes.SELECT,
+			},
 		);
 
-		return groupsWithProducts;
+		return products.map(product => ({
+			...product,
+			totalQuantity: parseFloat(product.totalQuantity),
+			avgUnitPrice: parseFloat(product.avgUnitPrice),
+			pricePvp: parseFloat(product.pricePvp),
+			priceDis: parseFloat(product.priceDis),
+			totalRevenue: parseFloat(product.totalRevenue),
+		}));
 	};
 
 	private getComparisonWithPreviousPeriod = async (
