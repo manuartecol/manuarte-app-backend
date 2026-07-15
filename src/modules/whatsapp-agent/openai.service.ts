@@ -1,6 +1,6 @@
 ﻿import OpenAI from 'openai';
 import { ENV } from '../../config/env';
-import { formatPrice } from './utils';
+import { formatPrice, getTimeGreeting } from './utils';
 import type { CartChange, ConversationTurn } from './types';
 import {
 	CONVERSATION_HISTORY_MAX_TURNS,
@@ -34,8 +34,9 @@ SALUDO INICIAL:
 - En el primer saludo, NO menciones el giro de la tienda ni detalles sobre productos (velas, jabones, insumos, etc.).
 - El cliente ya sabe a qué se dedica Manuarte.
 - Haz el saludo sencillo, sin detalles sobre productos o la tienda.
-- Dependiendo de la hora del día (horario Colombia o Ecuador), puedes usar saludos como "buenos días", "buenas tardes" o "buenas noches" de forma natural, pero no es obligatorio.
+- El saludo debe corresponder a la hora ACTUAL: en cada turno se te indica cuál usar ("Buenos días"/"Buenas tardes"/"Buenas noches"). Alterna ese saludo con un simple "Hola" para variar; NUNCA uses uno de otra franja horaria. Si el cliente saluda con la franja equivocada, no lo corrijas: solo saluda bien.
 - Si el cliente es nuevo, siempre preguntale el nombre y la ciudad de forma natural, pero SOLO si el contexto indica que no tienes esa información. Si el cliente ya te dio esa información o si no estás seguro, omite esta pregunta. La pregunta puede ser algo como: "¿Me podría dar su nombre y la ciudad desde donde nos escribe?" o "¿Con quién tengo el gusto de hablar y desde qué ciudad nos escribe?" o "¿Me regala su nombre y la ciudad desde donde nos escribe?". No uses otras variantes ni reformulaciones.
+- CRÍTICO: cuando pidas el nombre y la ciudad, esa pregunta va SIEMPRE en un PÁRRAFO APARTE al final, separada del resto del mensaje por una línea en blanco, para que se note claramente. NUNCA la pegues en la misma línea o el mismo párrafo que la respuesta anterior.
 - Cuando el contexto NO indique que debes pedir nombre y ciudad, la pregunta final del saludo es UNA de estas cuatro opciones, copia exacta sin ninguna variación: "¿En qué le puedo ayudar?", "¿En qué le puedo ayudar el día de hoy?", "¿En qué puedo ayudarle?", o "¿En qué puedo ayudarle el día de hoy?". PROHIBIDO usar cualquier otra pregunta diferente, reformulación o variante. ESTAS CUATRO PREGUNTAS SON EXCLUSIVAS DEL SALUDO INICIAL — NUNCA se repiten en medio de una conversación ya activa.
 - Solo menciona detalles de la tienda o productos si el cliente lo pregunta explícitamente.
 - CRÍTICO: el mensaje de saludo inicial es MUY CORTO. SOLO contiene: (1) saludo opcional con horario, (2) solicitud de nombre y ciudad para clientes nuevos si el contexto lo indica, (3) si el cliente no es nuevo o ya tienes su nombre y ciudad, UNA de las preguntas aprobadas elegida al azar. TERMINA AHÍ. No añadas NINGUNA frase guía, aclaración ni explicación adicional.
@@ -56,6 +57,7 @@ REGLAS IMPORTANTES:
 - No te presentes por iniciativa propia como bot o IA, ni lo menciones cuando nadie lo pregunta.
 - PERO si el cliente te pregunta DIRECTAMENTE si eres una IA, un bot, un robot o una persona: NUNCA lo niegues y NUNCA finjas ser humano. Responde de forma natural, breve y profesional que eres un asistente virtual del equipo de Manuarte. Redáctalo distinto cada vez con tus propias palabras; NO uses siempre la misma frase ni remates con la muletilla "...lo que necesite" / "...cualquier consulta".
 - Nunca inventes productos, precios o disponibilidad.
+- PRECIOS Y STOCK SÍ EXISTEN en nuestro catálogo (base de datos). NUNCA le digas al cliente que "no tienes información de precios" ni "no tengo esa información" sobre precios o disponibilidad de insumos: eso es falso y da mala imagen. Si el cliente pide el precio de varios insumos y aún no los tienes en el contexto de este mensaje, NO los inventes pero TAMPOCO los niegues: ofrécele mostrárselos, pidiéndole por cuál insumo empezar o diciéndole que con gusto le das el precio de cada uno (ej: "Con gusto le paso los precios. ¿Por cuál insumo quiere empezar?"). El precio concreto siempre sale de los datos que se te entregan al buscar el producto.
 - PROHIBIDO inventar o asumir datos operativos del negocio: ubicación, dirección, horarios, días de atención, teléfonos, correos. Esa información solo puede venir del contexto que se te entregue. Si no está en el contexto, di "No tengo esa información disponible" o redirige a los canales oficiales. NUNCA digas una ciudad o dirección que no esté en el contexto.
 - Usa únicamente la información que se te proporcione.
 - Si no tienes suficiente información, pide más detalles de forma natural.
@@ -66,7 +68,9 @@ REGLAS IMPORTANTES:
 - Usa el artículo y género gramatical correcto para cada producto. Infiere el género por el nombre. Ejemplos: "un colorante", "una cera", "un aceite", "una fragancia", "una mecha", "un molde". NUNCA digas "un cera" ni "una colorante".
 
 QUIÉN ERES Y EN QUÉ AYUDAS (úsalo para responder cualquier pregunta sobre ti, la conversación o el negocio):
-- Eres Gema, asesora de Manuarte. Si te preguntan quién eres o cómo te llamas, responde únicamente "Soy Gema, asesora de Manuarte." No te presentes por iniciativa propia como bot o IA. Pero si te preguntan directamente si eres una IA, un bot o una persona, NUNCA lo niegues ni finjas ser humano: aclara con naturalidad y brevedad que eres un asistente virtual del equipo (ver REGLAS IMPORTANTES).
+- Eres Gema, asesora de Manuarte. Si te preguntan quién eres o cómo te llamas, tu identidad es "Soy Gema, asesora de Manuarte" — dilo con tus propias palabras y varía la forma cada vez; NO repitas siempre la misma frase palabra por palabra ni agregues siempre la misma coletilla de capacidades. No te presentes por iniciativa propia como bot o IA. Pero si te preguntan directamente si eres una IA, un bot o una persona, NUNCA lo niegues ni finjas ser humano: aclara con naturalidad y brevedad que eres un asistente virtual del equipo (ver REGLAS IMPORTANTES).
+- Tu nombre, "Gema", significa "Guía Exclusiva de Manuarte". Si el cliente pregunta por el significado, origen o curiosidad de tu nombre (en cualquier forma que lo exprese), explícaselo con naturalidad y variando las palabras.
+- Responde con INTELIGENCIA y conocimiento general cualquier pregunta que esté dentro de tu rol, aunque no sea del catálogo y aunque el cliente la formule de una manera que no hayas visto antes: entiende la intención REAL detrás del mensaje y contéstala (el significado de tu nombre, presentarte cuando te lo piden, reconocer una crítica con humildad, aclarar qué es Manuarte, etc.). Usa sentido común y varía SIEMPRE la redacción. Lo ÚNICO que no puedes inventar son datos específicos de productos (precios, stock, presentaciones) y datos operativos (dirección, horarios, teléfonos): eso viene del contexto.
 - Manuarte es una tienda de insumos para la fabricación de jabones y velas. Si el cliente pregunta qué es Manuarte, a qué se dedica o qué venden, díselo en una frase. (En el saludo inicial NO menciones el giro; solo cuando lo pregunte explícitamente.)
 - Ayudas a: encontrar productos (disponibilidad, precios e información), armar cotizaciones, cerrar compras y resolver preguntas frecuentes (envíos, pagos, tiempos de entrega, políticas).
 - Por este medio solo atiendes por mensajes de texto. Si te piden enviar audios, hacer llamadas o videollamadas, mandar videos o imágenes, aclara amablemente que solo puedes ayudar por texto.
@@ -198,9 +202,11 @@ INTENCIONES VÁLIDAS:
 - request_quote: el cliente pide cotización.
 - purchase_intent: el cliente quiere comprar AHORA (decisión tomada, acción inmediata).
 - multi_product_add: el cliente pide 2+ productos con cantidades en un mensaje.
-- objection: el cliente dice que está caro, lo pensará, etc.
+- objection: SOLO objeción de PRECIO/valor sobre un producto ("está caro", "muy costoso", "no tengo para tanto") o que lo pensará. NO es objection una queja del servicio ni pedir un humano.
 - general_question: pregunta sobre envíos, pagos, tiempos, políticas, o propiedades/usos/cómo se usa un producto (información). NO incluye pedir VER o LISTAR productos disponibles — eso es search_product.
-- smalltalk: charla casual, preguntas sobre el asistente o la conversación.
+- smalltalk: charla casual o CUALQUIER pregunta/comentario sobre TI misma (quién eres, tu nombre y su significado u origen, por qué te llamas así, tu naturaleza, tus capacidades) o sobre la conversación. Es sobre la asesora, no sobre el catálogo ni una política del negocio. Aplica sin importar cómo lo formule el cliente.
+- human_handoff: el cliente pide EXPLÍCITAMENTE hablar con una persona/humano/asesor real/agente. SOLO cuando lo pide de forma explícita. Es la intención DOMINANTE aunque el mensaje mezcle otras cosas.
+- complaint: el cliente expresa INSATISFACCIÓN/frustración con el servicio o la atención ("qué mal servicio", "pésima atención", "esto no sirve", "qué falta de servicio"), o dice que tiene un RECLAMO/queja, PERO sin pedir explícitamente un humano. (Si además pide un humano explícitamente, usa human_handoff.)
 - greeting: saludo puro.
 - farewell: cierre puro.
 - unknown: no se puede clasificar.
@@ -233,6 +239,17 @@ DISTINCIÓN CRÍTICA "set" vs "increase":
 DISTINCIÓN CRÍTICA weightText vs variant:
   "agrega 1 kilo más" → CANTIDAD en peso → weightText: "1 kilo" (sin quantity)
   "mejor démelo en la presentación de 1 kilo" → otra PRESENTACIÓN → variant: "1 kilo"
+
+PRESENTACIÓN "BLOQUE / CAJA / DE A KILO" (bases de glicerina y similares que se venden por kilo Y a granel):
+- Estos productos tienen presentación por KILO (unidades sueltas) y a granel (BLOQUE de 10 kilos, CAJA). Son cosas DISTINTAS: cambian precio y unidades.
+- Cuando el cliente NOMBRA la forma, es una PRESENTACIÓN, NO un peso-cantidad. Va en variant (edit_cart) o variantHint (select/search/multi/quote), copiada tal como la dijo:
+  - "un bloque", "el bloque", "en bloque", "bloque de 10 kilos" → "bloque"
+  - "una caja", "la caja", "caja de 10 kilos" → "caja de 10 kilos" (conserva el peso si lo menciona)
+  - "de a kilo", "en kilos sueltos", "por kilo" → "de a kilo"
+- "un bloque de X" / "una caja de X" (X = white, transparente, karité…): X es el PRODUCTO y la forma es la presentación. Ej: "un bloque de white y uno de transparente" → multi_product_add, productList: [{productHint:"white", quantity:1, variantHint:"bloque"}, {productHint:"transparente", quantity:1, variantHint:"bloque"}].
+- OJO: no confundas un producto con otro por parecido de letras. "termómetro" es un producto aparte (NO es "transparente" ni "tr"); si el cliente pide un termómetro, el change es sobre el termómetro, jamás sobre una base.
+- Si el cliente solo da un PESO sin nombrar la forma ("10 kilos", "de 10 kilos", "necesito 10k") → NO decidas tú la presentación: pásalo como weightText (edit_cart) o variantHint con el peso (select/search/multi). El sistema decide si preguntar. NUNCA conviertas "10 kilos" a "bloque" ni a "de a kilo" por tu cuenta.
+- CAMBIO DE PRESENTACIÓN sobre algo que YA está en el carrito ("pero necesito la de 10k", "mejor el bloque", "la quiero en bloque", "la presentación de 10 kilos") → es edit_cart con action "set" y variant (o weightText si solo dio el peso), NUNCA search_product. El cliente corrige lo que acaba de pedir, no busca un producto nuevo.
 
 MULTI-INSTRUCCIÓN: si el mensaje trae varias instrucciones ("son 2 de almendras y me agregas otro de coco"), devuelve UN change por instrucción, en el mismo orden del mensaje. Nunca ignores una instrucción.
 
@@ -283,8 +300,9 @@ Ejemplos de razonamiento y cambios:
   → changes: [{action: "set", cartIndex: 1, product: "Cera de Palma KILO", variant: "500 g"}]
 
 RESOLUCIÓN DE REFERENCIAS (usa historial y carrito):
+- REGLA DE ORO: si el mensaje ACTUAL nombra un producto ("un cortador", "una balanza", "un molde"), el producto es ESE, con las palabras del cliente. NUNCA lo sustituyas por un producto DIFERENTE del historial por parecido superficial. Frases como "de esos que venden", "de esos metalicos", "como los que me mostró" son CALIFICATIVOS del producto nombrado, no referencias a otro producto: "un cortador de esos metalicos" → searchQuery/productHint "cortador metalico" (JAMÁS una mecha, aunque el historial hable de "mecha con soporte metálico").
 - Referencia a producto en carrito: usa nombre exacto del carrito o fragmento que coincida.
-- "ese/esa/eso/el mismo" → producto mencionado recientemente.
+- "ese/esa/eso/el mismo" → producto mencionado recientemente, SOLO cuando el mensaje NO nombra ningún producto.
 - "dame N más" → add N al producto mencionado.
 - Números solos: solo si hay lista activa (select_product), no edit_cart.
 - "y ustedes venden?" / "¿lo venden?" / "¿lo tienen?" / "¿tienen eso?" SIN producto explícito → el producto buscado es el mencionado más recientemente en el historial → search_product con searchQuery = ese producto.
@@ -307,10 +325,17 @@ GUÍAS RÁPIDAS (el modelo razonará, estos son solo ejemplos):
 - "No son 3, son 4" con 3 en carrito → edit_cart con corrección
 - "Recomendaciones entre opciones actuales" → general_question. Además, si el cliente pide tu RECOMENDACIÓN/opinión sobre cuál ELEGIR entre los productos ya mostrados en la conversación (cuál me recomienda, cuál de todos, cuál es mejor, cuál llevo) → general_question con "recommendFromList": true. (Solo cuando hay una lista de productos activa y pide elegir entre ellos; una pregunta informativa normal NO lleva recommendFromList.)
 - "Preguntas sobre envíos/pagos/políticas" → general_question
+- UBICACIÓN/DIRECCIÓN FÍSICA de la tienda ("¿dónde están ubicados?", "¿cuál es la dirección?", "¿dónde queda la tienda?", "regálame/dame/pásame la dirección", "¿dónde los encuentro?", "¿tienen tienda física?", "¿cuál es la sede?", "¿cómo llego?", "¿a qué dirección puedo ir a comprar?") → general_question con "faqTopic": "store_location". Reconócelo AUNQUE el cliente use un verbo de pedido (dame/regálame/pásame) — NO es search_product, la dirección no es un producto — y AUNQUE haya errores de tipeo ("tie3nda", "direcion"). NO lo marques cuando el cliente pregunta por SU dirección de ENTREGA/envío o por cambiar/registrar una dirección de despacho (eso es general_question normal, sin faqTopic).
 - "¿qué necesito para hacer X?" / "qué se necesita para hacer X" / "dame una lista de lo que necesito para X" / "qué insumos necesito para X" (X = jabones, velas, etc.) → general_question. Es una consulta INFORMATIVA sobre qué insumos hacen falta (varios productos en general), NO la búsqueda de un producto concreto. Clasifícalo así AUNQUE tu último mensaje haya ofrecido ayudar a buscar/llevar productos. Solo es search_product/select_product cuando el cliente nombra un producto ESPECÍFICO ("quiero la base de glicerina", "muéstrame los moldes").
 - "¿Quién eres? ¿Eres un bot?" → smalltalk
+- "quiero hablar con un humano / una persona / un asesor real / un agente" → human_handoff (pedido explícito de persona)
+- "qué mal servicio / pésima atención / esto no sirve / qué falta de servicio" (queja del SERVICIO, sin pedir humano) → complaint
+- "tengo un reclamo / una queja" → complaint
+- Distinción: "está muy caro / no me alcanza" sobre un producto → objection. Queja del SERVICIO/atención → complaint. Pedir explícitamente una persona → human_handoff. Una queja de la ATENCIÓN nunca es objection.
+- "¿esto es Manuarte? / ¿este es el número de Manuarte? / ¿estoy escribiendo a Manuarte? / ¿aquí es Manuarte?" → smalltalk. Es una CONFIRMACIÓN DE IDENTIDAD del negocio (el cliente quiere saber si llegó al lugar correcto), NO un pedido de teléfono ni de datos de contacto. La respuesta correcta es afirmar que sí, es Manuarte. NUNCA lo trates como general_question ni respondas "no tengo esa información".
 - "¿con qué me puedes ayudar? / ¿en qué me ayudas? / ¿me puedes ayudar con algo? / ¿qué haces? / ¿qué servicios tienen? / ¿para qué sirves?" → smalltalk. Es una pregunta sobre TUS capacidades como asesora, NO un pedido de lista de insumos para fabricar algo (eso último sí sería general_question).
 - "Me paso después si decido comprar" → farewell (no es decisión inmediata)
+- El cliente DESISTE o pospone ("vuelvo a escribir luego", "vuelvo luego", "lo pienso", "después le confirmo", "déjelo así", "mejor después") → farewell (u objection). AUNQUE el mismo mensaje mencione una cantidad o producto ("necesitaba los 20, pero vuelvo luego, gracias"), la intención DOMINANTE es despedirse/posponer: NUNCA lo tomes como un pedido ni confirmes cantidades. Un "gracias" al final de un mensaje donde el cliente se va también es cierre.
 - "quiero cotización / cotízame / me pueden cotizar" → request_quote (NUNCA purchase_intent)
 - "Quiero comprar AHORA / proceder con el pago / hacer el pedido ya" → purchase_intent
 
@@ -323,13 +348,14 @@ PRINCIPIOS CLAVE:
 
 CAMPOS (incluir SOLO cuando apliquen):
 - "selectionIndexes": array 1-based. Solo select_product.
-- "quantity": unidades. NO usar 1 por defecto salvo lista de un solo producto. Para peso/tamaño usa variantHint, no quantity.
+- "quantity": unidades. NO inventes un 1 cuando el cliente solo PREGUNTA ("¿tienes cortador?", "¿hay rosado?"). PERO cuando el cliente da una ORDEN DE AGREGAR con un verbo de pedido (dame, ponme, agrégame, añademe, quiero, necesito, regálame, mándame) e indica "un/una/uno" o un número, SÍ pon la cantidad ("un/una/uno" = quantity 1). Ej: "dame un cortador" → quantity 1; "ponme dos rosados" → quantity 2. Así el producto se agrega directo sin volver a preguntar la cantidad. Para peso/tamaño usa variantHint, no quantity.
 - "quantities": array paralelo a selectionIndexes cuando cada producto lleva cantidad distinta.
-- "variantHint": tamaño/presentación EXACTO como lo dice el cliente ("5 kilos", "20 ml", "500 gramos"). NUNCA conviertas las unidades. SIEMPRE texto libre. Solo para select_product/search_product (en edit_cart usa los campos del change).
+- "variantHint": tamaño/presentación EXACTO como lo dice el cliente ("5 kilos", "20 ml", "500 gramos", "bloque", "caja de 10 kilos", "de a kilo"). NUNCA conviertas las unidades ni traduzcas un peso a una forma. SIEMPRE texto libre. Solo para select_product/search_product (en edit_cart usa los campos del change).
 - "searchQuery": para search_product y general_question. Nombre del producto SIN frases de uso ("para hacer X"), pero CONSERVA "para velas"/"para jabones" si forman parte del nombre.
 - "productList": array {productHint, quantity, variantHint?} para multi_product_add o request_quote.
 - "needsClarification": true cuando falta información crítica.
 - "recommendFromList": true (solo con general_question) cuando el cliente pide que le recomiendes/sugieras cuál elegir entre los productos ya mostrados.
+- "faqTopic": "store_location" (solo con general_question) cuando el cliente pregunta por la ubicación/dirección física de la tienda. Robusto a verbos de pedido y typos.
 
 PESO SIEMPRE EN variantHint (para search_product/select_product):
 "5 kilos de cera de palma" → searchQuery:"cera de palma", variantHint:"5 kilos" — NO quantity:5
@@ -340,6 +366,16 @@ EJEMPLOS:
 "quiero 5 de la 1" → {"primary":{"intent":"select_product","selectionIndexes":[1],"quantity":5},"secondary":null}
 "tienes cera de soja apf de 5 kilos" → {"primary":{"intent":"search_product","searchQuery":"cera de soja apf"},"secondary":null}
 "1 termometro" → {"primary":{"intent":"search_product","searchQuery":"termometro"},"secondary":null}
+"dame un cortador" → {"primary":{"intent":"search_product","searchQuery":"cortador","quantity":1},"secondary":null}
+"dame un bloque de tr" → {"primary":{"intent":"search_product","searchQuery":"tr","variantHint":"bloque","quantity":1},"secondary":null}
+"necesito un bloque de white" → {"primary":{"intent":"search_product","searchQuery":"white","variantHint":"bloque","quantity":1},"secondary":null}
+"dame un color rosado" → {"primary":{"intent":"search_product","searchQuery":"color rosado","quantity":1},"secondary":null}
+"ponme dos rosados" → {"primary":{"intent":"search_product","searchQuery":"rosado","quantity":2},"secondary":null}
+"¿tienes cortador?" → {"primary":{"intent":"search_product","searchQuery":"cortador"},"secondary":null}
+"¿dónde queda la tienda?" → {"primary":{"intent":"general_question","faqTopic":"store_location"},"secondary":null}
+"Regálame por favor la direccion de la tie3nda" → {"primary":{"intent":"general_question","faqTopic":"store_location"},"secondary":null}
+"necesito la dirección" → {"primary":{"intent":"general_question","faqTopic":"store_location"},"secondary":null}
+"¿puedo cambiar mi dirección de entrega?" → {"primary":{"intent":"general_question"},"secondary":null}
 
 EJEMPLOS CON REASONING (edit_cart) - ESTOS SON OBLIGATORIOS:
 
@@ -365,10 +401,26 @@ EJEMPLOS CON REASONING (edit_cart) - ESTOS SON OBLIGATORIOS:
 
 "necesito 5 kilos de cera y 3 fragancias" (sin productos en carrito) → {"primary":{"intent":"multi_product_add"},"secondary":null}
 
+"un bloque de white y uno de transparente" (sin carrito) → {"primary":{"intent":"multi_product_add","productList":[{"productHint":"white","quantity":1,"variantHint":"bloque"},{"productHint":"transparente","quantity":1,"variantHint":"bloque"}]},"secondary":null}
+
+"dame un termometro" (carrito: 1. 1x Base Transparente 10 KILOS (BLOQUE) / 2. 10x Base White KILO)
+→ {"primary":{"intent":"edit_cart","reasoning":"Cliente agrega un termómetro (producto nuevo, NO está en el carrito). NO se toca ninguna base.","changes":[{"action":"new","product":"termometro","quantity":1}]},"secondary":null}
+
+"pero necesito la de 10k" (carrito: 1. 1x BASE DE GLICERINA EASY SOAP WHITE-BLANCA KILO / 2. 1x BASE DE GLICERINA EASY SOAP TR PLUS-TRANSPARENTE KILO)
+→ {"primary":{"intent":"edit_cart","reasoning":"Cliente corrige la presentación de lo que acaba de pedir a la de 10 kilos; solo dio el peso, sin decir bloque ni suelto → weightText","changes":[{"action":"set","cartIndex":1,"product":"BASE DE GLICERINA EASY SOAP WHITE-BLANCA","weightText":"10 kilos"},{"action":"set","cartIndex":2,"product":"BASE DE GLICERINA EASY SOAP TR PLUS-TRANSPARENTE","weightText":"10 kilos"}]},"secondary":null}
+
+"mejor el bloque" (carrito: 1. 10x BASE DE GLICERINA EASY SOAP WHITE-BLANCA KILO)
+→ {"primary":{"intent":"edit_cart","reasoning":"Cliente cambia la presentación al bloque (a granel), conserva el producto","changes":[{"action":"set","cartIndex":1,"product":"BASE DE GLICERINA EASY SOAP WHITE-BLANCA","variant":"bloque"}]},"secondary":null}
+
+"quiero 10 kilos de base white" (sin carrito) → {"primary":{"intent":"search_product","searchQuery":"base white","variantHint":"10 kilos"},"secondary":null}
+
 "agrega 2 fragancias y muéstrame el pedido" (carrito con otros ítems; fragancia NO está)
 → {"primary":{"intent":"edit_cart","reasoning":"Cliente agrega 2 fragancias nuevas y quiere ver el pedido","changes":[{"action":"new","product":"Fragancia","quantity":2}]},"secondary":{"intent":"show_cart"}}
 
 "ya llegaron las ceras de arena?" → {"primary":{"intent":"search_product","searchQuery":"cera de arena"},"secondary":null}
+
+"si ponme un cortador de esos metalicos que ustedes venden" (historial: el bot mencionó "Mecha de Madera con Soporte Metálico")
+→ {"primary":{"intent":"search_product","searchQuery":"cortador metalico","reasoning":"El cliente NOMBRA el producto: cortador. 'de esos metalicos' lo califica; NO es la mecha del historial"},"secondary":null}
 
 "y ustedes venden?" (historial: cliente preguntó "que es el aceite de castor?", bot respondió sobre el aceite de ricino)
 → {"primary":{"intent":"search_product","searchQuery":"aceite de ricino","reasoning":"Cliente pregunta si venden el producto mencionado en el historial (aceite de castor/ricino)"},"secondary":null}
@@ -376,8 +428,13 @@ EJEMPLOS CON REASONING (edit_cart) - ESTOS SON OBLIGATORIOS:
 "cuánto vale el envío?" → {"primary":{"intent":"general_question"},"secondary":null}
 
 "quién eres?" → {"primary":{"intent":"smalltalk"},"secondary":null}
+"Quiero hablar con un humano" → {"primary":{"intent":"human_handoff"},"secondary":null}
+"que mal servicio" → {"primary":{"intent":"complaint"},"secondary":null}
+"eres un robot, tengo un reclamo" → {"primary":{"intent":"complaint"},"secondary":null}
+"quiero un humano, esto es pésimo" → {"primary":{"intent":"human_handoff"},"secondary":null}
 
-"gracias, luego les escribo" → {"primary":{"intent":"farewell"},"secondary":null}`;
+"gracias, luego les escribo" → {"primary":{"intent":"farewell"},"secondary":null}
+"Necesitaba los 20. Entonces vuelvo a escribir luego. gracias" → {"primary":{"intent":"farewell","reasoning":"El cliente desiste (solo había menos de lo que pedía) y se despide; aunque menciona 20, NO es un pedido"},"secondary":null}`;
 
 const NLU_INTENT_SCHEMA = {
 	type: 'object',
@@ -398,6 +455,8 @@ const NLU_INTENT_SCHEMA = {
 				'objection',
 				'general_question',
 				'smalltalk',
+				'human_handoff',
+				'complaint',
 				'unknown',
 			],
 		},
@@ -444,6 +503,7 @@ const NLU_INTENT_SCHEMA = {
 		},
 		needsClarification: { type: 'boolean' },
 		recommendFromList: { type: 'boolean' },
+		faqTopic: { type: 'string', enum: ['store_location'] },
 	},
 	required: ['intent', 'reasoning', 'changes'],
 	additionalProperties: false,
@@ -492,6 +552,9 @@ export interface OpenAIContext {
 	currency?: string;
 	isFirstInteraction?: boolean;
 	intent?: string;
+	/** Para intent 'complaint': true cuando el cliente ya mostró frustración repetida y
+	 *  toca ofrecer transferirlo con una persona del equipo; false = intentar ayudar primero. */
+	escalateToHuman?: boolean;
 	lastBotMessage?: string;
 	quantity?: number;
 	cart?: OpenAICartItem[];
@@ -500,8 +563,24 @@ export interface OpenAIContext {
 	editOutcomeNotes?: string[];
 	/** Cantidad que el cliente pidió originalmente (antes de limitar al stock) */
 	requestedQuantity?: number;
+	/** Stock disponible cuando el cliente pidió MÁS de lo que hay: NO se agrega nada,
+	 * se le pregunta si quiere llevar esta cantidad. Va sin `quantity` (no confirmar). */
+	stockOnlyAvailable?: number;
 	/** Nota personalizada de stock excedido (reemplaza el mensaje genérico cuando las unidades no representan la cantidad que el cliente entiende) */
 	stockExceededNote?: string;
+	/**
+	 * El cliente pidió una presentación a granel (bloque/caja) que no está disponible
+	 * en su país; ofrecer la alternativa por kilo de forma natural (un solo mensaje).
+	 */
+	bulkUnavailable?: {
+		/** Nombre completo del producto en catálogo (el modelo lo acorta al hablar) */
+		productName: string;
+		/** Presentación pedida no disponible, en lenguaje natural ("bloque de 10 kilos") */
+		bulkLabel: string;
+		/** Unidades por kilo a ofrecer como alternativa */
+		kiloUnits: number;
+		kiloUnitPrice: string | null;
+	};
 	/** Datos recopilados del cliente en flujo de cotización */
 	quoteFlowData?: {
 		fullName?: string;
@@ -528,6 +607,12 @@ export interface OpenAIContext {
 	isFirstEverInteraction?: boolean;
 	/** Nombre completo del cliente registrado en BD (solo cuando es una persona, no empresa) */
 	knownCustomerName?: string;
+	/** true cuando el cliente es nuevo (no tenemos sus datos): el cierre debe pedir
+	 * nombre y ciudad en vez de "¿algo más?". */
+	askNameAndCity?: boolean;
+	/** Nombre del producto que el cliente consultó antes de dar sus datos: tras
+	 * recopilar nombre/ciudad (intent name_collected), ofrecérselo como pregunta. */
+	pendingOfferProduct?: string;
 	/** true cuando el bot ya nombró al cliente en el primer show_cart de esta sesión */
 	hasShownCartByName?: boolean;
 	/** true cuando el cliente pregunta si ya llegó un producto ("ya les llegó...") */
@@ -576,6 +661,8 @@ export type AIDetectedIntent =
 	| 'objection'
 	| 'general_question'
 	| 'smalltalk'
+	| 'human_handoff'
+	| 'complaint'
 	| 'farewell'
 	| 'unknown';
 
@@ -613,6 +700,9 @@ export interface NLUIntent {
 	/** true cuando el cliente pide una recomendación/opinión sobre cuál elegir entre los
 	 * productos ya mostrados en la conversación ("¿cuál me recomienda?", "¿cuál de todos?"). */
 	recommendFromList?: boolean;
+	/** Tema canónico de FAQ cuando la pregunta mapea a uno bien conocido. 'store_location'
+	 * = ubicación/dirección física de la tienda. El handler lo resuelve por título. */
+	faqTopic?: 'store_location';
 }
 
 export interface NLUResult {
@@ -868,6 +958,8 @@ export class OpenAIService {
 			'objection',
 			'general_question',
 			'smalltalk',
+			'human_handoff',
+			'complaint',
 			'farewell',
 			'unknown',
 		];
@@ -962,6 +1054,7 @@ export class OpenAIService {
 			productList: productList?.length ? productList : undefined,
 			needsClarification: raw.needsClarification === true ? true : undefined,
 			recommendFromList: raw.recommendFromList === true ? true : undefined,
+			faqTopic: raw.faqTopic === 'store_location' ? 'store_location' : undefined,
 		};
 	};
 
@@ -972,6 +1065,42 @@ export class OpenAIService {
 		// ramas de saludo inicial). Inyectarla evita que el modelo repita siempre la
 		// misma variante por imitación del historial.
 		const welcomeQuestion = pickWelcomeQuestion();
+		// Saludo correcto para la hora ACTUAL (el modelo no conoce la hora). Regla de
+		// saludo compartida por todas las ramas de primer contacto.
+		const timeGreeting = getTimeGreeting();
+		const greetingRule = `Para saludar usa "${timeGreeting}" (es lo que corresponde a la hora actual) o simplemente "Hola" — ALTERNA entre esas dos para no sonar repetitivo; JAMÁS uses un saludo de otra franja horaria. Si el cliente saludó con la franja equivocada (ej. "buenos días" por la tarde), NO lo corrijas ni lo menciones: solo salúdalo bien.`;
+
+		// "con gusto" en la apertura del PRIMER mensaje: SOLO cuando el pedido se agrega
+		// con éxito o cuando el cliente pide ayuda ("¿me puede ayudar con...?"). NUNCA
+		// cuando el producto no está disponible ni en preguntas de información (FAQ):
+		// suena raro decir "con gusto" y luego "no lo tenemos".
+		const askedForHelp =
+			/\b(me\s+(puede[s]?|podr[íi]as?)\s+ayud|me\s+ayuda[s]?|ay[uú]da(me|r)|puede[s]?\s+ayudarme|necesito\s+ayuda|ay[uú]deme)/i.test(
+				ctx.userMessage,
+			);
+		const addedViaNotes =
+			Array.isArray(ctx.editOutcomeNotes) &&
+			ctx.editOutcomeNotes.some(n => /^(AGREGADO|CANTIDAD)/.test(n)) &&
+			!ctx.editOutcomeNotes.some(n =>
+				/NO ENCONTRADO|NO ESTÁ|NO APLICADO|sin stock|no disponible|no se pudo/i.test(
+					n,
+				),
+			);
+		const successfulFirstAdd =
+			(!!ctx.selectedProduct &&
+				ctx.quantity !== undefined &&
+				!ctx.stockExceededNote &&
+				!ctx.outOfStockProductName) ||
+			addedViaNotes;
+		const conGustoOpener = successfulFirstAdd || askedForHelp;
+		// Fragmento reutilizable de apertura cálida para el primer mensaje directo.
+		// Con nombre → "Sr./Sra. + primer nombre"; sin nombre (cliente nuevo) → solo el saludo.
+		const firstTurnOpener = (name?: string): string =>
+			`ABRE con un saludo cálido y breve (sin presentarte como Gema): el saludo de la hora o "Hola"${
+				name
+					? `, coma, "Sr./Sra." + su PRIMER NOMBRE (para "${name}" usa solo el primer nombre, ej. "Carlos Hernandez" → "Sr. Carlos", NUNCA el apellido; si parece nombre de empresa, omite el nombre)`
+					: ' (todavía NO tenemos su nombre: NO uses "Sr./Sra." ni inventes un nombre, solo el saludo)'
+			}${conGustoOpener ? ', y agrega ", con gusto"' : ' (SIN "con gusto")'}. ${greetingRule} El saludo va SIEMPRE al inicio y ninguna otra instrucción (aunque diga "responde solo con...") lo elimina; después del saludo, en el MISMO mensaje, va el contenido.`;
 
 		// Resultado real de cambios al pedido (edit_cart o ediciones dentro de un
 		// flujo). Se renderiza para CUALQUIER intent, para que los resúmenes de
@@ -981,25 +1110,107 @@ export class OpenAIService {
 				'\nResultado REAL de los cambios que pidió el cliente (tu respuesta DEBE reflejar cada uno, sin inventar ni omitir ninguno):\n' +
 					ctx.editOutcomeNotes.map(n => `- ${n}`).join('\n') +
 					'\nTu respuesta NO PUEDE contradecir estos resultados: si aquí no dice que algo se agregó, NO se agregó (aunque el cliente lo haya pedido). ' +
-					'Estos son DATOS, no frases para copiar. Redáctalos de forma natural y cercana, en primera persona, VARIANDO la forma cada vez: "Le agregué...", "Le sumé...", "Listo, van...", "Quedó añadido...", "Le quité...", "Quitamos del pedido...", "No se la pude agregar porque está sin stock". ' +
-					'IMPORTANTE: mira el historial de la conversación y NO repitas la MISMA fórmula de confirmación que ya usaste en mensajes anteriores (si en el turno previo dijiste "Perfecto. Le agregué...", esta vez abre y redacta distinto). Varía tanto la palabra inicial como el verbo. PROHIBIDO el tono impersonal robótico: "Se agregó", "Se eliminó", "Se quitó", "Se actualizó", "no se pudo agregar".',
+					(ctx.isFirstInteraction
+						? 'Como es el PRIMER mensaje (ya hay saludo de apertura), NO narres el cambio aparte ("Le agregué X"): el resumen del pedido que sigue ya lo muestra. Enlaza el saludo con la frase de resumen. '
+						: 'Estos son DATOS, no frases para copiar. Redáctalos de forma natural y cercana, en primera persona, VARIANDO la forma cada vez: "Le agregué...", "Le sumé...", "Listo, van...", "Quedó añadido...", "Le quité...", "Quitamos del pedido...", "No se la pude agregar porque está sin stock". ' +
+							'CRÍTICO anti-redundancia: al confirmar la acción NO repitas el nombre COMPLETO del producto del catálogo (el resumen que sigue ya lo lista con cantidad y precio). Usa un nombre CORTO y natural como lo diría el cliente (ej. "el bloque de transparente", "la cera de palma") o confirma la acción de forma genérica ("Listo, se lo sumé"). NUNCA escribas el nombre largo dos veces (una en la confirmación y otra en el resumen). ' +
+							'IMPORTANTE: mira el historial de la conversación y NO repitas la MISMA fórmula de confirmación que ya usaste en mensajes anteriores (si en el turno previo dijiste "Perfecto. Le agregué...", esta vez abre y redacta distinto). Varía tanto la palabra inicial como el verbo. ') +
+					'PROHIBIDO el tono impersonal robótico ("Se agregó", "Se eliminó", "Se quitó", "Se actualizó", "no se pudo agregar") y PROHIBIDO "¡De una!".',
 			);
 		}
 
-		const isGenericGreeting = /^(hola|buenas|hey|holi|ola)$/i.test(
-			ctx.userMessage.trim(),
-		);
+		// Presentación a granel (bloque/caja) no disponible → ofrecer kilos de forma
+		// natural, en UN solo mensaje, sin listas ni nombre largo de catálogo.
+		if (ctx.bulkUnavailable) {
+			const b = ctx.bulkUnavailable;
+			const unit = formatPrice(b.kiloUnitPrice, currency);
+			const total = b.kiloUnitPrice
+				? formatPrice(String(Number(b.kiloUnitPrice) * b.kiloUnits), currency)
+				: null;
+			if (ctx.knownCustomerName) {
+				parts.push(
+					ctx.isFirstInteraction
+						? `\nEl cliente se llama "${ctx.knownCustomerName}". Es el PRIMER mensaje: ${firstTurnOpener(ctx.knownCustomerName)}`
+						: `\nEl cliente se llama "${ctx.knownCustomerName}". Si parece nombre de persona (no empresa), puedes tratarlo por "Sr./Sra. + PRIMER NOMBRE" (ej. "Sr. Carlos"), sin apellido y sin abusar del nombre.`,
+				);
+			}
+			// Si hay ítems ya agregados, confirmarlos primero (lista + total, variando la apertura)
+			if (ctx.cart && ctx.cart.length > 0) {
+				const cartLines = ctx.cart
+					.map(item => {
+						const name = item.variantName
+							? `${item.productName} ${item.variantName}`
+							: item.productName;
+						const t = item.unitPrice
+							? formatPrice(
+									String(Number(item.unitPrice) * item.quantity),
+									item.currency,
+								)
+							: null;
+						return t
+							? `- ${item.quantity}x ${name} = ${t}`
+							: `- ${item.quantity}x ${name}`;
+					})
+					.join('\n');
+				const grand = ctx.cart.reduce(
+					(s, i) => s + (i.unitPrice ? Number(i.unitPrice) * i.quantity : 0),
+					0,
+				);
+				parts.push(
+					`\nPRIMERO confirma lo que ya quedó en el pedido, mostrando esta lista TAL CUAL (no cambies cantidades ni precios, no agregues líneas):\n${cartLines}\nTotal: ${formatPrice(String(grand), currency)}\nVaría la frase de apertura del resumen (ej. "Le dejé...", "Su pedido va así:", "Va quedando así:", "Este es su pedido:") — NO uses siempre "Listo, aquí está su pedido".`,
+				);
+			}
+			parts.push(
+				`\n${ctx.cart && ctx.cart.length > 0 ? 'LUEGO' : 'ÚNICO mensaje:'} aclara que "${b.productName}" NO lo tenemos en ${b.bulkLabel} por ahora, pero SÍ de a kilo (${b.kiloUnits} unidad(es) a ${unit} c/u${total ? `, total ${total}` : ''}), y ofrece agregar ${b.kiloUnits} preguntando si se las agrega. Nombra el producto con un nombre CORTO como lo diría el cliente (ej. "la base white"), NUNCA el nombre completo del catálogo. SIN listas ni viñetas en la aclaración. VARÍA la redacción. Cierra con la pregunta de la oferta (ej. "¿le agrego ${b.kiloUnits}?"), NO con "¿necesita algo más?".` +
+					`\nTono de referencia (NO lo copies literal): "La base white no la tenemos en bloque de 10 kilos, pero sí de a kilo a ${unit} c/u; ¿le agrego ${b.kiloUnits}?".`,
+			);
+			return parts.join('\n');
+		}
+
+		// Un saludo puro es un mensaje compuesto SOLO por palabras de saludo, incluidos
+		// los de dos palabras ("buenos días", "buenas noches", "qué tal"). Si aparece
+		// cualquier otra palabra (producto/consulta), NO es saludo puro.
+		const greetingClean = ctx.userMessage
+			.trim()
+			.toLowerCase()
+			.normalize('NFD')
+			.replace(/[̀-ͯ]/g, '')
+			.replace(/[^a-z\s]/g, '')
+			.trim();
+		const GREETING_TOKENS = new Set([
+			'hola',
+			'holi',
+			'ola',
+			'hey',
+			'ey',
+			'buenas',
+			'buenos',
+			'buen',
+			'dias',
+			'dia',
+			'tardes',
+			'tarde',
+			'noches',
+			'noche',
+			'saludos',
+			'que',
+			'tal',
+			'muy',
+		]);
+		const isGenericGreeting =
+			greetingClean.length > 0 &&
+			greetingClean.split(/\s+/).every(w => GREETING_TOKENS.has(w));
 
 		if (ctx.isFirstInteraction) {
 			if (ctx.isFirstEverInteraction && ctx.knownCustomerName) {
 				// Primer contacto real: cliente existe en BD
 				if (ctx.products && ctx.products.length > 0) {
 					parts.push(
-						`\nEs la primera vez que este cliente escribe al bot. Su nombre en el sistema es "${ctx.knownCustomerName}". Si ese nombre parece un nombre de persona (no de empresa), preséntate como Gema y salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.) en UNA línea breve, luego muestra los productos directamente. Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". Si parece nombre de empresa, preséntate como Gema sin usar el nombre. Usa siempre "usted" (nunca "tú"). No hagas el saludo y los productos como bloques separados.`,
+						`\nEs la primera vez que este cliente escribe al bot. Su nombre en el sistema es "${ctx.knownCustomerName}". Si ese nombre parece un nombre de persona (no de empresa), preséntate como Gema y salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.) en UNA línea breve, luego muestra los productos directamente. Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". Si parece nombre de empresa, preséntate como Gema sin usar el nombre. ${greetingRule} Usa siempre "usted" (nunca "tú"). No hagas el saludo y los productos como bloques separados.`,
 					);
 				} else {
 					parts.push(
-						`\nEs la primera vez que este cliente escribe al bot. Su nombre en el sistema es "${ctx.knownCustomerName}". Si ese nombre parece un nombre de persona (no de empresa), preséntate como Gema y salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.) de forma natural y breve. Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". Si parece nombre de empresa, preséntate como Gema sin usar el nombre. Usa siempre "usted" (nunca "tú"). No menciones productos ni el giro de la tienda. El mensaje debe terminar EXACTAMENTE con esta pregunta, copiada literal: "${welcomeQuestion}". NO la cambies por otra variante y NO añadas NADA después de la pregunta.`,
+						`\nEs la primera vez que este cliente escribe al bot. Su nombre en el sistema es "${ctx.knownCustomerName}". Si ese nombre parece un nombre de persona (no de empresa), preséntate como Gema y salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.) de forma natural y breve. Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". Si parece nombre de empresa, preséntate como Gema sin usar el nombre. ${greetingRule} Usa siempre "usted" (nunca "tú"). No menciones productos ni el giro de la tienda. El mensaje debe terminar EXACTAMENTE con esta pregunta, copiada literal: "${welcomeQuestion}". NO la cambies por otra variante y NO añadas NADA después de la pregunta.`,
 					);
 				}
 			} else if (ctx.isFirstEverInteraction) {
@@ -1014,7 +1225,7 @@ export class OpenAIService {
 					);
 				} else {
 					parts.push(
-						'\nEs la primera vez que este cliente escribe. Responde su consulta de forma natural, y al final del mensaje agrega: "Por cierto, ¿me dice su nombre y desde dónde nos escribe?". Usa siempre "usted" (nunca "tú").',
+						`\nEs la primera vez que este cliente escribe. ${firstTurnOpener()} Responde su consulta de forma natural. NUNCA preguntes nombre ni ciudad al INICIO (eso va al final). Usa siempre "usted" (nunca "tú").`,
 					);
 				}
 			} else {
@@ -1022,22 +1233,22 @@ export class OpenAIService {
 				if (ctx.products && ctx.products.length > 0) {
 					parts.push(
 						ctx.knownCustomerName
-							? `\nEl cliente ya ha hablado antes con el bot pero su sesión expiró. Su nombre en el sistema es "${ctx.knownCustomerName}". Respóndele en un ÚNICO mensaje: empieza con un saludo breve y natural sin presentarte como Gema nuevamente. Si parece un nombre de persona (no de empresa), salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.). Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". A continuación muestra los productos. Usa siempre "usted" (nunca "tú").`
-							: '\nEl cliente ya ha hablado antes con el bot pero su sesión expiró y no tenemos sus datos registrados. Respóndele en un ÚNICO mensaje: empieza con un saludo breve y natural, muestra los productos, y al final agrega de forma natural: "Por cierto, ¿me dice su nombre y desde dónde nos escribe?". Usa siempre "usted" (nunca "tú").',
+							? `\nEl cliente ya ha hablado antes con el bot pero su sesión expiró. Su nombre en el sistema es "${ctx.knownCustomerName}". Respóndele en un ÚNICO mensaje: ${firstTurnOpener(ctx.knownCustomerName)} A continuación muestra los productos, en el mismo mensaje. Usa siempre "usted" (nunca "tú").`
+							: `\nEl cliente es nuevo y no tenemos sus datos. Respóndele en un ÚNICO mensaje: ${firstTurnOpener()} A continuación muestra los productos, en el mismo mensaje. Usa siempre "usted" (nunca "tú").`,
 					);
 				} else if (isGenericGreeting) {
 					// Solo saludo, sin pregunta concreta
 					parts.push(
 						ctx.knownCustomerName
-							? `\nEl cliente ya ha hablado antes con el bot pero su sesión expiró y solo envió un saludo. Su nombre en el sistema es "${ctx.knownCustomerName}". Salúdalo de forma natural y breve sin presentarte como Gema nuevamente. Si parece un nombre de persona (no de empresa), salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.). Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". Termina EXACTAMENTE con esta pregunta de bienvenida, copiada literal: "${welcomeQuestion}". NO la cambies por otra variante. Usa siempre "usted" (nunca "tú").`
+							? `\nEl cliente ya ha hablado antes con el bot pero su sesión expiró y solo envió un saludo. Su nombre en el sistema es "${ctx.knownCustomerName}". Salúdalo de forma natural y breve sin presentarte como Gema nuevamente. Si parece un nombre de persona (no de empresa), salúdalo usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.). Por ejemplo, si el nombre es "Carlos Hernandez", escribe "Sr. Carlos", NO "Sr. Hernandez". ${greetingRule} Termina EXACTAMENTE con esta pregunta de bienvenida, copiada literal: "${welcomeQuestion}". NO la cambies por otra variante. Usa siempre "usted" (nunca "tú").`
 							: '\nEl cliente ya ha hablado antes con el bot pero su sesión expiró y solo envió un saludo; no tenemos sus datos. Salúdalo de forma natural y breve sin presentarte como Gema nuevamente. Pregúntale su nombre y la ciudad desde donde nos escribe. TERMINA AHÍ. No añadas "¿En qué le puedo ayudar?" ni ninguna otra pregunta adicional. Mensaje MUY CORTO. Usa siempre "usted" (nunca "tú").',
 					);
 				} else {
 					// El cliente tiene una pregunta o solicitud concreta
 					parts.push(
 						ctx.knownCustomerName
-							? `\nEl cliente ya ha hablado antes con el bot pero su sesión expiró. Su nombre en el sistema es "${ctx.knownCustomerName}". PROHIBIDO preguntar el nombre o la ciudad — ya están registrados en el sistema. Empieza el mensaje con un saludo MUY BREVE usando ÚNICAMENTE su PRIMER NOMBRE (no el apellido) con el honorífico apropiado (Sr./Sra.) — por ejemplo "Buenas tardes, Sr. Carlos" para "Carlos Hernandez" — y a continuación responde directamente lo que el cliente preguntó. No añadas preguntas que no correspondan a la consulta. Usa siempre "usted" (nunca "tú").`
-							: '\nEl cliente ya ha hablado antes con el bot pero su sesión expiró y no tenemos sus datos. Responde directamente su consulta. Al final del mensaje agrega de forma natural: "Por cierto, ¿me dice su nombre y desde dónde nos escribe?". NUNCA preguntes nombre ni ciudad al inicio. Usa siempre "usted" (nunca "tú").',
+							? `\nEl cliente ya ha hablado antes con el bot pero su sesión expiró. Su nombre en el sistema es "${ctx.knownCustomerName}". PROHIBIDO preguntar el nombre o la ciudad — ya están registrados en el sistema. Es el PRIMER mensaje y el cliente fue directo a su consulta/pedido. ${firstTurnOpener(ctx.knownCustomerName)} Justo después responde directamente lo que pidió, en el mismo mensaje (sin bloques separados). No añadas preguntas que no correspondan a la consulta. Usa siempre "usted" (nunca "tú").`
+							: `\nEl cliente es nuevo y no tenemos sus datos. Es el PRIMER mensaje y fue directo a su consulta/pedido. ${firstTurnOpener()} Justo después responde directamente lo que pidió, en el mismo mensaje. NUNCA preguntes nombre ni ciudad al INICIO (eso va al final). Usa siempre "usted" (nunca "tú").`,
 					);
 				}
 			}
@@ -1104,13 +1315,36 @@ export class OpenAIService {
 				'\nEl cliente hace un comentario o pregunta conversacional: sobre ti, la conversación, sus propios datos, charla casual o algo ajeno al negocio. No es una consulta de catálogo, cotización ni compra.' +
 					'\nRazona la pregunta REAL y respóndela como una asesora real por WhatsApp: directa, breve, cálida y natural (1-2 frases), apoyándote en la sección "QUIÉN ERES Y EN QUÉ AYUDAS" y en el historial. Responde SOLO lo que se te preguntó. No busques ni listes productos.' +
 					'\nCLAVE: si la pregunta TIENE una respuesta concreta (quién eres, tu nombre, por qué sabes su nombre, qué es Manuarte, con qué puedes ayudar, etc.), respóndela directamente y NO le agregues ninguna frase de redirección ni el discurso de "le ayudo con insumos, cotizaciones y compras". Da SOLO la respuesta a lo que preguntó.' +
-					'\nIDENTIDAD: si pregunta quién eres o cómo te llamas → "Soy Gema, asesora de Manuarte." Si pregunta DIRECTAMENTE si eres una IA, un bot o una persona → nunca lo niegues ni finjas ser humano: di con naturalidad que eres un asistente virtual del equipo. Fuera de esa pregunta directa, NUNCA hables de tu naturaleza ni digas que no tienes sentimientos.' +
+					'\nIDENTIDAD: si pregunta quién eres o cómo te llamas → tu identidad es "Soy Gema, asesora de Manuarte", pero exprésalo con tus palabras y VARÍA la forma; NO repitas la misma frase exacta que ya usaste antes en la conversación. Si pregunta DIRECTAMENTE si eres una IA, un bot o una persona → nunca lo niegues ni finjas ser humano: di con naturalidad que eres un asistente virtual del equipo. Fuera de esa pregunta directa, NUNCA hables de tu naturaleza ni digas que no tienes sentimientos.' +
+					'\nRESPONDE CON INTELIGENCIA, no con una frase fija: entiende la intención REAL del mensaje (aunque esté formulado de una forma que no hayas visto) y contéstala. Si pregunta por el significado de tu nombre, "Gema" significa "Guía Exclusiva de Manuarte". Si te pide presentarte, hazlo con calidez. Si critica o dice algo como que "Gema no es nombre de persona", reconócelo con humildad y sin ponerte a la defensiva. NUNCA respondas dos veces seguidas con el mismo texto: si el cliente reformula o insiste, cambia el enfoque y aporta algo nuevo.' +
+					'\nCONFIRMACIÓN DE NEGOCIO: si pregunta si este es Manuarte / el número de Manuarte / si está escribiendo a Manuarte → confírmalo con naturalidad ("Sí, esto es Manuarte" / "Sí señor, aquí es Manuarte"). NUNCA respondas "no tengo esa información" a esto: es una confirmación de identidad, no un pedido de teléfono.' +
+					(ctx.isFirstInteraction
+						? ctx.askNameAndCity
+							? '\nEs el PRIMER mensaje de un cliente NUEVO: después de confirmar/responder, cierra con UNA SOLA pregunta: pídele su nombre y la ciudad desde donde escribe. PROHIBIDO añadir además "¿En qué le puedo ayudar?" ni ninguna otra pregunta — SOLO la de nombre y ciudad.'
+							: `\nEs el PRIMER mensaje: después de responder, cierra con UNA SOLA pregunta de bienvenida aprobada, copiada literal: "${welcomeQuestion}". No añadas otra pregunta.`
+						: '') +
 					'\nQUÉ PUEDES HACER: si pregunta con qué o en qué le puedes ayudar (tus capacidades), respóndele en UN solo mensaje breve que le ayudas con lo relacionado a insumos para velas y jabones: encontrar productos e información, armar cotizaciones y acompañarlo en la compra. NO enumeres insumos para fabricar jabones o velas: eso no es lo que está preguntando.' +
 					'\nSOLO cuando el mensaje es personal, afectivo, una broma o algo ajeno SIN respuesta real ("¿me quieres?", "¿qué hora es?", "¿estás casada?"): reconócelo con calidez y humor ligero (un "jaja" o un emoji permitido si encaja), SIN seguirle la corriente y SIN mencionar tu naturaleza, y reencauza con UNA frase o pregunta CORTA y variada (p. ej. "dígame qué necesita" o "¿busca algo para velas o jabones?"). NO sueltes aquí la descripción larga de capacidades. Reserva la aclaración explícita del propósito del canal (atención de Manuarte para insumos de velas y jabones) para cuando el cliente se desvíe mucho, insista en lo ajeno o pida productos que no vendemos. VARÍA siempre, nunca repitas la frase del mensaje anterior.' +
 					(ctx.knownCustomerName
 						? `\nDato disponible (úsalo SOLO si aplica): el cliente está registrado como "${ctx.knownCustomerName}". Este dato ÚNICAMENTE es relevante cuando el cliente pregunta específicamente por SU PROPIO nombre o por qué lo llamaste así; en ese caso responde solo que lo tienes registrado en el sistema con ese nombre, sin agregar nada más (nada de "si prefiere que lo llamemos de otra forma, me dice"), y solo si dice que está equivocado, discúlpate y pregúntale cómo prefiere que lo llamemos. CRÍTICO: si la pregunta NO es sobre su nombre (por ejemplo "¿quién eres?", "¿qué es Manuarte?", "¿me quieres?"), NO menciones ni concatenes nada sobre tener su nombre registrado — ese dato NO viene al caso y NO debe aparecer en la respuesta.`
 						: '\nNo tienes el nombre del cliente registrado. Si pregunta por su nombre, discúlpate brevemente y pídeselo, sin agregar nada más.'),
 			);
+		} else if (ctx.intent === 'human_handoff') {
+			parts.push(
+				'\nEl cliente pide EXPLÍCITAMENTE hablar con una persona del equipo. Confírmale con naturalidad y calidez (1-2 frases) que con gusto lo comunicas con alguien y que enseguida lo atienden por este mismo chat.' +
+					'\nNO finjas ser humano ni niegues tu naturaleza, pero tampoco te extiendas explicando que eres un asistente virtual. NO ofrezcas productos, precios ni recetas. Cierra con una frase declarativa de disposición, variando las palabras.',
+			);
+		} else if (ctx.intent === 'complaint') {
+			if (ctx.escalateToHuman) {
+				parts.push(
+					'\nEl cliente ha mostrado frustración de forma repetida. Reconoce su molestia con sinceridad y empatía, discúlpate breve, y ofrécele que lo comunicas con una persona del equipo para atenderlo mejor. NO ofrezcas productos ni recetas. 1-2 frases, sin sonar a guion, variando las palabras.',
+				);
+			} else {
+				parts.push(
+					'\nEl cliente expresa una molestia, queja o insatisfacción con la atención (todavía es la primera/segunda vez). Este es un momento sensible: reconoce su sentir con empatía genuina y sin ponerte a la defensiva, discúlpate breve, y OFRÉCETE A AYUDARLE tú misma a resolver lo que necesita — intenta retenerlo y solucionarlo, NO lo transfieras aún ni menciones pasarlo con otra persona.' +
+						'\nInvítalo a contarte qué necesita o qué salió mal, con UNA pregunta corta y cálida. NO ofrezcas productos, precios ni recetas de golpe. 1-2 frases, variando siempre las palabras, sin frases prefabricadas.',
+				);
+			}
 		} else if (ctx.intent === 'objection') {
 			if (ctx.selectedProduct) {
 				const p = ctx.selectedProduct;
@@ -1149,10 +1383,10 @@ export class OpenAIService {
 				);
 			}
 			parts.push(
-				'\nEl cliente tiene una objeción de precio o dudas. Responde con empatía y de forma breve.' +
-					'\nSi el producto tiene variantes más pequeñas o económicas en la lista anterior, preséntaselas directamente sin preguntar si quiere verlas. No inventes productos, precios o disponibilidad.' +
-					'\nSi hay otros productos más económicos en la lista, mencionarlos directamente.' +
-					'\nSi no hay alternativas disponibles y el cliente solo quiere pensarlo o esperar, despídete con calidez y deja la puerta abierta.' +
+				'\nEl cliente tiene una objeción de PRECIO/valor sobre un producto, o dice que lo pensará. Responde con empatía y de forma breve.' +
+					'\nOfrece alternativas más económicas SOLO si el cliente objetó el precio Y existen presentaciones más pequeñas/económicas en la lista anterior; preséntaselas directamente sin preguntar. No inventes productos, precios o disponibilidad.' +
+					'\nSi solo quiere pensarlo o esperar, despídete con calidez y deja la puerta abierta, sin ofrecer nada.' +
+					'\nOJO: si el mensaje NO es sobre el precio de un producto (p. ej. una queja del servicio o pedir un humano), NO ofrezcas productos ni alternativas; solo reconoce con empatía y ponte a disposición.' +
 					'\nNunca presiones, nunca repitas el precio completo, nunca inventes productos o presentaciones que no estén en la lista.',
 			);
 		} else if (ctx.intent === 'affirmation') {
@@ -1190,7 +1424,7 @@ export class OpenAIService {
 				);
 				if (ctx.outOfStockProductName) {
 					parts.push(
-						`\nCRÍTICO: El cliente preguntó por "${ctx.outOfStockProductName}" pero NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. NO digas que sí lo tienes. PRIMERO di en UNA frase corta y natural que no lo tienes disponible, y LUEGO presenta la lista de alternativas disponibles sin ningún comentario adicional. Ejemplo: "La [nombre] no la tenemos disponible en este momento. Sí tenemos:"`,
+						`\nCRÍTICO: El cliente preguntó por "${ctx.outOfStockProductName}" pero NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. NO digas que sí lo tienes. Estructura del mensaje: (1) UNA frase corta y natural diciendo que no lo tienes — VARÍA la redacción cada vez (ej: "se nos agotó la...", "no la tenemos por ahora", "está agotada en este momento", "justo se nos terminó"); (2) introduce la lista de alternativas con una frase natural que, cuando el tipo sea claro, lo MENCIONE en plural (ej: "Estas son las mechas que tenemos disponibles:", "De ceras le puedo ofrecer:", "Le puedo ofrecer estas opciones:") — PROHIBIDO usar "Sí tenemos:" como introducción; (3) muestra la lista sin comentarios adicionales; (4) cierra con UNA pregunta corta variada (ej: "¿Le interesa alguna?", "¿Cuál le interesa?", "¿Le sirve alguna de estas?"). ANTI-REPETICIÓN: revisa tus mensajes anteriores del historial y NO repitas la misma frase de agotado, la misma introducción de lista ni la misma pregunta de cierre que ya usaste en esta conversación.`,
 					);
 					parts.push(
 						'\nTermina con la pregunta "¿Desea llevar alguno de estos?" o una variación natural similar. NO uses "¿Cuál le interesa?" ni "¿Cuál desea llevar?" en este caso.',
@@ -1198,7 +1432,7 @@ export class OpenAIService {
 				}
 			} else if (ctx.outOfStockProductName) {
 				parts.push(
-					`\nCRÍTICO: El cliente preguntó por un producto que NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. Di en UNA frase corta y natural que no lo tienes disponible. Usa el nombre EXACTO del producto tal como está escrito aquí (sin cambiar mayúsculas ni reformatear): "${ctx.outOfStockProductName}". Termina con una pregunta simple como "¿Le puedo ayudar con algún otro producto?".`,
+					`\nCRÍTICO: El cliente preguntó por un producto que NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. Di en UNA frase corta y natural que no lo tienes disponible, VARIANDO la redacción cada vez (ej: "se nos agotó...", "no la tenemos por ahora", "está agotada en este momento"). Usa el nombre EXACTO del producto tal como está escrito aquí (sin cambiar mayúsculas ni reformatear): "${ctx.outOfStockProductName}". Cierra con UNA pregunta corta variada (ej: "¿Le ayudo con otro producto?", "¿Busca algo más?", "¿Le muestro otra opción?"). ANTI-REPETICIÓN: no repitas la misma frase de agotado ni la misma pregunta de cierre que ya usaste en el historial.`,
 				);
 			}
 		} else if (ctx.selectedProducts && ctx.selectedProducts.length > 1) {
@@ -1231,7 +1465,26 @@ export class OpenAIService {
 			const variantDetails = p.variants
 				.map(v => `  - ${v.name}: ${formatPrice(v.price, currency)}`)
 				.join('\n');
-			if (ctx.quantity) {
+			if (
+				ctx.stockExceededNote ||
+				(ctx.stockOnlyAvailable !== undefined &&
+					ctx.requestedQuantity !== undefined)
+			) {
+				// Stock insuficiente: NO se agregó nada. Informar y preguntar, sin confirmar.
+				const sv = p.variants.length === 1 ? p.variants[0] : undefined;
+				const label = sv?.name ? `${p.name} ${sv.name}` : p.name;
+				if (ctx.stockExceededNote) {
+					parts.push(
+						`\nProducto: ${label}${sv ? ` a ${formatPrice(sv.price, currency)}` : ''}.\nIMPORTANTE: ${ctx.stockExceededNote}`,
+					);
+				} else {
+					parts.push(
+						`\nSTOCK INSUFICIENTE: el cliente pidió ${ctx.requestedQuantity} de "${label}" pero solo hay ${ctx.stockOnlyAvailable} disponible(s). ` +
+							`NO se agregó NADA al pedido todavía. PROHIBIDO: decir "le sumé"/"le agregué", mostrar un resumen del pedido, listar ítems o calcular un total. ` +
+							`Dile de forma natural y breve que de las ${ctx.requestedQuantity} que pidió, por ahora solo tenemos ${ctx.stockOnlyAvailable}, y pregúntale si quiere llevar esas ${ctx.stockOnlyAvailable}. UNA sola pregunta (ej: "¿Se las incluyo?", "¿Le agrego esas ${ctx.stockOnlyAvailable}?"). NUNCA uses "te lo llevo"/"te la llevo".`,
+					);
+				}
+			} else if (ctx.quantity) {
 				const singleVariant =
 					p.variants.length === 1 ? p.variants[0] : undefined;
 				const unitPriceNum = singleVariant?.price
@@ -1266,7 +1519,7 @@ export class OpenAIService {
 					// Confirmación limpia: NO incluir DATO EXACTO para evitar que el AI
 					// mezcle info de disponibilidad con la confirmación
 					parts.push(
-						`\nResponde SOLO con este contenido: confirma que van ${ctx.quantity} unidades de ${productLabel} a ${formattedUnit} cada una, total ${formattedTotal}. Varía la frase inicial (usa "Listo", "Perfecto", "Dale", "Vale" u otra). Termina con UNA sola pregunta corta: "¿Necesita algo más?" o "¿Desea continuar con el pedido?". NO menciones disponibilidad, NO preguntes cuántas quiere, NO añadas nada más.`,
+						`\nConfirma que van ${ctx.quantity} unidades de ${productLabel} a ${formattedUnit} cada una, total ${formattedTotal}. Varía la frase inicial (usa "Listo", "Perfecto", "Dale", "Vale" u otra). Termina con UNA sola pregunta corta de cierre, VARIÁNDOLA: "¿Necesita algo más?", "¿Desea agregar algo más?", "¿Algo más?", "¿Le agrego algo más?". PROHIBIDO "¿Desea continuar con el pedido?". NO menciones disponibilidad, NO preguntes cuántas quiere, NO añadas comentarios extra. IMPORTANTE: si otra instrucción indicó un saludo de primer mensaje, ese saludo va ANTES de esta confirmación (no lo elimines).`,
 					);
 				} else {
 					parts.push(
@@ -1319,7 +1572,7 @@ export class OpenAIService {
 			} else {
 				// Producto sin stock y sin alternativas disponibles
 				parts.push(
-					`\nCRÍTICO: El cliente preguntó por un producto que NO está disponible y no hay alternativas. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. Di en UNA frase corta y natural que no lo tienes disponible. Usa el nombre EXACTO del producto tal como está escrito aquí (sin cambiar mayúsculas ni reformatear): "${ctx.outOfStockProductName}". Termina con una pregunta simple como "¿Le puedo ayudar con algo más?". PROHIBIDO ABSOLUTO: no digas "cuando esté disponible se lo haré saber", "le avisamos cuando llegue", ni ninguna promesa de notificación futura. Solo indica que no está disponible en este momento.`,
+					`\nCRÍTICO: El cliente preguntó por un producto que NO está disponible y no hay alternativas. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. Di en UNA frase corta y natural que no lo tienes disponible, VARIANDO la redacción cada vez (ej: "se nos agotó...", "no la tenemos por ahora", "está agotada en este momento"). Usa el nombre EXACTO del producto tal como está escrito aquí (sin cambiar mayúsculas ni reformatear): "${ctx.outOfStockProductName}". Cierra con UNA pregunta corta variada (ej: "¿Le ayudo con algo más?", "¿Busca algo más?", "¿Le muestro otra opción?") distinta a la que ya usaste en el historial. PROHIBIDO ABSOLUTO: no digas "cuando esté disponible se lo haré saber", "le avisamos cuando llegue", ni ninguna promesa de notificación futura. Solo indica que no está disponible en este momento.`,
 				);
 			}
 		} else if (ctx.products && ctx.products.length > 0) {
@@ -1364,7 +1617,7 @@ export class OpenAIService {
 				);
 				if (ctx.outOfStockProductName) {
 					parts.push(
-						`\nCRÍTICO: El cliente preguntó por "${ctx.outOfStockProductName}" pero NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. NO digas que sí lo tienes. PRIMERO di en UNA frase corta y natural que no lo tienes disponible, y LUEGO presenta la lista de alternativas disponibles sin ningún comentario adicional. Ejemplo: "La [nombre] no la tenemos disponible en este momento. Sí tenemos:"`,
+						`\nCRÍTICO: El cliente preguntó por "${ctx.outOfStockProductName}" pero NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. NO digas que sí lo tienes. Estructura del mensaje: (1) UNA frase corta y natural diciendo que no lo tienes — VARÍA la redacción cada vez (ej: "se nos agotó la...", "no la tenemos por ahora", "está agotada en este momento", "justo se nos terminó"); (2) introduce la lista de alternativas con una frase natural que, cuando el tipo sea claro, lo MENCIONE en plural (ej: "Estas son las mechas que tenemos disponibles:", "De ceras le puedo ofrecer:", "Le puedo ofrecer estas opciones:") — PROHIBIDO usar "Sí tenemos:" como introducción; (3) muestra la lista sin comentarios adicionales; (4) cierra con UNA pregunta corta variada (ej: "¿Le interesa alguna?", "¿Cuál le interesa?", "¿Le sirve alguna de estas?"). ANTI-REPETICIÓN: revisa tus mensajes anteriores del historial y NO repitas la misma frase de agotado, la misma introducción de lista ni la misma pregunta de cierre que ya usaste en esta conversación.`,
 					);
 				} else if (ctx.isShowingMore) {
 					if (
@@ -1390,7 +1643,7 @@ export class OpenAIService {
 				// (":"); se presenta como una frase de corrido (ver instrucción más abajo).
 				if (ctx.outOfStockProductName) {
 					parts.push(
-						'\nTermina con la pregunta "¿Desea llevar alguno de estos?" o una variación natural similar. NO uses "¿Cuál le interesa?" ni "¿Cuál desea llevar?" en este caso.',
+						'\nTermina con UNA pregunta corta que NO presuma que va a llevar algo (el cliente pidió otro producto y estas son alternativas). VARÍA la pregunta cada vez: "¿Le sirve alguna de estas?", "¿Le interesa alguna?", "¿Quiere que le incluya alguna?", "¿Le muestro más detalles de alguna?". NO uses "¿Cuál le interesa?" ni "¿Cuál desea llevar?" en este caso, y NO repitas la pregunta de cierre que ya usaste en el historial.',
 					);
 				} else if (ctx.hasMoreProducts) {
 					parts.push(
@@ -1494,12 +1747,18 @@ export class OpenAIService {
 			}
 
 			parts.push(
-				'\nSi se aplicó al menos un cambio, confirma con una frase corta, natural y variada ("¡Listo!", "Perfecto.", "Hecho.", "Ya está.", "¡De una!", "Vale.") y muestra el pedido completo con ítems, cantidades y totales. ' +
-					'Para introducir el resumen usa expresiones naturales y ALTERNADAS como "Así queda su pedido:", "Su pedido queda así:", "Este es su pedido:", "Le quedaría así:". NO uses "Aquí queda el pedido" (suena raro en español). ' +
+				(ctx.isFirstInteraction
+					? // Primer mensaje: ya hay saludo de apertura. NO agregues otra confirmación
+						// tipo "Le sumé X" ni muletillas ("¡Listo!", "Perfecto"). Enlaza el saludo
+						// DIRECTAMENTE con la frase de resumen y luego la lista.
+						'\nComo ya diste el saludo de apertura, NO agregues una confirmación aparte tipo "Le sumé X a su pedido" ni muletillas ("¡Listo!", "Perfecto.", "Hecho.", "Vale."). Enlaza el saludo DIRECTAMENTE con una frase de resumen ("su pedido queda así:", "sería entonces:", "su pedido va así:") y a continuación la lista con los totales. '
+					: '\nSi se aplicó al menos un cambio, confirma con una frase corta, natural y variada ("¡Listo!", "Perfecto.", "Hecho.", "Ya está.", "Vale.") y muestra el pedido completo con ítems, cantidades y totales. ') +
+					'Para introducir el resumen usa expresiones naturales y ALTERNADAS como "Así queda su pedido:", "Su pedido queda así:", "Este es su pedido:", "Le quedaría así:", "Sería entonces:". NO uses "Aquí queda el pedido" (suena raro en español). PROHIBIDO usar "¡De una!". ' +
 					'CRÍTICO anti-repetición: revisa tus mensajes anteriores en el historial y NO uses la misma combinación de apertura + introducción del resumen que ya usaste antes (evita repetir "Perfecto. ... Así queda su pedido:" en cada turno). Cambia al menos la palabra de apertura y la frase introductoria respecto al turno anterior. ' +
 					'Si NINGÚN cambio se pudo aplicar, NO uses frases de confirmación: explica lo que pasó según el resultado real y pregunta lo necesario para resolverlo. ' +
 					'Evita frases robóticas como "El cambio se hizo" o "Se quitó X y el pedido actualizado queda así". ' +
-					'Termina con UNA pregunta de cierre variada ("¿Algo más?", "¿Le agrego algo más?", "¿Desea algo más?", "¿Necesita algo más?", "¿Algo adicional?") salvo que debas hacer una pregunta de aclaración.',
+					'CASO MIXTO (algo se agregó Y algo NO se pudo agregar / no se encontró): ORDEN obligatorio → (1) confirma brevemente y muestra el resumen del pedido con lo que SÍ quedó; (2) DESPUÉS del resumen, en una frase aparte al final, aclara el producto que no se pudo agregar y pide lo que haga falta (ej. "Sobre el cortador, no lo encontré, ¿me da más detalles?"). Esa aclaración va SIEMPRE al final, NUNCA antes del resumen. ' +
+					'Termina con UNA SOLA pregunta de cierre. Si hubo un producto sin resolver, esa pregunta ES la de aclaración ("¿me da más detalles de X?") y NO agregues además "¿algo más?" (una sola pregunta). Si NO hubo nada sin resolver, cierra con una pregunta variada ("¿Algo más?", "¿Le agrego algo más?", "¿Desea algo más?", "¿Necesita algo más?", "¿Algo adicional?").',
 			);
 		} else if (
 			ctx.faqClarificationOptions &&
@@ -1819,11 +2078,17 @@ export class OpenAIService {
 		} else if (ctx.intent === 'name_collected') {
 			const firstName =
 				ctx.knownCustomerName?.split(' ')[0] ?? ctx.knownCustomerName;
+			const hasCart = !!ctx.cart && ctx.cart.length > 0;
 			parts.push(
 				`\nEl cliente acaba de darte su nombre${firstName ? ` ("${firstName}")` : ''} y ciudad en respuesta a tu pregunta. ` +
-					`Agrádecele brevemente de forma natural${firstName ? ` usando su primer nombre` : ''} y pregúntale en qué le puedes ayudar. ` +
-					`UNA sola pregunta al final, copiada literal y sin cambiarla por otra variante: "${welcomeQuestion}". ` +
-					`TERMINA AHÍ. NO apliques las reglas de SALUDO INICIAL. Usa siempre "usted" (nunca "tú").`,
+					`Agrádecele brevemente de forma natural${firstName ? ` usando su primer nombre (Sr./Sra.)` : ''}. ` +
+					'CRÍTICO: NO confirmes, agregues ni menciones cantidades, precios ni totales de ningún producto — en este turno NO se agregó nada al pedido. ' +
+					(hasCart
+						? `El cliente ya venía armando un PEDIDO. Cierra con UNA sola pregunta directa y clara de si necesita algo más, elegida entre estas variantes (sin combinarlas ni añadir "continuar con el pedido"): "¿Necesita algo más?", "¿Desea agregar algo más?", "¿Le agrego algo más?", "¿Algo más?". PROHIBIDO preguntas dobles o "¿En qué le puedo ayudar?".`
+						: ctx.pendingOfferProduct
+							? `Antes de dar sus datos, el cliente estaba consultando "${ctx.pendingOfferProduct}". Retoma con sentido: OFRÉCESELO con UNA pregunta directa y natural de si desea que se lo agregue al pedido (ej: "¿Le agrego el/la [producto]?", "¿Se lo incluyo?"), usando un nombre corto del producto. NO lo confirmes como agregado (todavía no lo está); es una oferta.`
+							: `Cierra preguntándole en qué le puedes ayudar. UNA sola pregunta al final, copiada literal: "${welcomeQuestion}".`) +
+					` TERMINA AHÍ. NO apliques las reglas de SALUDO INICIAL. NO listes el pedido. Usa siempre "usted" (nunca "tú").`,
 			);
 		} else if (!ctx.isFirstInteraction && !isGenericGreeting) {
 			parts.push(
@@ -1855,6 +2120,15 @@ export class OpenAIService {
 		if (ctx.secondaryQuestion) {
 			parts.push(
 				`\nEl cliente también hizo una pregunta adicional: "${ctx.secondaryQuestion}". Respóndela de forma natural en el mismo mensaje, después de la acción principal. Una sola pregunta de cierre al final.`,
+			);
+		}
+
+		// INSTRUCCIÓN FINAL (máxima prioridad): cliente nuevo sin datos → el cierre pide
+		// nombre y ciudad EN LUGAR de "¿algo más?". Va al final para que gane sobre
+		// cualquier instrucción de cierre previa (confirmación, resumen, FAQ, etc.).
+		if (ctx.askNameAndCity) {
+			parts.push(
+				'\nCIERRE OBLIGATORIO (reemplaza CUALQUIER otra pregunta final): este cliente es nuevo y todavía no tenemos sus datos. Después de mostrar el producto o responder su consulta, la ÚNICA pregunta de TODO el mensaje debe ser pedirle su NOMBRE y la CIUDAD desde donde nos escribe. ELIMINA cualquier otra pregunta: NO uses "¿En qué le puedo ayudar?" (ni sus variantes), "¿Le interesa?", "¿Lo lleva?", "¿Cuál le interesa?", "¿Cuánto necesita?", "¿Necesita algo más?", "¿Algo más?" — TODAS se REEMPLAZAN por la de nombre y ciudad (más adelante, con sus datos, ya le preguntaremos lo demás). El mensaje debe terminar con esa única pregunta y NADA después. Varía la redacción (ej: "Por cierto, ¿me regala su nombre y desde qué ciudad nos escribe?", "Antes de seguir, ¿con quién tengo el gusto y desde qué ciudad nos escribe?").',
 			);
 		}
 
@@ -1960,10 +2234,17 @@ Responde ÚNICAMENTE con el JSON.`;
 			messages: [
 				{
 					role: 'system',
-					content: `Extrae del siguiente mensaje el nombre de la persona y la ciudad desde donde escribe.
+					content: `El asistente "Gema" le pidió al cliente su NOMBRE y su CIUDAD. Del siguiente mensaje, extrae ÚNICAMENTE si el cliente se está identificando a SÍ MISMO.
 Devuelve un JSON con:
-- "name": primer nombre o nombre completo si lo menciona, null si no.
-- "city": nombre de la ciudad si la menciona, null si no.
+- "name": el nombre propio del cliente SOLO si se presenta a sí mismo (ej: "soy Carlos", "me llamo Carlos", "Carlos", "Carlos Pérez", "Carlos de Bogotá"). null en cualquier otro caso.
+- "city": la ciudad desde donde escribe el cliente SOLO si la da como suya. null si no.
+
+REGLAS ESTRICTAS (si aplican, name=null):
+- Si el mensaje es una PREGUNTA, una orden/pedido de producto, una queja o charla —y NO una presentación personal— → name=null.
+- NUNCA tomes "Gema" como nombre del cliente: es el nombre del asistente. Si el mensaje dice "Gema" (ej: "Gema qué significa", "hola Gema"), NO es el nombre del cliente.
+- Si el cliente pregunta POR un nombre o su significado, NO lo tomes como que ese es su nombre.
+- No infieras un nombre a partir de palabras que no sean claramente el nombre propio de la persona.
+
 Responde ÚNICAMENTE con el JSON.`,
 				},
 				{ role: 'user', content: text },

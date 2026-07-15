@@ -193,6 +193,19 @@ export function formatPrice(price: string | null, currency: string): string {
 	return `$${num.toFixed(2)}`;
 }
 
+/**
+ * Saludo según la hora ACTUAL en Colombia/Ecuador (ambas UTC-5, sin horario de
+ * verano). El modelo no conoce la hora, así que se la inyectamos para que no
+ * salude "buenos días" por la tarde.
+ */
+export function getTimeGreeting(): 'Buenos días' | 'Buenas tardes' | 'Buenas noches' {
+	const now = toZonedTime(new Date(), 'America/Bogota');
+	const h = now.getHours();
+	if (h >= 5 && h < 12) return 'Buenos días';
+	if (h >= 12 && h < 19) return 'Buenas tardes';
+	return 'Buenas noches';
+}
+
 export function isWithinOfficeHours(): boolean {
 	const now = toZonedTime(new Date(), 'America/Bogota');
 	const day = now.getDay(); // 0=Dom, 1=Lun, ..., 6=Sáb

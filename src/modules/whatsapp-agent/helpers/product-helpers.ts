@@ -38,6 +38,20 @@ export function buildResumptionReply(product: ProductListEntry): string {
 }
 
 /**
+ * Coincidencia difusa entre dos PALABRAS: igualdad exacta siempre vale; la
+ * contención (una dentro de la otra) SOLO cuando la palabra más corta tiene
+ * al menos 4 letras. Sin este mínimo, tokens cortos producen falsos positivos
+ * de identidad: "termometro" contiene "tr" y matchearía la base "TR
+ * PLUS-TRANSPARENTE"; "encerada" contiene "cera", etc.
+ */
+export function fuzzyWordMatch(a: string, b: string): boolean {
+	if (a === b) return true;
+	const shorterLen = Math.min(a.length, b.length);
+	if (shorterLen < 4) return false;
+	return a.includes(b) || b.includes(a);
+}
+
+/**
  * Score de coincidencia (0..1) entre un hint del NLU y el nombre de un
  * producto/ítem: proporción de palabras del hint que coinciden, donde la
  * coincidencia exacta vale 1 y la parcial (substring) 0.5. Evita el falso
@@ -52,8 +66,7 @@ export function scoreNameMatch(hint: string, candidate: string): number {
 	let score = 0;
 	for (const hw of hintWords) {
 		if (candidateWords.some(cw => cw === hw)) score += 1;
-		else if (candidateWords.some(cw => cw.includes(hw) || hw.includes(cw)))
-			score += 0.5;
+		else if (candidateWords.some(cw => fuzzyWordMatch(cw, hw))) score += 0.5;
 	}
 	return score / hintWords.length;
 }
@@ -70,7 +83,7 @@ export function allHintWordsMatch(hint: string, candidate: string): boolean {
 	if (hintWords.length === 0) return false;
 	const candidateWords = normalizeText(candidate).split(/\s+/);
 	return hintWords.every(hw =>
-		candidateWords.some(cw => cw === hw || cw.includes(hw) || hw.includes(cw)),
+		candidateWords.some(cw => fuzzyWordMatch(cw, hw)),
 	);
 }
 
@@ -152,6 +165,107 @@ export function detectRequestedWeightGrams(text: string): number | null {
 	const val = parseFloat(weightMatch[1].replace(',', '.'));
 	const unit = weightMatch[2].toLowerCase();
 	return unit.startsWith('k') ? val * 1000 : val;
+}
+
+/**
+ * Umbral (en gramos) a partir del cual un peso pedido SIN presentación explícita
+ * deja de asumirse: el cliente podría querer kilos sueltos o un bloque/caja, así
+ * que se le pregunta. Por debajo del umbral se resuelve directo a kilos sueltos.
+ * Regla de negocio: "si pide 10 o más kilos sin especificar, hay que preguntar".
+ */
+export const PRESENTATION_AMBIGUITY_MIN_GRAMS = 10000;
+
+/**
+ * Interpreta la PREFERENCIA de presentación que el cliente expresó en texto libre
+ * (o que el NLU pasó como hint): a granel ("bloque", "caja", "bulto") o suelta
+ * ("de a kilo", "por kilo", "unidades", "sueltos"). Devuelve undefined si el texto
+ * no expresa una preferencia clara (ej. solo un peso: "10 kilos").
+ * Nota: es una lectura léxica del hint, NO clasificación de intención (eso lo hace el NLU).
+ */
+export function classifyPresentationPreference(
+	text: string | undefined,
+): 'bulk' | 'unit' | undefined {
+	if (!text) return undefined;
+	const t = normalizeText(text);
+	if (/\b(bloque|bloques|caja|cajas|bulto|bultos|paca|pacas)\b/.test(t))
+		return 'bulk';
+	if (
+		/\bde a kilo\b|\bpor kilos?\b|\bkilos? suelt/.test(t) ||
+		/\b(unidad|unidades|individual|individuales|suelto|suelta|sueltos|sueltas)\b/.test(
+			t,
+		)
+	)
+		return 'unit';
+	return undefined;
+}
+
+export type WeightedPresentationResult =
+	| { mode: 'resolved'; variant: ProductListEntry['variants'][0]; units: number }
+	| {
+			mode: 'ambiguous';
+			kilo: { variant: ProductListEntry['variants'][0]; units: number };
+			bulk: Array<{ variant: ProductListEntry['variants'][0]; units: number }>;
+	  }
+	| { mode: 'none' };
+
+/**
+ * Política de resolución de un peso pedido contra las presentaciones de un
+ * producto DUAL (se vende por KILO y también a granel: bloque/caja):
+ * - Preferencia explícita del cliente ('bulk'/'unit') → resuelve directo a esa forma.
+ * - Sin preferencia y peso < umbral → kilos sueltos (ej. "4 kilos" = 4 × KILO).
+ * - Sin preferencia y peso ≥ umbral con opción a granel exacta → AMBIGUO (preguntar).
+ * Devuelve { mode: 'none' } cuando el producto no es dual o el peso no aplica a esta
+ * política; en ese caso el caller usa resolveVariantByWeight (comportamiento estándar).
+ */
+export function resolveWeightedPresentation(
+	variants: ProductListEntry['variants'],
+	requestedGrams: number,
+	preference?: 'bulk' | 'unit',
+): WeightedPresentationResult {
+	if (requestedGrams <= 0) return { mode: 'none' };
+	const weighted = variants
+		.map(v => ({ variant: v, grams: parseVariantWeightGrams(v.name) }))
+		.filter(
+			(x): x is { variant: ProductListEntry['variants'][0]; grams: number } =>
+				x.grams !== null && x.grams > 0,
+		);
+	if (weighted.length === 0) return { mode: 'none' };
+
+	const inStock = weighted.filter(w => w.variant.totalQty > 0);
+	const pool = inStock.length > 0 ? inStock : weighted;
+
+	const kilo = pool.find(w => w.grams === 1000);
+	const hasBulk = pool.some(w => w.grams > 1000);
+	// Solo intervenimos en productos DUALES (KILO + presentación mayor).
+	if (!kilo || !hasBulk) return { mode: 'none' };
+
+	const units = (grams: number) => Math.ceil(requestedGrams / grams);
+	// Opciones a granel que cubren EXACTAMENTE el peso pedido (mayor primero: bloque antes que caja)
+	const bulks = pool
+		.filter(w => w.grams > 1000 && requestedGrams % w.grams === 0)
+		.sort((a, b) => b.grams - a.grams);
+
+	// Preferencia explícita del cliente
+	if (preference === 'unit')
+		return { mode: 'resolved', variant: kilo.variant, units: units(kilo.grams) };
+	if (preference === 'bulk' && bulks.length > 0)
+		return {
+			mode: 'resolved',
+			variant: bulks[0].variant,
+			units: units(bulks[0].grams),
+		};
+
+	// Sin preferencia: solo aplica a pesos múltiplos exactos de 1 kilo
+	if (requestedGrams % 1000 !== 0) return { mode: 'none' };
+	if (requestedGrams < PRESENTATION_AMBIGUITY_MIN_GRAMS)
+		return { mode: 'resolved', variant: kilo.variant, units: units(kilo.grams) };
+	if (bulks.length > 0)
+		return {
+			mode: 'ambiguous',
+			kilo: { variant: kilo.variant, units: units(kilo.grams) },
+			bulk: bulks.map(b => ({ variant: b.variant, units: units(b.grams) })),
+		};
+	return { mode: 'none' };
 }
 
 /**

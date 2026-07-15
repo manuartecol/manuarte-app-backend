@@ -18,6 +18,11 @@ import {
 	resolveVariantByWeight,
 	resolveVariant,
 	allHintWordsMatch,
+	classifyPresentationPreference,
+	resolveWeightedPresentation,
+	WeightedPresentationResult,
+	parseVariantWeightGrams,
+	PRESENTATION_AMBIGUITY_MIN_GRAMS,
 } from '../helpers/product-helpers';
 import { addToCart } from '../helpers/cart-helpers';
 
@@ -25,6 +30,13 @@ import { addToCart } from '../helpers/cart-helpers';
 // Se excluyen de los términos OBLIGATORIOS de la búsqueda por nombre (ver buildProductReply).
 const MEASURE_TOKEN =
 	/^(kilos?|kgs?|gramos?|grs?|ml|mililitros?|litros?|lts?|cc|onzas?|oz)$/i;
+
+// Palabras de FORMA/presentación (bloque, caja…). Como anotamos variantes con
+// "(BLOQUE)", "CAJA…", buscar estos términos en NOMBRES DE VARIANTE haría que
+// "bloque" matcheara TODAS las bases → ruido. Son presentación (se resuelven por
+// variantHint), no atributos que identifican el producto: se excluyen del match
+// por variante (NO del match por nombre: hay productos como "Caja Glan Colores").
+const FORM_TOKEN = /^(bloque|bloques|caja|cajas|bulto|bultos|paca|pacas)$/i;
 
 export class ProductSearchService {
 	constructor(private logService: WhatsAppLogService) {}
@@ -62,6 +74,67 @@ export class ProductSearchService {
 		}
 
 		return { purchasableItems, blockedItems };
+	};
+
+	/**
+	 * Devuelve TODAS las variantes activas de un producto con su stock en las bodegas
+	 * dadas, INCLUIDAS las agotadas (totalQty 0). Se usa para detectar cuando la
+	 * presentación que pidió el cliente (ej. bloque) existe en el catálogo pero está
+	 * agotada en su país, y así informarlo en vez de sustituirla en silencio.
+	 */
+	getVariantsWithStock = async (
+		productId: string,
+		stockIds: string[],
+	): Promise<
+		Array<{
+			variantId: string;
+			stockItemId: string | null;
+			name: string;
+			totalQty: number;
+			price: string | null;
+		}>
+	> => {
+		const stockItemWhere =
+			stockIds.length > 0
+				? { stockId: { [Op.in]: stockIds }, active: true }
+				: { active: true };
+		try {
+			const product = await ProductModel.findByPk(productId, {
+				attributes: ['id'],
+				include: [
+					{
+						model: ProductVariantModel,
+						as: 'productVariants',
+						attributes: ['id', 'name'],
+						include: [
+							{
+								model: StockItemModel,
+								as: 'stockItems',
+								attributes: ['id', 'quantity', 'price'],
+								where: stockItemWhere,
+								required: false,
+							},
+						],
+					},
+				],
+			});
+			type V = {
+				id: string;
+				name: string;
+				stockItems: { id: string; quantity: number; price: string }[];
+			};
+			const variants = (product?.get('productVariants') as V[] | undefined) ?? [];
+			return variants.map(v => ({
+				variantId: v.id,
+				stockItemId: v.stockItems[0]?.id ?? null,
+				name: v.name,
+				totalQty: v.stockItems.reduce((s, si) => s + Number(si.quantity), 0),
+				price: v.stockItems[0]?.price ?? null,
+			}));
+		} catch (error) {
+			console.error('[WhatsApp Agent] Error in getVariantsWithStock:', error);
+			return [];
+		}
 	};
 
 	/** Devuelve el stock disponible actual de un stockItem (0 si no existe). */
@@ -190,6 +263,19 @@ export class ProductSearchService {
 			currentStock: number;
 			alternatives: Array<{ name: string; stock: number }>;
 		}>;
+		/** Ítems cuyo peso es ambiguo entre kilos sueltos y bloque/caja: el caller debe preguntar. */
+		presentationChoices: Array<{
+			product: ProductListEntry;
+			requestedGrams: number;
+			ambiguous: Extract<WeightedPresentationResult, { mode: 'ambiguous' }>;
+		}>;
+		/** Ítems cuya presentación a granel (bloque/caja) existe pero está agotada aquí: ofrecer kilos. */
+		bulkUnavailable: Array<{
+			product: ProductListEntry;
+			bulkName: string;
+			requestedGrams: number;
+			kiloVariant: ProductListEntry['variants'][0];
+		}>;
 	}> => {
 		let added = 0;
 		const outOfStock: string[] = [];
@@ -197,6 +283,17 @@ export class ProductSearchService {
 			name: string;
 			currentStock: number;
 			alternatives: Array<{ name: string; stock: number }>;
+		}> = [];
+		const presentationChoices: Array<{
+			product: ProductListEntry;
+			requestedGrams: number;
+			ambiguous: Extract<WeightedPresentationResult, { mode: 'ambiguous' }>;
+		}> = [];
+		const bulkUnavailable: Array<{
+			product: ProductListEntry;
+			bulkName: string;
+			requestedGrams: number;
+			kiloVariant: ProductListEntry['variants'][0];
 		}> = [];
 
 		const pushOutOfStock = (
@@ -252,15 +349,32 @@ export class ProductSearchService {
 					item.variantHint,
 				);
 				if (fromList) {
-					console.log(
-						`[WhatsApp Agent] Product list item "${item.productHint}" resolved from active list: ${fromList.product.name} – ${fromList.variant.name}`,
-					);
-					addResolved(
-						fromList.product,
-						fromList.variant,
-						fromList.units * qtyRequested,
-					);
-					continue;
+					// Revalidar stock EN VIVO: la lista activa persiste en Redis (2h) y su
+					// totalQty puede estar desactualizado o ser de otra bodega/país. En compra,
+					// si no hay stock real, NO agregar desde la lista: caer a la búsqueda en BD.
+					const activeStockIds =
+						countryInfo?.stockIds ?? session.lastCountryInfo?.stockIds ?? [];
+					const liveStock = fromList.variant.stockItemId
+						? await this.getAvailableStock(
+								fromList.variant.stockItemId,
+								activeStockIds,
+							)
+						: 0;
+					if (mode === 'purchase' && liveStock <= 0) {
+						console.log(
+							`[WhatsApp Agent] Active-list item "${item.productHint}" (${fromList.product.name} – ${fromList.variant.name}) has no live stock → falling back to DB search`,
+						);
+					} else {
+						console.log(
+							`[WhatsApp Agent] Product list item "${item.productHint}" resolved from active list: ${fromList.product.name} – ${fromList.variant.name}`,
+						);
+						addResolved(
+							fromList.product,
+							{ ...fromList.variant, totalQty: liveStock },
+							fromList.units * qtyRequested,
+						);
+						continue;
+					}
 				}
 
 				// 2) Búsqueda en BD
@@ -287,36 +401,155 @@ export class ProductSearchService {
 				const qty = qtyRequested;
 
 				if (item.variantHint) {
+					// 0) Forma nombrada ("bloque"/"caja") y presentaciones a granel agotadas.
+					const stockIds =
+						countryInfo?.stockIds ?? session.lastCountryInfo?.stockIds ?? [];
+					const prefForm = classifyPresentationPreference(item.variantHint);
+					const hintGrams = detectRequestedWeightGrams(item.variantHint);
+					const formKeyword =
+						prefForm === 'bulk'
+							? normalizeText(item.variantHint).match(
+									/(bloque|caja|bulto|paca)/,
+								)?.[1]
+							: undefined;
+
+					// 0a) Forma nombrada SIN peso ("un bloque", "una caja"): si una variante
+					//     EN STOCK la nombra literalmente, ESA es la presentación pedida. Qué
+					//     significa "bloque" depende del producto (cera de soya: "1 KILO
+					//     (BLOQUE)"; bases de glicerina: "10 KILOS (BLOQUE)"), así que el
+					//     nombre manda antes que cualquier heurística de peso.
+					//     (product.variants solo trae variantes con stock.)
+					if (formKeyword && hintGrams === null) {
+						const byFormName = [...product.variants]
+							.filter(v => normalizeText(v.name).includes(formKeyword))
+							.sort((a, b) => b.totalQty - a.totalQty)[0];
+						if (byFormName) {
+							addResolved(product, byFormName, qtyRequested);
+							continue;
+						}
+					}
+
+					// 0b) Presentación a granel (bloque/caja) pedida pero AGOTADA en el país
+					//     del cliente: informar y ofrecer la alternativa, en vez de sustituir
+					//     en silencio por la presentación por kilo.
+					const wantsBulk =
+						prefForm === 'bulk' ||
+						(hintGrams !== null &&
+							hintGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS);
+					const inStockBulk = product.variants.some(
+						v => (parseVariantWeightGrams(v.name) ?? 0) > 1000,
+					);
+					if (wantsBulk && !inStockBulk) {
+						const full = await this.getVariantsWithStock(
+							product.productId,
+							stockIds,
+						);
+						const bulks = full
+							.filter(v => (parseVariantWeightGrams(v.name) ?? 0) > 1000)
+							.sort(
+								(a, b) =>
+									(parseVariantWeightGrams(b.name) ?? 0) -
+									(parseVariantWeightGrams(a.name) ?? 0),
+							);
+						// Preferir la presentación que calza con lo pedido: peso exacto si el
+						// cliente dio peso; si nombró la forma, la MÁS PEQUEÑA que la nombra
+						// (no la más grande del catálogo: "bloque" no significa "40 kilos").
+						const catalogBulk =
+							(hintGrams !== null
+								? bulks.find(
+										v => parseVariantWeightGrams(v.name) === hintGrams,
+									)
+								: undefined) ??
+							(formKeyword
+								? [...bulks]
+										.reverse()
+										.find(v => normalizeText(v.name).includes(formKeyword))
+								: undefined) ??
+							bulks[0];
+						if (catalogBulk) {
+							// La presentación a granel existe en catálogo pero está agotada aquí.
+							const kiloVariant = product.variants.find(
+								v => parseVariantWeightGrams(v.name) === 1000,
+							);
+							if (kiloVariant) {
+								// Hay presentación por kilo → ofrecerla (mensaje natural en el caller).
+								const bulkGrams =
+									parseVariantWeightGrams(catalogBulk.name) ?? 10000;
+								bulkUnavailable.push({
+									product,
+									bulkName: catalogBulk.name,
+									requestedGrams: hintGrams ?? bulkGrams * qtyRequested,
+									kiloVariant,
+								});
+								continue;
+							}
+							// Sin kilo tampoco: agotado de verdad, reportar con alternativas (las que haya).
+							const realName = `${product.name} ${catalogBulk.name}`.trim();
+							pushOutOfStock(
+								realName,
+								product.variants.map(v => ({
+									variantId: v.variantId,
+									name: `${product.name} ${v.name}`.trim(),
+									totalQty: v.totalQty,
+								})),
+								catalogBulk.variantId,
+								0,
+							);
+							continue;
+						}
+						// Sin presentación a granel en catálogo (producto solo por kilo):
+						// continúa con la resolución normal (agrega kilos).
+					}
+
 					// El tamaño/presentación/peso viene como texto libre en variantHint
-					// (ej: "5 kilos", "20 ml").
+					// (ej: "5 kilos", "20 ml", "bloque", "caja de 10 kilos").
 					// 1) Si el hint expresa un PESO (ej: "4 kilos"), resolver por peso PRIMERO.
 					//    Esto cubre el caso en que el producto se vende por kilo (variante "KILO")
 					//    y el cliente pide "4 kilos": son 4 unidades, no 1. resolveVariant no
 					//    puede inferir el multiplicador (devuelve la variante única tal cual).
 					const requestedGrams = detectRequestedWeightGrams(item.variantHint);
-					const byWeight =
-						requestedGrams !== null
-							? resolveVariantByWeight(product.variants, requestedGrams)
-							: null;
-					if (byWeight) {
-						// El peso YA expresa la cantidad total ("4 kilos" → 4 unidades de KILO).
-						// NO multiplicar por qty: el NLU suele repetir el mismo número en
-						// quantity y en el peso ("4 kilos" → quantity:4 + variantHint:"4 kilos"),
-						// lo que daría 16 (4×4). Mismo criterio que la búsqueda directa.
-						addResolved(product, byWeight.variant, byWeight.units);
-					} else {
-						// 2) Sin peso (ej: "20 ml"): match directo de la presentación contra
-						//    el texto libre de las variantes en BD.
-						const resolved = resolveVariant(
-							product,
-							item.variantHint,
-							normalizeText(item.productHint),
+					if (requestedGrams !== null) {
+						// Presentación dual (KILO + bloque/caja): respeta la preferencia
+						// explícita del cliente y, si el peso es ambiguo (≥ umbral) sin
+						// preferencia, lo expone para que el caller pregunte (no se asume).
+						const pref = classifyPresentationPreference(item.variantHint);
+						const wp = resolveWeightedPresentation(
+							product.variants,
+							requestedGrams,
+							pref,
 						);
-						if (resolved) {
-							addResolved(product, resolved, qty);
-						} else if (product.variants.length === 1) {
-							addResolved(product, product.variants[0], qty);
+						if (wp.mode === 'ambiguous') {
+							presentationChoices.push({
+								product,
+								requestedGrams,
+								ambiguous: wp,
+							});
+							continue;
 						}
+						const byWeight =
+							wp.mode === 'resolved'
+								? { variant: wp.variant, units: wp.units }
+								: resolveVariantByWeight(product.variants, requestedGrams);
+						if (byWeight) {
+							// El peso YA expresa la cantidad total ("4 kilos" → 4 unidades de KILO).
+							// NO multiplicar por qty: el NLU suele repetir el mismo número en
+							// quantity y en el peso ("4 kilos" → quantity:4 + variantHint:"4 kilos"),
+							// lo que daría 16 (4×4). Mismo criterio que la búsqueda directa.
+							addResolved(product, byWeight.variant, byWeight.units);
+							continue;
+						}
+					}
+					// 2) Sin peso (ej: "20 ml", "bloque") o peso sin match: match directo de la
+					//    presentación contra el texto libre de las variantes en BD.
+					const resolved = resolveVariant(
+						product,
+						item.variantHint,
+						normalizeText(item.productHint),
+					);
+					if (resolved) {
+						addResolved(product, resolved, qty);
+					} else if (product.variants.length === 1) {
+						addResolved(product, product.variants[0], qty);
 					}
 				} else if (product.variants.length === 1) {
 					addResolved(product, product.variants[0], qty);
@@ -338,7 +571,13 @@ export class ProductSearchService {
 				);
 			}
 		}
-		return { added, outOfStock, outOfStockDetails };
+		return {
+			added,
+			outOfStock,
+			outOfStockDetails,
+			presentationChoices,
+			bulkUnavailable,
+		};
 	};
 
 	buildProductReply = async (
@@ -429,6 +668,10 @@ export class ProductSearchService {
 			'este',
 			'esto',
 			'eso',
+			'esos',
+			'esas',
+			'aquellos',
+			'aquellas',
 			'sus',
 			'les',
 			'nos',
@@ -507,18 +750,74 @@ export class ProductSearchService {
 				return SYNONYM_REPLACEMENTS[stem] ?? [t];
 			});
 
+			// Match también por NOMBRE DE VARIANTE: hay productos cuyo atributo distintivo
+			// está en la variante, no en el nombre (ej. "EASY COLOR 20 cc" var. ROSADO,
+			// "Pigmento para cera arena" var. ROSADO). Buscamos qué productos tienen una
+			// variante que contenga cada término (los tokens de medida ya se excluyeron de
+			// andSearchTerms, así "kilo"/"20 gramos" no arrastran cualquier presentación).
+			const variantStems = [
+				...new Set(
+					andSearchTerms
+						.filter(t => !FORM_TOKEN.test(t))
+						.map(t => stemTerm(t)),
+				),
+			];
+			const productIdsByVariantStem = new Map<string, Set<string>>(
+				variantStems.map(s => [s, new Set<string>()]),
+			);
+			try {
+				const variantHitRows = (await ProductVariantModel.findAll({
+					attributes: ['productId', 'name'],
+					where: {
+						[Op.or]: variantStems.map(stem =>
+							sequelize.where(
+								sequelize.fn(
+									'unaccent',
+									sequelize.col('ProductVariantModel.name'),
+								),
+								{ [Op.iLike]: `%${stem}%` },
+							),
+						),
+					},
+				})) as Array<{ productId: string; name: string }>;
+				for (const row of variantHitRows) {
+					const vName = normalizeText(row.name);
+					for (const stem of variantStems) {
+						if (vName.includes(stem))
+							productIdsByVariantStem.get(stem)!.add(String(row.productId));
+					}
+				}
+			} catch (e) {
+				console.error('[WhatsApp Agent] variant-name lookup failed:', e);
+			}
+
 			let products = await ProductModel.findAll({
 				attributes: ['id', 'name', 'description'],
 				where: {
 					name: { [Op.notILike]: 'flete' },
-					[Op.and]: effectiveTermsPerSearch.map(terms => ({
-						[Op.or]: terms.map(term =>
-							sequelize.where(
-								sequelize.fn('unaccent', sequelize.col('ProductModel.name')),
-								{ [Op.iLike]: `%${stemTerm(term)}%` },
-							),
-						),
-					})),
+					[Op.and]: effectiveTermsPerSearch.map((terms, idx) => {
+						const variantPids = [
+							...(productIdsByVariantStem.get(stemTerm(andSearchTerms[idx])) ??
+								new Set<string>()),
+						];
+						return {
+							[Op.or]: [
+								...terms.map(term =>
+									sequelize.where(
+										sequelize.fn(
+											'unaccent',
+											sequelize.col('ProductModel.name'),
+										),
+										{ [Op.iLike]: `%${stemTerm(term)}%` },
+									),
+								),
+								// El término calza con una VARIANTE de estos productos
+								...(variantPids.length > 0
+									? [{ id: { [Op.in]: variantPids } }]
+									: []),
+							],
+						};
+					}),
 				},
 				include: [variantInclude],
 				limit: 20,
@@ -637,6 +936,14 @@ export class ProductSearchService {
 					return nameWords.some(w => w === stem || w.startsWith(stem));
 				}).length;
 
+				// Match de palabra EXACTA (w === stem): distingue "tr" (palabra suelta en
+				// "…TR PLUS-TRANSPARENTE") de "triple"/"extracto" que solo empiezan/contienen
+				// "tr". Desempata abreviaturas cortas hacia el producto correcto.
+				const exactWordMatchCount = searchTerms.filter(t => {
+					const stem = stemTerm(t);
+					return nameWords.some(w => w === stem);
+				}).length;
+
 				// Substring-only match: appears in name but NOT as a whole word
 				// (e.g. "cera" inside "encerada")
 				const substringMatchCount = searchTerms.filter(t => {
@@ -649,6 +956,20 @@ export class ProductSearchService {
 				const descMatchCount = searchTerms.filter(t =>
 					normalizeText(description).includes(stemTerm(t)),
 				).length;
+
+				// Match por NOMBRE DE VARIANTE (ej. "rosado" → variante ROSADO de Easy Color).
+				// Excluye tokens de medida (kilo/gramos) para no premiar cualquier presentación.
+				const variantNamesLower = availableVariants.map(v =>
+					normalizeText(v.name),
+				);
+				const variantMatchTerms = searchTerms.filter(
+					t => !MEASURE_TOKEN.test(t) && !FORM_TOKEN.test(t),
+				);
+				const variantMatchCount = variantMatchTerms.filter(t => {
+					const stem = stemTerm(t);
+					return variantNamesLower.some(vn => vn.includes(stem));
+				}).length;
+
 				const exactMatch = nameLower === searchTerms.join(' ') ? 1000 : 0;
 
 				// Product-type bonus: search term is the first word of the product name
@@ -672,11 +993,15 @@ export class ProductSearchService {
 				// Bonus de contexto: si la categoría trae productos "para jabon" y "para
 				// velas", el que calza con lo que el cliente está haciendo sube de tier
 				// (los del otro uso bajan y quedan en "remaining" → "tienes más?").
+				// Se mira NOMBRE + DESCRIPCIÓN: así un producto de doble uso cuya descripción
+				// dice "para velas y jabones" (ej. Easy Color) califica para AMBOS y no queda
+				// por debajo de los específicos.
 				let craftBonus = 0;
 				if (craftContext) {
 					const other = craftContext === 'jabon' ? 'vela' : 'jabon';
-					if (nameLower.includes(craftContext)) craftBonus = 60;
-					else if (nameLower.includes(other)) craftBonus = -60;
+					const craftText = `${nameLower} ${normalizeText(description)}`;
+					if (craftText.includes(craftContext)) craftBonus = 60;
+					else if (craftText.includes(other)) craftBonus = -60;
 				}
 
 				// Relevance score (primary): determines product ordering tier
@@ -684,6 +1009,8 @@ export class ProductSearchService {
 					exactMatch +
 					productTypeBonus +
 					wordMatchCount * 30 +
+					exactWordMatchCount * 20 +
+					variantMatchCount * 25 +
 					substringMatchCount * 3 +
 					descMatchCount * 3 +
 					startsWithMatch +
@@ -693,13 +1020,33 @@ export class ProductSearchService {
 				// Final score: relevance dominates, stock breaks ties within same tier
 				const score = relevanceScore * 1000 + totalStock;
 
+				// Si el cliente nombró un atributo que vive en la VARIANTE (color) y NO en el
+				// nombre del producto, mostrar solo esa(s) variante(s) — ej. "rosado" → ROSADO,
+				// no las 8 opciones de color. Si el color pedido no está en stock, se dejan
+				// todas las disponibles (para que pueda elegir otra).
+				const colorTerms = variantMatchTerms.filter(t => {
+					const stem = stemTerm(t);
+					return (
+						!nameLower.includes(stem) &&
+						variantNamesLower.some(vn => vn.includes(stem))
+					);
+				});
+				let displayVariants = availableVariants;
+				if (colorTerms.length > 0) {
+					const filtered = availableVariants.filter(v => {
+						const vn = normalizeText(v.name);
+						return colorTerms.every(t => vn.includes(stemTerm(t)));
+					});
+					if (filtered.length > 0) displayVariants = filtered;
+				}
+
 				scored.push({
 					score,
 					relevanceScore,
 					productId: String(p.id),
 					name: p.name,
 					description: description || undefined,
-					variants: availableVariants,
+					variants: displayVariants,
 				});
 			}
 
@@ -712,6 +1059,7 @@ export class ProductSearchService {
 					searchTerms,
 					stockItemWhere,
 					outOfStockIds.length > 0 ? outOfStockIds : undefined,
+					outOfStockNames.length > 0 ? outOfStockNames : undefined,
 				);
 				return {
 					replyText: suggestions.replyText,
@@ -885,6 +1233,7 @@ export class ProductSearchService {
 		searchTerms: string[],
 		stockItemWhere: object,
 		outOfStockProductIds?: string[],
+		outOfStockProductNames?: string[],
 	): Promise<{
 		replyText: string;
 		products: ProductListEntry[];
@@ -897,11 +1246,11 @@ export class ProductSearchService {
 			const matchingProducts =
 				outOfStockProductIds && outOfStockProductIds.length > 0
 					? await ProductModel.findAll({
-							attributes: ['id', 'productCategoryId'],
+							attributes: ['id', 'name', 'productCategoryId'],
 							where: { id: { [Op.in]: outOfStockProductIds } },
 						})
 					: await ProductModel.findAll({
-							attributes: ['id', 'productCategoryId'],
+							attributes: ['id', 'name', 'productCategoryId'],
 							where: {
 								name: { [Op.notILike]: 'flete' },
 								[Op.or]: searchTerms.map(term =>
@@ -1096,10 +1445,53 @@ export class ProductSearchService {
 					})
 					.sort((a, b) => b.totalQty - a.totalQty);
 
+			// Solo sugerir productos del MISMO TIPO que lo pedido. El tipo lo define la
+			// primera palabra significativa del nombre del producto agotado ("Mecha de
+			// Madera con Soporte Metálico" → "mecha"; "BASE DE GLICERINA..." → "base").
+			// Las categorías pueden ser amplias (accesorios: mechas, balanzas, cajas...)
+			// y sugerir cosas de otra función confunde. Si nada comparte el tipo, mejor
+			// no sugerir nada (devolver vacío: el caller informa "no disponible" a secas).
+			const headWordOf = (name: string): string | undefined =>
+				normalizeText(name)
+					.split(/\s+/)
+					.find(w => w.length > 2 && !/^\d+$/.test(w));
+			const typeSourceNames =
+				outOfStockProductNames ??
+				matchingProducts.map(p => String(p.get('name') ?? ''));
+			const typeStems = new Set<string>();
+			for (const n of typeSourceNames) {
+				const head = headWordOf(n);
+				if (head) {
+					const stem = stemTerm(head);
+					typeStems.add(stem);
+					// Sinónimos de tipo (mecha↔pabilo, colorante↔pigmento↔mica...)
+					for (const syn of SYNONYMS[stem] ?? []) typeStems.add(syn);
+				}
+			}
+			// El tipo se compara cabeza contra cabeza: la PRIMERA palabra del nombre
+			// define qué ES el producto ("Pigmento para cera..." es un pigmento, no
+			// una cera, aunque "cera" aparezca en el nombre).
+			const sameTypeProducts =
+				typeStems.size === 0
+					? allProducts
+					: allProducts.filter(p => {
+							const head = headWordOf(p.name);
+							if (!head) return false;
+							return [...typeStems].some(
+								ts => head === ts || head.startsWith(ts) || ts.startsWith(head),
+							);
+						});
+			if (sameTypeProducts.length === 0) {
+				console.log(
+					`[WhatsApp Agent] Suggestions discarded: none share the product type (${[...typeStems].join(', ')})`,
+				);
+				return { replyText: '', products: [], remainingProducts: [] };
+			}
+
 			// Flatten multi-variant products: each variant becomes its own entry
 			type FlatSuggestion = ProductListEntry & { totalQty: number };
 			const flatProducts: FlatSuggestion[] = [];
-			for (const p of allProducts) {
+			for (const p of sameTypeProducts) {
 				if (p.variants.length === 1) {
 					flatProducts.push(p);
 				} else {

@@ -478,6 +478,64 @@ export class WhatsAppAgentService {
 			}
 		}
 
+		// ── Interceptor: elección de presentación pendiente (kilos sueltos vs bloque/caja) ──
+		// Si el turno anterior le preguntó al cliente cómo prefiere llevar un peso
+		// (ej. "10 kilos" → sueltos o en bloque), resolvemos su respuesta aquí antes del
+		// NLU. Si el mensaje no expresa una preferencia clara, el método limpia el
+		// pendiente y devuelve null → sigue el flujo normal.
+		if (session.pendingPresentationChoice) {
+			const presentationReply =
+				await this.intentHandlerService.resolvePendingPresentationChoice(
+					session,
+					phoneNumber,
+					text,
+					normalizedText,
+					countryInfo,
+				);
+			if (presentationReply !== null) {
+				session.lastBotMessage = presentationReply;
+				const presentationUserTurn: ConversationTurn = {
+					role: 'user',
+					text: text.slice(0, CONVERSATION_HISTORY_MESSAGE_MAX_CHARS),
+					ts: now,
+				};
+				const presentationBotTurn: ConversationTurn = {
+					role: 'bot',
+					text: presentationReply.slice(
+						0,
+						CONVERSATION_HISTORY_MESSAGE_MAX_CHARS,
+					),
+					ts: Date.now(),
+				};
+				session.conversationHistory = [
+					...(session.conversationHistory ?? []),
+					presentationUserTurn,
+					presentationBotTurn,
+				].slice(-CONVERSATION_HISTORY_MAX_TURNS * 2);
+				await redis.set(
+					`session:${phoneNumber}`,
+					JSON.stringify(session),
+					'EX',
+					SESSION_TTL_SECONDS,
+				);
+				await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
+				await this.sendReply(phoneNumber, botPhoneNumberId, presentationReply);
+				this.logService
+					.logMessage({
+						phoneNumber,
+						botPhoneNumberId,
+						direction: 'outbound',
+						text: presentationReply,
+						intent: 'presentation_choice',
+						countryPrefix,
+					})
+					.catch(err =>
+						console.error('[WhatsApp Agent] Error saving outbound log:', err),
+					);
+				return;
+			}
+		}
+
 		// ── NLU: clasificación de intención y extracción de slots ──
 		// Única fuente de intención. Reemplaza el antiguo motor de reglas/regex: una
 		// sola llamada al LLM produce el intent y todos los slots estructurados.
@@ -494,6 +552,7 @@ export class WhatsAppAgentService {
 		let aiChanges: CartChange[] | undefined;
 		let aiNeedsClarification: boolean | undefined;
 		let aiRecommendFromList: boolean | undefined;
+		let aiFaqTopic: string | undefined;
 		let aiSecondaryIntent: NLUIntent | undefined;
 
 		try {
@@ -530,6 +589,7 @@ export class WhatsAppAgentService {
 			aiProductList = primaryIntent.productList;
 			aiNeedsClarification = primaryIntent.needsClarification;
 			aiRecommendFromList = primaryIntent.recommendFromList;
+			aiFaqTopic = primaryIntent.faqTopic;
 			// NUEVO: Razonamiento y cambios basados en modelo (más flexible que slots)
 			aiReasoning = primaryIntent.reasoning;
 			aiChanges = primaryIntent.changes;
@@ -575,6 +635,7 @@ export class WhatsAppAgentService {
 						? `, productList: ${JSON.stringify(aiProductList)}`
 						: '') +
 					(aiNeedsClarification ? ', needsClarification' : '') +
+					(aiFaqTopic ? `, faqTopic: "${aiFaqTopic}"` : '') +
 					(aiReasoning ? `, reasoning: "${aiReasoning}"` : '') +
 					(aiChanges ? `, changes: ${JSON.stringify(aiChanges)}` : ''),
 			);
@@ -601,9 +662,30 @@ export class WhatsAppAgentService {
 			intent = 'resumption';
 		}
 
-		// Si el cliente acaba de dar su nombre/ciudad, ignorar el intent detectado por NLU.
+		// Si el cliente acaba de dar su nombre/ciudad, tratarlo como name_collected —
+		// SALVO que el mismo mensaje también traiga un pedido/consulta de producto (p. ej.
+		// mensajes juntados por el buffer: "Carlos desde Soledad\nDame 4 aceites"). En ese
+		// caso el nombre ya quedó guardado y dejamos que el intent del NLU procese el
+		// producto (si no, se perdería el pedido y el bot confirmaría algo sin agregarlo).
 		if (nameJustCollected) {
-			intent = 'name_collected';
+			// ¿El mensaje trae ADEMÁS un pedido/consulta con contenido real de producto?
+			const hasProductContent =
+				(intent === 'search_product' && !!aiSearchQuery) ||
+				(intent === 'multi_product_add' &&
+					((aiProductList?.length ?? 0) > 0 || (aiChanges?.length ?? 0) > 0)) ||
+				(intent === 'edit_cart' && (aiChanges?.length ?? 0) > 0) ||
+				(intent === 'select_product' &&
+					(aiSelectionIndexes?.length ?? 0) > 0) ||
+				intent === 'request_quote' ||
+				intent === 'purchase_intent' ||
+				intent === 'show_cart';
+			if (!hasProductContent) {
+				intent = 'name_collected';
+			} else {
+				console.log(
+					`[WhatsApp Agent] Name collected but message also has product intent (${intent}); processing product, name saved.`,
+				);
+			}
 		}
 
 		console.log(
@@ -655,11 +737,26 @@ export class WhatsAppAgentService {
 			aiChanges: aiChanges,
 			aiNeedsClarification,
 			aiRecommendFromList,
+			aiFaqTopic,
 			secondaryIntent: aiSecondaryIntent,
 			isFirstEverInteraction: session.isFirstEverInteraction,
 			knownCustomerName:
 				session.knownCustomerName ?? session.collectedCustomerName,
+			// Cliente nuevo sin datos: el cierre de la respuesta debe pedir nombre y ciudad,
+			// pero SOLO una vez (no en cada turno). Si el cliente no responde, se recogen
+			// más adelante en el flujo de cotización/compra.
+			awaitingNameAndCity:
+				session.awaitingNameAndCity === true &&
+				!session.askedNameAndCity &&
+				!session.pendingQuoteFlow &&
+				!session.pendingPurchaseFlow,
 		};
+
+		// En cuanto este turno incluya la solicitud de nombre y ciudad, marcamos que ya
+		// se pidió para no repetirla en los siguientes mensajes.
+		if (ctx.awaitingNameAndCity) {
+			session.askedNameAndCity = true;
+		}
 
 		const replyText = await this.intentHandlerService.handle(intent, ctx);
 

@@ -18,13 +18,15 @@ import {
 	normalizeRagQuery,
 } from '../utils';
 import { SESSION_TTL_SECONDS, MAX_PRODUCT_RESULTS } from '../constants';
-import { RagDocService } from '../../rag-docs/service';
+import { RagDocService, RagSearchResult } from '../../rag-docs/service';
 import {
 	ProductListEntry,
 	CartItem,
 	CartChange,
 	CartChangeResult,
 	PendingPurchaseFlow,
+	PendingPresentationChoice,
+	PresentationOption,
 	UserSession,
 } from '../types';
 import { stripCallingCode, isFarewellOnly } from '../helpers/intent-detection';
@@ -38,8 +40,26 @@ import {
 	buildOutOfStockResolutionMessage,
 	scoreNameMatch,
 	allHintWordsMatch,
+	fuzzyWordMatch,
+	classifyPresentationPreference,
+	resolveWeightedPresentation,
+	WeightedPresentationResult,
+	PRESENTATION_AMBIGUITY_MIN_GRAMS,
 } from '../helpers/product-helpers';
 import { addToCart } from '../helpers/cart-helpers';
+
+/** Intenciones que representan una interacción productiva (el cliente avanza hacia la
+ *  compra): al detectarlas reiniciamos el contador de frustración de la sesión. */
+const PRODUCTIVE_INTENTS = new Set([
+	'select_product',
+	'search_product',
+	'edit_cart',
+	'multi_product_add',
+	'purchase_intent',
+	'request_quote',
+	'show_cart',
+	'affirmation',
+]);
 
 /** Etiqueta legible de un ítem del carrito ("Cera de Palma KILO"). */
 const cartItemLabel = (item: CartItem): string =>
@@ -142,9 +162,7 @@ const itemMentionedInText = (textWords: string[], label: string): boolean => {
 	const labelWords = normalizeText(label)
 		.split(/\s+/)
 		.filter(w => w.length > 2 && !/^\d+$/.test(w));
-	return labelWords.some(lw =>
-		textWords.some(tw => tw === lw || tw.includes(lw) || lw.includes(tw)),
-	);
+	return labelWords.some(lw => textWords.some(tw => fuzzyWordMatch(tw, lw)));
 };
 
 /**
@@ -196,7 +214,7 @@ const buildProductVocab = (
 const isProductIndicator = (word: string, vocab: string[]): boolean =>
 	PRODUCT_FAMILY_WORDS.has(word) ||
 	PRODUCT_FAMILY_WORDS.has(stemTerm(word)) ||
-	vocab.some(vw => vw === word || vw.includes(word) || word.includes(vw));
+	vocab.some(vw => fuzzyWordMatch(vw, word));
 
 /** true si el mensaje nombra algún producto explícitamente (no es solo pronombre/cantidad). */
 const textNamesAnyProduct = (textWords: string[], vocab: string[]): boolean =>
@@ -222,9 +240,7 @@ const matchesRequestedProduct = (hint: string, candidate: string): boolean => {
 	return significant.every(hw => {
 		const terms = [hw, ...(SYNONYM_REPLACEMENTS[stemTerm(hw)] ?? [])];
 		return terms.some(term =>
-			candidateWords.some(
-				cw => cw === term || cw.includes(term) || term.includes(cw),
-			),
+			candidateWords.some(cw => fuzzyWordMatch(cw, term)),
 		);
 	});
 };
@@ -254,10 +270,15 @@ export type IntentContext = {
 	aiNeedsClarification?: boolean;
 	/** true cuando el cliente pide recomendación sobre cuál elegir entre los productos mostrados */
 	aiRecommendFromList?: boolean;
+	/** Tema canónico de FAQ identificado por el NLU (ej. 'store_location'). El handler lo
+	 *  resuelve con un lookup determinístico por título en vez de fiarse del score semántico. */
+	aiFaqTopic?: string;
 	/** Intención secundaria detectada en el mismo mensaje (multi-intent). El handler primario puede usarla para enriquecer la respuesta. */
 	secondaryIntent?: import('../openai.service').NLUIntent;
 	isFirstEverInteraction?: boolean;
 	knownCustomerName?: string;
+	/** true cuando el cliente es nuevo y aún no tenemos su nombre/ciudad: el cierre debe pedirlos. */
+	awaitingNameAndCity?: boolean;
 };
 
 export class IntentHandlerService {
@@ -299,6 +320,21 @@ export class IntentHandlerService {
 			return this.offerQuotePurchaseResumption(ctx);
 		}
 
+		// El NLU marcó la consulta como un tema canónico de FAQ (ej. ubicación de la
+		// tienda). Ese tema se resuelve en handleIntentGeneralQuestion con un lookup
+		// determinístico por título; garantizamos que llegue allí. Es una señal del NLU
+		// (no un regex sobre el texto): la decisión de "esto es una pregunta de ubicación"
+		// la tomó el clasificador, robusto a verbos y errores de tipeo.
+		if (ctx.aiFaqTopic) {
+			intent = 'general_question';
+		}
+
+		// Si el cliente retoma una interacción productiva (busca, elige, agrega, compra),
+		// reiniciamos el contador de frustración: la conversación se reencauzó.
+		if (PRODUCTIVE_INTENTS.has(intent) && ctx.session.frustrationCount) {
+			ctx.session.frustrationCount = 0;
+		}
+
 		if (intent === 'resumption') {
 			return this.handleIntentResumption(ctx);
 		} else if (intent === 'select_product') {
@@ -315,6 +351,10 @@ export class IntentHandlerService {
 			return this.handleIntentGeneralQuestion(ctx);
 		} else if (intent === 'smalltalk') {
 			return this.handleIntentSmalltalk(ctx);
+		} else if (intent === 'human_handoff') {
+			return this.handleIntentHumanHandoff(ctx);
+		} else if (intent === 'complaint') {
+			return this.handleIntentComplaint(ctx);
 		} else if (intent === 'product_followup') {
 			return this.handleIntentProductFollowup(ctx);
 		} else if (intent === 'edit_cart') {
@@ -349,6 +389,7 @@ export class IntentHandlerService {
 					isFirstInteraction: ctx.isFirstInteraction,
 					isFirstEverInteraction: ctx.isFirstEverInteraction,
 					knownCustomerName: ctx.knownCustomerName,
+					askNameAndCity: ctx.awaitingNameAndCity,
 					lastBotMessage: ctx.session.lastBotMessage,
 					conversationHistory: ctx.session.conversationHistory,
 					afterPurchase,
@@ -562,6 +603,11 @@ export class IntentHandlerService {
 					primaryCappedQty = cappedQty;
 					primaryItemQty = stockExceededForItem ? undefined : cappedQty;
 					primaryRequestedQty = stockExceededForItem ? itemQty : undefined;
+					// Stock insuficiente: no agregamos; dejamos el pendiente para que un "sí"
+					// del cliente agregue la cantidad disponible.
+					if (stockExceededForItem && cappedQty) {
+						session.pendingStockConfirmQty = cappedQty;
+					}
 				}
 				if (cappedQty && !stockExceededForItem) {
 					addToCart(session, item, cappedQty, currency, itemVariant);
@@ -590,15 +636,20 @@ export class IntentHandlerService {
 						})
 					: undefined;
 
+			// Stock insuficiente en el ítem principal → no confirmar cantidad; pedir que
+			// confirme si quiere la cantidad disponible (stockOnlyAvailable), sin `quantity`.
+			const stockShort = primaryRequestedQty !== undefined;
 			return this.openai
 				.generateReply({
 					userMessage: text,
 					selectedProduct: selectedProductForReply,
 					selectedProducts: resolvedSelectedItems,
-					quantity: aiQuantities
-						? undefined
-						: (primaryItemQty ?? primaryCappedQty),
+					quantity:
+						aiQuantities || stockShort
+							? undefined
+							: (primaryItemQty ?? primaryCappedQty),
 					requestedQuantity: primaryRequestedQty,
+					stockOnlyAvailable: stockShort ? primaryCappedQty : undefined,
 					currency,
 					...secondaryCtx,
 				})
@@ -671,14 +722,102 @@ export class IntentHandlerService {
 			result.products.length >= 1 &&
 			result.productFound
 		) {
-			const product = result.products[0];
+			// Con variantHint no-peso (ej. "bloque", "rosado"): preferir el producto cuya
+			// variante realmente lo cumple, no siempre products[0]. Ej: "bloque de tr" trae
+			// TR-transparente y Triple Butter; ambos tienen bloque, pero si el primero NO
+			// tuviera esa presentación, saltamos al que sí. Evita agregar la variante
+			// equivocada de un producto que no tiene lo pedido.
+			let product = result.products[0];
+			if (aiVariantHint && requestedGramsForAutoAdd === null) {
+				const hintNorm = normalizeText(aiVariantHint);
+				const satisfiesHint = (p: ProductListEntry) =>
+					p.variants.some(v => {
+						const vn = normalizeText(v.name);
+						return (
+							vn.length > 0 &&
+							(vn.includes(hintNorm) || hintNorm.includes(vn))
+						);
+					});
+				if (!satisfiesHint(product)) {
+					const better = result.products.find(satisfiesHint);
+					if (better) product = better;
+				}
+			}
 			const requestedGrams = requestedGramsForAutoAdd;
 
 			if (requestedGrams !== null) {
-				const resolved = resolveVariantByWeight(
+				// Presentación dual (por KILO + bloque/caja): si el cliente no especifica
+				// forma y el peso es ambiguo (≥ umbral), preguntar en vez de asumir.
+				const pref = classifyPresentationPreference(
+					aiVariantHint ?? normalizedText,
+				);
+				const wp = resolveWeightedPresentation(
 					product.variants,
 					requestedGrams,
+					pref,
 				);
+				if (wp.mode === 'ambiguous') {
+					return this.askPresentationChoice(
+						session,
+						phoneNumber,
+						product,
+						requestedGrams,
+						wp,
+						currency,
+						'add',
+					);
+				}
+				// Presentación a granel pedida (peso ≥ umbral o palabra "bloque/caja")
+				// pero sin stock aquí: si existe en catálogo, informar y ofrecer kilos.
+				const wantsBulk =
+					pref === 'bulk' ||
+					requestedGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS;
+				const inStockBulk = product.variants.some(
+					v => (parseVariantWeightGrams(v.name) ?? 0) > 1000,
+				);
+				const kiloVariant = product.variants.find(
+					v => parseVariantWeightGrams(v.name) === 1000,
+				);
+				if (wp.mode === 'none' && wantsBulk && !inStockBulk && kiloVariant) {
+					const stockIds =
+						countryInfo?.stockIds ?? session.lastCountryInfo?.stockIds ?? [];
+					const full =
+						await this.productSearchService.getVariantsWithStock(
+							product.productId,
+							stockIds,
+						);
+					const bulks = full
+						.filter(v => (parseVariantWeightGrams(v.name) ?? 0) > 1000)
+						.sort(
+							(a, b) =>
+								(parseVariantWeightGrams(b.name) ?? 0) -
+								(parseVariantWeightGrams(a.name) ?? 0),
+						);
+					// Preferir la presentación cuyo peso calza con lo pedido (no la más grande)
+					const catalogBulk =
+						bulks.find(
+							v => parseVariantWeightGrams(v.name) === requestedGrams,
+						) ?? bulks[0];
+					if (catalogBulk) {
+						return this.offerKiloForUnavailableBulk(
+							session,
+							phoneNumber,
+							product,
+							requestedGrams,
+							kiloVariant,
+							catalogBulk.name,
+							currency,
+							'add',
+							undefined,
+							undefined,
+							isFirstInteraction,
+						);
+					}
+				}
+				const resolved =
+					wp.mode === 'resolved'
+						? { variant: wp.variant, units: wp.units }
+						: resolveVariantByWeight(product.variants, requestedGrams);
 				if (resolved) {
 					const cappedUnits = Math.min(
 						resolved.units,
@@ -767,32 +906,31 @@ export class IntentHandlerService {
 					);
 				}
 			} else if (aiQuantity !== undefined) {
-				// Múltiples variantes sin hint ni peso → usar la más pequeña disponible (menor precio).
-				// El cliente pidió cantidad pero sin especificar presentación; asumimos la más económica
-				// (generalmente la de menor tamaño/precio) es la más vendida.
-				const sortedByPrice = [...product.variants]
-					.filter(v => v.totalQty > 0)
-					.sort((a, b) => Number(a.price) - Number(b.price));
-				const smallestVariant = sortedByPrice[0];
-				if (smallestVariant) {
-					const cappedUnits = Math.min(aiQuantity, smallestVariant.totalQty);
-					const stockExceeded = cappedUnits < aiQuantity;
-					if (!stockExceeded) {
-						addToCart(session, product, cappedUnits, currency, smallestVariant);
-					}
-					session.selectedProduct = product.name;
-					session.selectedVariantName = smallestVariant.name;
+				// Múltiples variantes disponibles SIN que el cliente especifique cuál
+				// (ej. Cortador: Liso vs Ondulado; una base sin presentación). NO elegimos
+				// por él: dejamos que se muestre el producto con sus variantes para que
+				// escoja. Los colores no llegan aquí porque la búsqueda ya filtró a la
+				// variante pedida (queda 1 → se agrega directo en la rama de arriba).
+				const inStock = product.variants.filter(v => v.totalQty > 0);
+				if (inStock.length === 1) {
+					// Solo una disponible: agregarla directo (es la única opción real).
+					const only = inStock[0];
+					const cappedUnits = Math.min(aiQuantity, only.totalQty);
 					if (cappedUnits > 0) {
+						addToCart(session, product, cappedUnits, currency, only);
+						session.selectedProduct = product.name;
+						session.selectedVariantName = only.name;
 						autoAddedProduct = product;
 						autoAddedQty = cappedUnits;
-						autoAddedVariant = smallestVariant;
-						if (stockExceeded) {
-							autoAddedRequestedQty = aiQuantity;
-							session.pendingStockConfirmQty = cappedUnits;
-						}
+						autoAddedVariant = only;
 					}
 					console.log(
-						`[WhatsApp Agent] Auto-added to cart from search (smallest variant): ${product.name} – ${smallestVariant.name} x${cappedUnits}`,
+						`[WhatsApp Agent] Auto-added (única variante disponible): ${product.name} – ${only.name} x${cappedUnits}`,
+					);
+				} else {
+					// 2+ disponibles → mostrar opciones y preguntar (no auto-elegir).
+					console.log(
+						`[WhatsApp Agent] Product "${product.name}" has ${inStock.length} available variants and no hint → showing options instead of auto-adding.`,
 					);
 				}
 			}
@@ -816,18 +954,60 @@ export class IntentHandlerService {
 			const productForReply = autoAddedVariant
 				? { ...autoAddedProduct, variants: [autoAddedVariant] }
 				: autoAddedProduct;
-			replyText = await this.openai
-				.generateReply({
-					userMessage: text,
-					selectedProduct: productForReply,
-					quantity: autoAddedQty,
-					requestedQuantity: autoAddedRequestedQty,
-					stockExceededNote: autoAddedStockExceededNote,
-					currency,
-					isArrivalQuery,
-					...secondaryCtx,
-				})
-				.catch(() => result.replyText);
+			const stockExceeded =
+				autoAddedStockExceededNote !== undefined ||
+				autoAddedRequestedQty !== undefined;
+			// Cliente conocido: saludo cálido de apertura ("Sr. X, con gusto"). No pasamos
+			// isFirstEverInteraction a propósito: la rama deseada es la de saludo cálido.
+			const firstTurnGreetingCtx = {
+				isFirstInteraction,
+				knownCustomerName: ctx.knownCustomerName,
+				askNameAndCity: ctx.awaitingNameAndCity,
+				lastBotMessage: session.lastBotMessage,
+				conversationHistory: session.conversationHistory,
+			};
+			if (stockExceeded) {
+				// Stock insuficiente: NO se agregó nada. Informar la cantidad disponible y
+				// preguntar (sin `quantity` confirmable, que confundía al modelo a "le sumé").
+				replyText = await this.openai
+					.generateReply({
+						userMessage: text,
+						selectedProduct: productForReply,
+						requestedQuantity: autoAddedRequestedQty,
+						stockOnlyAvailable: autoAddedStockExceededNote
+							? undefined
+							: autoAddedQty,
+						stockExceededNote: autoAddedStockExceededNote,
+						currency,
+						isArrivalQuery,
+						...firstTurnGreetingCtx,
+						...secondaryCtx,
+					})
+					.catch(() => result.replyText);
+			} else {
+				// Add limpio: usar el formato de RESUMEN del pedido (lista + total, apertura
+				// variada "Su pedido queda así:") igual que el flujo edit_cart, en vez de la
+				// confirmación aislada de una línea ("serían N unidades...").
+				const addedLabel = autoAddedVariant?.name
+					? `${autoAddedProduct.name} ${autoAddedVariant.name}`
+					: autoAddedProduct.name;
+				const addedLineTotal = autoAddedVariant?.price
+					? ` = ${formatPrice(String(Number(autoAddedVariant.price) * autoAddedQty), currency)}`
+					: '';
+				replyText = await this.openai
+					.generateReply({
+						userMessage: text,
+						intent: 'edit_cart',
+						cart: session.cart,
+						currency,
+						editOutcomeNotes: [
+							`AGREGADO: ${autoAddedQty}x ${addedLabel}${addedLineTotal}`,
+						],
+						...firstTurnGreetingCtx,
+						...secondaryCtx,
+					})
+					.catch(() => result.replyText);
+			}
 		} else {
 			// No se encontró el producto y tampoco hay sugerencias que ofrecer: dejar que el
 			// modelo aclare según el rubro (si es algo ajeno a insumos de velas/jabones y a
@@ -844,6 +1024,7 @@ export class IntentHandlerService {
 					isFirstInteraction,
 					isFirstEverInteraction: ctx.isFirstEverInteraction,
 					knownCustomerName: ctx.knownCustomerName,
+					askNameAndCity: ctx.awaitingNameAndCity,
 					currency,
 					outOfStockProductName: result.outOfStockProductName,
 					isArrivalQuery,
@@ -851,6 +1032,10 @@ export class IntentHandlerService {
 					notFoundTerm: productNotFound
 						? (aiSearchQuery ?? text)
 						: undefined,
+					// Historial: necesario para que el modelo VARÍE la redacción (frase de
+					// agotado, introducción de lista, pregunta de cierre) entre turnos.
+					lastBotMessage: session.lastBotMessage,
+					conversationHistory: session.conversationHistory,
 					...secondaryCtx,
 				})
 				.catch(() => result.replyText);
@@ -1054,6 +1239,48 @@ export class IntentHandlerService {
 			if (pendingQty !== undefined) session.pendingStockConfirmQty = undefined;
 			const effectiveQtyAff =
 				aiQuantity ?? bareNumberQtyAff ?? inlineQty ?? impliedQty ?? pendingQty;
+			const variantForStock =
+				sessionVariantAff ??
+				(affirmationProduct.variants.length === 1
+					? affirmationProduct.variants[0]
+					: undefined);
+			const availableStock = variantForStock
+				? variantForStock.totalQty
+				: totalQtyAff;
+			const productForAffReply = sessionVariantAff
+				? { ...affirmationProduct, variants: [sessionVariantAff] }
+				: affirmationProduct;
+
+			// Pide MÁS de lo disponible → NO agregar; informar y preguntar si quiere lo que
+			// hay (igual que select_product/search). Un "sí" posterior lo agrega.
+			if (
+				effectiveQtyAff !== undefined &&
+				availableStock !== undefined &&
+				effectiveQtyAff > availableStock &&
+				availableStock > 0
+			) {
+				session.pendingStockConfirmQty = availableStock;
+				await redis.set(
+					`session:${phoneNumber}`,
+					JSON.stringify(session),
+					'EX',
+					SESSION_TTL_SECONDS,
+				);
+				return this.openai
+					.generateReply({
+						userMessage: text,
+						selectedProduct: productForAffReply,
+						requestedQuantity: effectiveQtyAff,
+						stockOnlyAvailable: availableStock,
+						lastBotMessage: session.lastBotMessage,
+						currency,
+					})
+					.catch(
+						() =>
+							`De las ${effectiveQtyAff} que pidió, por ahora solo tenemos ${availableStock}. ¿Le incluyo esas ${availableStock}?`,
+					);
+			}
+
 			if (effectiveQtyAff) {
 				addToCart(
 					session,
@@ -1069,9 +1296,6 @@ export class IntentHandlerService {
 				'EX',
 				SESSION_TTL_SECONDS,
 			);
-			const productForAffReply = sessionVariantAff
-				? { ...affirmationProduct, variants: [sessionVariantAff] }
-				: affirmationProduct;
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -1134,10 +1358,76 @@ export class IntentHandlerService {
 				userMessage: text,
 				intent: 'smalltalk',
 				knownCustomerName,
+				// Primer mensaje (ej. "¿esto es Manuarte?"): saludar cordialmente al inicio.
+				isFirstInteraction: ctx.isFirstInteraction,
+				isFirstEverInteraction: ctx.isFirstEverInteraction,
+				askNameAndCity: ctx.awaitingNameAndCity,
 				lastBotMessage: session.lastBotMessage,
 				conversationHistory: session.conversationHistory,
 			})
 			.catch(() => 'Soy Gema, asesora de Manuarte 💛 ¿En qué le puedo ayudar?');
+	};
+
+	/**
+	 * El cliente pide hablar con una persona, expresa insatisfacción con el servicio o
+	 * tiene un reclamo. Por ahora solo respondemos con empatía y confirmamos que alguien
+	 * del equipo lo atenderá (la lógica real de transferencia se agregará luego). Nunca
+	 * se le ofrecen productos ni recetas aquí: es un momento sensible de atención.
+	 */
+	private handleIntentHumanHandoff = async (
+		ctx: IntentContext,
+	): Promise<string> => {
+		const { text, session, knownCustomerName } = ctx;
+		return this.openai
+			.generateReply({
+				userMessage: text,
+				intent: 'human_handoff',
+				knownCustomerName,
+				lastBotMessage: session.lastBotMessage,
+				conversationHistory: session.conversationHistory,
+			})
+			.catch(
+				() =>
+					'Con gusto le comunico con una persona del equipo. Enseguida alguien lo atiende por aquí. 🙌',
+			);
+	};
+
+	/** A partir de esta cantidad de señales de frustración en la sesión, la respuesta
+	 *  al reclamo ofrece transferir con una persona del equipo en vez de seguir intentando. */
+	private FRUSTRATION_HANDOFF_THRESHOLD = 3;
+
+	/**
+	 * El cliente expresa una queja/frustración con la atención (sin pedir un humano
+	 * explícitamente). Primero intentamos ayudarlo nosotros; solo tras varias señales
+	 * de frustración (FRUSTRATION_HANDOFF_THRESHOLD) ofrecemos pasarlo con una persona.
+	 */
+	private handleIntentComplaint = async (
+		ctx: IntentContext,
+	): Promise<string> => {
+		const { text, session, phoneNumber, knownCustomerName } = ctx;
+		session.frustrationCount = (session.frustrationCount ?? 0) + 1;
+		const escalateToHuman =
+			session.frustrationCount >= this.FRUSTRATION_HANDOFF_THRESHOLD;
+		await redis.set(
+			`session:${phoneNumber}`,
+			JSON.stringify(session),
+			'EX',
+			SESSION_TTL_SECONDS,
+		);
+		return this.openai
+			.generateReply({
+				userMessage: text,
+				intent: 'complaint',
+				escalateToHuman,
+				knownCustomerName,
+				lastBotMessage: session.lastBotMessage,
+				conversationHistory: session.conversationHistory,
+			})
+			.catch(() =>
+				escalateToHuman
+					? 'Lamento mucho la molestia. Con gusto lo comunico con una persona del equipo para atenderlo mejor. 🙌'
+					: 'Lamento que se sienta así. Cuénteme qué necesita y con gusto le ayudo a resolverlo.',
+			);
 	};
 
 	/** Margen de score coseno bajo el cual dos FAQ se consideran "empatadas". */
@@ -1303,11 +1593,38 @@ export class IntentHandlerService {
 		// sin riesgo de falsos positivos en búsqueda de catálogo.
 		const RAG_FAQ_THRESHOLD = 0.5;
 		try {
-			let ragResults = await this.ragDocService.search(
-				ragQuery,
-				undefined,
-				RAG_FAQ_THRESHOLD,
-			);
+			let ragResults: RagSearchResult[] = [];
+
+			// El NLU marcó esta consulta como un tema canónico de FAQ. La recuperación
+			// semántica es demasiado inestable para estos FAQ (el embedding es el centroide
+			// de la pregunta + paráfrasis, y "dirección"/"tienda" empujan a FAQ vecinas), así
+			// que la resolvemos por título — determinístico y confiable. La DECISIÓN de que
+			// esto es una pregunta de ubicación la tomó el clasificador NLU, no el código.
+			if (ctx.aiFaqTopic === 'store_location') {
+				// El país sale del prefijo telefónico (igual que moneda y pagos), no del texto:
+				// Ecuador → sede de Quito; Colombia (o país desconocido) → sede de Barranquilla.
+				const isoCode =
+					countryInfo?.isoCode ?? session.lastCountryInfo?.isoCode;
+				const countryKeyword = isoCode === 'EC' ? 'ecuador' : 'colombia';
+				const addressFaq = await this.ragDocService.searchByTitle([
+					'ubicada',
+					countryKeyword,
+				]);
+				if (addressFaq.length > 0) {
+					console.log(
+						`[RAG] NLU faqTopic=store_location — resolved address FAQ by title (${countryKeyword}): "${addressFaq[0].title}"`,
+					);
+					ragResults = addressFaq;
+				}
+			}
+
+			if (ragResults.length === 0) {
+				ragResults = await this.ragDocService.search(
+					ragQuery,
+					undefined,
+					RAG_FAQ_THRESHOLD,
+				);
+			}
 
 			// Si la búsqueda con contexto no retorna resultados y el ragQuery fue enriquecido,
 			// reintentar con solo el texto del usuario. Esto cubre preguntas FAQ/generales en
@@ -1578,6 +1895,7 @@ export class IntentHandlerService {
 				isFirstInteraction,
 				isFirstEverInteraction: ctx.isFirstEverInteraction,
 				knownCustomerName: ctx.knownCustomerName,
+				askNameAndCity: ctx.awaitingNameAndCity,
 				ragContext,
 				ragType,
 				lastBotMessage: session.lastBotMessage,
@@ -1716,6 +2034,108 @@ export class IntentHandlerService {
 		const currency =
 			session.lastCountryInfo?.currency ?? countryInfo?.currency ?? 'USD';
 
+		// Ambigüedad de presentación en una corrección por peso: "que sean 10 kilos"
+		// sobre un ítem que se vende por KILO y también en bloque/caja. Si el cliente
+		// no especifica la forma y el peso llega al umbral, preguntar en vez de asumir
+		// (10 unidades de a kilo ≠ 1 bloque de 10 kilos). Solo el caso 'set' de un
+		// único cambio; el resto conserva el comportamiento actual.
+		if (aiChanges && aiChanges.length === 1) {
+			const ch = aiChanges[0];
+			const requestedGrams = ch.weightText
+				? detectRequestedWeightGrams(ch.weightText)
+				: null;
+			const pref = classifyPresentationPreference(
+				ch.variant ?? ch.weightText ?? ctx.normalizedText,
+			);
+			if (
+				ch.action === 'set' &&
+				!ch.variant &&
+				!pref &&
+				requestedGrams !== null &&
+				requestedGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS &&
+				requestedGrams % 1000 === 0
+			) {
+				const item = this.resolveCartItem(session.cart ?? [], ch);
+				if (item && parseVariantWeightGrams(item.variantName ?? '') === 1000) {
+					let productEntry = (session.lastProductList ?? []).find(
+						p => normalizeText(p.name) === normalizeText(item.productName),
+					);
+					// El producto puede no estar en la lista activa (ej. se agregó por peso
+					// en un turno anterior): buscarlo en BD para ver todas sus presentaciones.
+					if (!productEntry) {
+						const search = await this.productSearchService.buildProductReply(
+							normalizeText(item.productName),
+							countryInfo ?? session.lastCountryInfo ?? null,
+							item.productName,
+						);
+						productEntry =
+							search.products.find(
+								p => normalizeText(p.name) === normalizeText(item.productName),
+							) ?? (search.productFound ? search.products[0] : undefined);
+					}
+					if (productEntry) {
+						const wp = resolveWeightedPresentation(
+							productEntry.variants,
+							requestedGrams,
+						);
+						if (wp.mode === 'ambiguous') {
+							return this.askPresentationChoice(
+								session,
+								ctx.phoneNumber,
+								productEntry,
+								requestedGrams,
+								wp,
+								currency,
+								'edit',
+								item.productVariantId,
+							);
+						}
+						// Sin presentación a granel en stock: si existe en catálogo pero está
+						// agotada aquí, informar y ofrecer los kilos sueltos.
+						const inStockBulk = productEntry.variants.some(
+							v => (parseVariantWeightGrams(v.name) ?? 0) > 1000,
+						);
+						const kiloV = productEntry.variants.find(
+							v => parseVariantWeightGrams(v.name) === 1000,
+						);
+						if (!inStockBulk && kiloV) {
+							const stockIds =
+								countryInfo?.stockIds ??
+								session.lastCountryInfo?.stockIds ??
+								[];
+							const full =
+								await this.productSearchService.getVariantsWithStock(
+									productEntry.productId,
+									stockIds,
+								);
+							const catalogBulk = full
+								.filter(v => (parseVariantWeightGrams(v.name) ?? 0) > 1000)
+								.sort(
+									(a, b) =>
+										(parseVariantWeightGrams(b.name) ?? 0) -
+										(parseVariantWeightGrams(a.name) ?? 0),
+								)[0];
+							if (catalogBulk) {
+								return this.offerKiloForUnavailableBulk(
+									session,
+									ctx.phoneNumber,
+									productEntry,
+									requestedGrams,
+									kiloV,
+									catalogBulk.name,
+									currency,
+									'edit',
+									item.productVariantId,
+									undefined,
+									ctx.isFirstInteraction,
+								);
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Sin cambios estructurados del NLU → pedir aclaración honesta, nunca adivinar
 		if (!aiChanges || aiChanges.length === 0) {
 			return this.openai
@@ -1731,6 +2151,13 @@ export class IntentHandlerService {
 				})
 				.catch(() => '¿Qué desea cambiar de su pedido?');
 		}
+
+		// Snapshot de cantidades ANTES de aplicar, para poder revertir cambios de
+		// arrastre (ítems que el NLU tocó pero el mensaje actual no menciona).
+		const cartSnapshot = (session.cart ?? []).map(i => ({
+			item: i,
+			qty: i.quantity,
+		}));
 
 		// Aplicar todos los cambios en orden, acumulando el resultado real de cada uno
 		const results: CartChangeResult[] = [];
@@ -1792,30 +2219,160 @@ export class IntentHandlerService {
 			}
 		}
 
-		// Si la ÚNICA instrucción era agregar un producto que no se encontró o que
-		// está SIN STOCK, redirigir a la búsqueda: muestra alternativas del mismo
-		// tipo al cliente (o le informa que no está disponible si no hay), en vez
-		// de depender del modelo para explicarlo.
-		const appliedCount = results.filter(r => r.status === 'applied').length;
-		const single = results.length === 1 ? results[0] : undefined;
-		if (
-			single &&
-			appliedCount === 0 &&
-			single.change.action === 'new' &&
-			single.change.product &&
-			(single.status === 'needs_search' ||
-				(single.status === 'no_op' && single.availableStock !== undefined))
-		) {
-			console.log(
-				`[WhatsApp Agent] edit_cart: add failed for "${single.change.product}" (${single.status}), redirecting to search`,
+		// Pidió MÁS de lo disponible: NO se agregó; informar y preguntar si quiere lo que
+		// hay (un "sí" lo agrega vía pendingStockConfirmQty). Solo si fue el único cambio.
+		const ssResult = results.find(r => r.stockShortage);
+		if (results.length === 1 && ssResult?.stockShortage) {
+			const ss = ssResult.stockShortage;
+			session.selectedProduct = ss.product.name;
+			session.selectedVariantName = ss.variant.name;
+			session.lastProductList = [{ ...ss.product, variants: [ss.variant] }];
+			session.pendingStockConfirmQty = ss.available;
+			await redis.set(
+				`session:${ctx.phoneNumber}`,
+				JSON.stringify(session),
+				'EX',
+				SESSION_TTL_SECONDS,
 			);
-			return this.handleIntentSearchProduct({
-				...ctx,
-				aiSearchQuery: single.change.product,
-			});
+			return this.openai
+				.generateReply({
+					userMessage: text,
+					selectedProduct: { ...ss.product, variants: [ss.variant] },
+					requestedQuantity: ss.requested,
+					stockOnlyAvailable: ss.available,
+					isFirstInteraction: ctx.isFirstInteraction,
+					knownCustomerName: ctx.knownCustomerName,
+					conversationHistory: session.conversationHistory,
+				})
+				.catch(
+					() =>
+						`De ${ss.product.name} pidió ${ss.requested}, pero por ahora solo tenemos ${ss.available}. ¿Le incluyo esas ${ss.available}?`,
+				);
 		}
 
-		const editOutcomeNotes = results.map(r => this.describeCartChangeResult(r));
+		// Presentación a granel agotada al agregar: ofrecer los kilos (si fue el único cambio).
+		const buResult = results.find(r => r.bulkUnavailable);
+		if (results.length === 1 && buResult?.bulkUnavailable) {
+			const bu = buResult.bulkUnavailable;
+			return this.offerKiloForUnavailableBulk(
+				session,
+				ctx.phoneNumber,
+				bu.product,
+				bu.requestedGrams,
+				bu.kiloVariant,
+				bu.bulkName,
+				currency,
+				'add',
+				undefined,
+				undefined,
+				ctx.isFirstInteraction,
+			);
+		}
+
+		// Peso ambiguo al agregar (kilos sueltos vs bloque/caja): si fue la única
+		// instrucción, preguntar en vez de asumir.
+		const pcResult = results.find(r => r.presentationChoice);
+		if (results.length === 1 && pcResult?.presentationChoice) {
+			const wp = resolveWeightedPresentation(
+				pcResult.presentationChoice.product.variants,
+				pcResult.presentationChoice.requestedGrams,
+			);
+			if (wp.mode === 'ambiguous') {
+				return this.askPresentationChoice(
+					session,
+					ctx.phoneNumber,
+					pcResult.presentationChoice.product,
+					pcResult.presentationChoice.requestedGrams,
+					wp,
+					currency,
+					'add',
+				);
+			}
+		}
+
+		// El cliente pidió un producto nuevo que NO está disponible (agotado / no
+		// encontrado). Es la información saliente: informarla y NADA más (sin volcar el
+		// pedido). Antes, revertimos cualquier cambio de ARRASTRE que el NLU haya
+		// aplicado sobre ítems que el mensaje actual no menciona (ej. re-tocar la white
+		// cuando el cliente solo pidió un termómetro).
+		const failedNewAdd = results.find(
+			r =>
+				r.change.action === 'new' &&
+				r.change.product &&
+				(r.status === 'needs_search' ||
+					(r.status === 'no_op' && r.availableStock !== undefined)),
+		);
+		if (failedNewAdd?.change.product) {
+			const textWords = significantTextWords(ctx.normalizedText);
+			for (const r of results) {
+				if (
+					r.status === 'applied' &&
+					r.item &&
+					!itemMentionedInText(textWords, r.itemLabel ?? cartItemLabel(r.item))
+				) {
+					const snap = cartSnapshot.find(s => s.item === r.item);
+					if (r.removed) {
+						if (!session.cart?.includes(r.item)) session.cart?.push(r.item);
+						r.item.quantity = snap?.qty ?? r.item.quantity;
+					} else if (snap) {
+						r.item.quantity = snap.qty;
+					}
+					r.status = 'no_op';
+					r.note = 'cambio de arrastre descartado (el cliente no lo mencionó)';
+					console.log(
+						`[WhatsApp Agent] edit_cart: reverted phantom change on "${r.itemLabel}" (message didn't mention it)`,
+					);
+				}
+			}
+			const stillApplied = results.filter(r => r.status === 'applied').length;
+			if (stillApplied === 0) {
+				// Redirigir a la búsqueda: informa que no está disponible y, si existen
+				// productos del MISMO TIPO con stock (buildSuggestions ya filtra por tipo:
+				// otra mecha, otra cera...), los ofrece como alternativas. Si no hay del
+				// mismo tipo, la respuesta es solo la aclaración de agotado. Además deja
+				// las sugerencias en lastProductList para que "dame la 2" funcione.
+				console.log(
+					`[WhatsApp Agent] edit_cart: product "${failedNewAdd.change.product}" unavailable and nothing else changed → redirecting to search for same-type alternatives`,
+				);
+				return this.handleIntentSearchProduct({
+					...ctx,
+					aiSearchQuery: failedNewAdd.change.product,
+				});
+			}
+		}
+		const appliedCount = results.filter(r => r.status === 'applied').length;
+
+		// Reconciliación anti-contradicción: si un "new" quedó como no-encontrado/sin-stock
+		// PERO ese producto SÍ está en el carrito (lo agregó otro cambio, o ya estaba), es un
+		// duplicado espurio del NLU. Se descarta esa nota para no decir a la vez "agregué X"
+		// y "no encontré X".
+		const reconciledResults = results.filter(r => {
+			const failedNew =
+				r.change.action === 'new' &&
+				r.change.product &&
+				(r.status === 'needs_search' ||
+					r.status === 'not_found' ||
+					(r.status === 'no_op' && r.availableStock !== undefined));
+			if (!failedNew) return true;
+			// Match LAXO: "cortador metalico" (con calificativo) vs el ítem real "Cortador
+			// Ondulado Acero Inoxidable" comparten la palabra clave "cortador". Basta con que
+			// coincidan las palabras principales (score ≥ 0.5) para considerarlo el mismo y no
+			// contradecir el resumen con un "no lo encontré".
+			const inCart = (session.cart ?? []).some(
+				i => scoreNameMatch(r.change.product!, cartItemLabel(i)) >= 0.5,
+			);
+			if (inCart) {
+				console.log(
+					`[WhatsApp Agent] edit_cart: dropping spurious "not found" for "${r.change.product}" (matching item already in cart)`,
+				);
+				return false;
+			}
+			return true;
+		});
+
+		const editOutcomeNotes = reconciledResults.map(r =>
+			this.describeCartChangeResult(r),
+		);
 		console.log(
 			`[WhatsApp Agent] edit_cart results: ${JSON.stringify(editOutcomeNotes)}`,
 		);
@@ -1828,6 +2385,11 @@ export class IntentHandlerService {
 				cart: session.cart,
 				currency,
 				editOutcomeNotes,
+				// Primer mensaje (ej. "dame un bloque de tr" como primer mensaje): saludo de
+				// apertura + pedir nombre/ciudad si el cliente es nuevo.
+				isFirstInteraction: ctx.isFirstInteraction,
+				knownCustomerName: ctx.knownCustomerName,
+				askNameAndCity: ctx.awaitingNameAndCity,
 				// Pasar el historial para que el modelo VEA cómo confirmó los cambios en
 				// turnos anteriores y NO repita siempre la misma fórmula ("Perfecto. Le
 				// agregué... Así queda su pedido:").
@@ -1918,7 +2480,7 @@ export class IntentHandlerService {
 					normalizedText,
 				);
 			}
-			return this.applyNewFromActiveList(session, change, currency);
+			return this.applyNewFromActiveList(session, change, currency, stockIds);
 		}
 
 		// ── set / increase / decrease / remove: resolver el ítem del carrito ──
@@ -2062,6 +2624,19 @@ export class IntentHandlerService {
 			};
 		}
 
+		// 'set' a la MISMA cantidad = sin cambios reales. Frecuente cuando el NLU
+		// re-emite un ítem ya presente (arrastre). No lo anunciamos como si se hubiera
+		// modificado (evita "le sumé/agregué X" cuando nada cambió).
+		if (change.action === 'set' && target === old) {
+			return {
+				change,
+				status: 'no_op',
+				item,
+				itemLabel,
+				note: 'ya estaba en esa cantidad, sin cambios',
+			};
+		}
+
 		// Validar contra stock disponible (mismo criterio que el resto de adds)
 		let final = target;
 		let capped = false;
@@ -2107,11 +2682,12 @@ export class IntentHandlerService {
 	};
 
 	/** Agrega un producto nuevo desde la lista activa. Si no se puede resolver aquí, pide búsqueda en BD (needs_search). */
-	private applyNewFromActiveList = (
+	private applyNewFromActiveList = async (
 		session: UserSession,
 		change: CartChange,
 		currency: string,
-	): CartChangeResult => {
+		stockIds: string[],
+	): Promise<CartChangeResult> => {
 		if (!change.product) {
 			return { change, status: 'no_op', note: 'no se especificó el producto' };
 		}
@@ -2126,10 +2702,32 @@ export class IntentHandlerService {
 
 		const { product: productEntry, variant } = fromList;
 		const units = fromList.units * (change.quantity ?? 1);
-		const capped = Math.min(units, variant.totalQty);
+		// Revalidar stock EN VIVO: session.lastProductList persiste en Redis (2h) y su
+		// totalQty puede estar desactualizado o ser de otra bodega/país. Nunca agregar
+		// confiando solo en el stock cacheado de la lista.
+		const liveStock = variant.stockItemId
+			? await this.productSearchService.getAvailableStock(
+					variant.stockItemId,
+					stockIds,
+				)
+			: 0;
+		const capped = Math.min(units, liveStock);
 		if (capped <= 0) {
-			// Sin stock en la lista activa → la búsqueda en BD mostrará alternativas
+			// Sin stock real → la búsqueda en BD mostrará alternativas o informará que no hay
 			return { change, status: 'needs_search' };
+		}
+		// Pidió MÁS de lo disponible → NO agregar; el handler pregunta si quiere lo que hay.
+		if (units > liveStock) {
+			return {
+				change,
+				status: 'no_op',
+				stockShortage: {
+					product: productEntry,
+					variant,
+					requested: units,
+					available: liveStock,
+				},
+			};
 		}
 		addToCart(session, productEntry, capped, currency, variant);
 		const itemLabel = [productEntry.name, variant.name]
@@ -2143,7 +2741,7 @@ export class IntentHandlerService {
 			newQuantity: capped,
 			capped: capped < units,
 			requestedQuantity: capped < units ? units : undefined,
-			availableStock: capped < units ? variant.totalQty : undefined,
+			availableStock: capped < units ? liveStock : undefined,
 		};
 	};
 
@@ -2248,17 +2846,55 @@ export class IntentHandlerService {
 		}
 		const validAdded = addedItems.filter(i => session.cart?.includes(i));
 
+		// Peso ambiguo (kilos sueltos vs bloque/caja): no se agregó nada; el handler
+		// de edit_cart preguntará al cliente qué presentación prefiere.
+		if (validAdded.length === 0 && outcome.presentationChoices.length > 0) {
+			const pc = outcome.presentationChoices[0];
+			result.presentationChoice = {
+				product: pc.product,
+				requestedGrams: pc.requestedGrams,
+			};
+			result.status = 'no_op';
+			return;
+		}
+
+		// Presentación a granel pedida pero agotada aquí: el handler ofrecerá los kilos.
+		if (validAdded.length === 0 && outcome.bulkUnavailable.length > 0) {
+			result.bulkUnavailable = outcome.bulkUnavailable[0];
+			result.status = 'no_op';
+			return;
+		}
+
 		if (validAdded.length > 0) {
 			const addedItem = validAdded[0];
+			const requested = change.quantity ?? 1;
+			// Pidió MÁS de lo disponible → deshacer y preguntar (no agregar arbitrariamente).
+			if (addedItem.quantity > 0 && addedItem.quantity < requested) {
+				session.cart?.splice(session.cart.indexOf(addedItem), 1);
+				const variant = {
+					variantId: addedItem.productVariantId ?? '',
+					stockItemId: addedItem.stockItemId ?? null,
+					name: addedItem.variantName ?? '',
+					totalQty: addedItem.quantity,
+					price: addedItem.unitPrice,
+				};
+				result.status = 'no_op';
+				result.itemLabel = undefined;
+				result.stockShortage = {
+					product: {
+						productId: addedItem.productId,
+						name: addedItem.productName,
+						variants: [variant],
+					},
+					variant,
+					requested,
+					available: addedItem.quantity,
+				};
+				return;
+			}
 			result.status = 'applied';
 			result.itemLabel = cartItemLabel(addedItem);
 			result.newQuantity = addedItem.quantity;
-			if (outcome.outOfStock.length > 0) {
-				const detail = outcome.outOfStockDetails[0];
-				result.capped = true;
-				result.availableStock = detail?.currentStock;
-				result.note = 'la cantidad se ajustó al stock disponible';
-			}
 			return;
 		}
 		// La búsqueda solo trajo productos que no corresponden → no encontrado
@@ -2504,6 +3140,365 @@ export class IntentHandlerService {
 		return { units: requestedGrams / itemGrams };
 	};
 
+	/**
+	 * Resumen del pedido en formato lista + total ("Listo, aquí está su pedido: ...").
+	 * Devuelve '' si el carrito está vacío. Se usa para confirmar lo agregado antes de
+	 * aclarar, al final del mensaje, un producto no disponible.
+	 */
+	private buildCartSummary = (cart: CartItem[], currency: string): string => {
+		if (!cart || cart.length === 0) return '';
+		const lines = cart
+			.map(item => {
+				const name = item.variantName
+					? `${item.productName} ${item.variantName}`
+					: item.productName;
+				const total = item.unitPrice
+					? formatPrice(
+							String(Number(item.unitPrice) * item.quantity),
+							item.currency,
+						)
+					: null;
+				return total
+					? `- ${item.quantity}x ${name} = ${total}`
+					: `- ${item.quantity}x ${name}`;
+			})
+			.join('\n');
+		const grandTotal = cart.reduce(
+			(sum, item) =>
+				sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
+			0,
+		);
+		return `Listo, aquí está su pedido:\n${lines}\n\nTotal: ${formatPrice(String(grandTotal), currency)}`;
+	};
+
+	/** Convierte una opción de peso resuelta a PresentationOption serializable. */
+	private toPresentationOption = (x: {
+		variant: ProductListEntry['variants'][0];
+		units: number;
+	}): PresentationOption => ({
+		variantId: x.variant.variantId,
+		stockItemId: x.variant.stockItemId,
+		variantName: x.variant.name,
+		units: x.units,
+		unitPrice: x.variant.price,
+		totalQty: x.variant.totalQty,
+	});
+
+	/**
+	 * Guarda en sesión una elección de presentación pendiente (kilos sueltos vs
+	 * bloque/caja) y devuelve la pregunta al cliente. La respuesta del cliente se
+	 * resuelve en el siguiente turno vía resolvePendingPresentationChoice.
+	 */
+	private askPresentationChoice = async (
+		session: UserSession,
+		phoneNumber: string,
+		product: ProductListEntry,
+		requestedGrams: number,
+		ambiguous: Extract<WeightedPresentationResult, { mode: 'ambiguous' }>,
+		currency: string,
+		mode: 'add' | 'edit',
+		cartItemVariantId?: string,
+	): Promise<string> => {
+		const choice: PendingPresentationChoice = {
+			productId: product.productId,
+			productName: product.name,
+			requestedGrams,
+			currency,
+			kilo: this.toPresentationOption(ambiguous.kilo),
+			bulk: ambiguous.bulk.map(b => this.toPresentationOption(b)),
+			mode,
+			cartItemVariantId,
+		};
+		session.pendingPresentationChoice = choice;
+		await redis.set(
+			`session:${phoneNumber}`,
+			JSON.stringify(session),
+			'EX',
+			SESSION_TTL_SECONDS,
+		);
+
+		const kg = requestedGrams / 1000;
+		const kgLabel = kg % 1 === 0 ? `${kg}` : kg.toFixed(1);
+		const lineFor = (opt: PresentationOption, forma: string): string => {
+			const total = opt.unitPrice
+				? formatPrice(String(Number(opt.unitPrice) * opt.units), currency)
+				: null;
+			return `- ${forma}: ${opt.units} x ${opt.variantName}${total ? ` = ${total}` : ''}`;
+		};
+		const lines = [
+			lineFor(choice.kilo, 'en kilos sueltos'),
+			...choice.bulk.map(b =>
+				lineFor(b, /caja/i.test(b.variantName) ? 'en caja' : 'en bloque'),
+			),
+		].join('\n');
+		return (
+			`Para ${kgLabel} kilos de ${product.name} tiene dos formas de llevarlo:\n${lines}\n\n` +
+			`¿Cómo lo prefiere?`
+		);
+	};
+
+	/**
+	 * La presentación a granel (bloque/caja) que pidió el cliente existe en catálogo
+	 * pero está AGOTADA en su país. Guarda un pendiente con solo la opción por kilo y
+	 * ofrece esa alternativa (un "sí" la confirma en el siguiente turno).
+	 */
+	private offerKiloForUnavailableBulk = async (
+		session: UserSession,
+		phoneNumber: string,
+		product: ProductListEntry,
+		requestedGrams: number,
+		kiloVariant: ProductListEntry['variants'][0],
+		bulkName: string,
+		currency: string,
+		mode: 'add' | 'edit',
+		cartItemVariantId?: string,
+		/** Ítems ya agregados a confirmar (lista+total) antes de la aclaración (multi/quote). */
+		confirmCart?: CartItem[],
+		/** true si es el primer mensaje de la conversación (para el saludo de apertura). */
+		isFirstTurn?: boolean,
+	): Promise<string> => {
+		const units = Math.max(1, Math.round(requestedGrams / 1000));
+		const cappedUnits = Math.min(units, kiloVariant.totalQty);
+		const bulkGrams = parseVariantWeightGrams(bulkName);
+		const bulkLabel = /bloque/i.test(bulkName)
+			? `bloque${bulkGrams ? ` de ${bulkGrams / 1000} kilos` : ''}`
+			: /caja/i.test(bulkName)
+				? bulkName.toLowerCase()
+				: `presentación ${bulkName}`;
+
+		if (cappedUnits <= 0) {
+			// Ni bloque ni kilo disponibles: nada que ofrecer.
+			session.pendingPresentationChoice = null;
+			await redis.set(
+				`session:${phoneNumber}`,
+				JSON.stringify(session),
+				'EX',
+				SESSION_TTL_SECONDS,
+			);
+			return this.openai
+				.generateReply({
+					userMessage: 'sin stock',
+					knownCustomerName:
+						session.knownCustomerName ?? session.collectedCustomerName,
+					lastBotMessage: session.lastBotMessage,
+					editOutcomeNotes: [
+						`NO hay ${bulkLabel} ni presentación por kilo de "${product.name}" disponible ahora. Dilo de forma natural y breve (nombre corto del producto, sin lista) y ofrece ayudar con otra base.`,
+					],
+				})
+				.catch(
+					() =>
+						`Por ahora no tengo disponible esa presentación de ese producto. ¿Le ayudo con otra base?`,
+				);
+		}
+
+		session.pendingPresentationChoice = {
+			productId: product.productId,
+			productName: product.name,
+			requestedGrams,
+			currency,
+			kilo: this.toPresentationOption({
+				variant: kiloVariant,
+				units: cappedUnits,
+			}),
+			bulk: [],
+			mode,
+			cartItemVariantId,
+			bulkUnavailable: true,
+			unavailableBulkName: bulkName,
+		};
+		await redis.set(
+			`session:${phoneNumber}`,
+			JSON.stringify(session),
+			'EX',
+			SESSION_TTL_SECONDS,
+		);
+
+		return this.openai
+			.generateReply({
+				userMessage: 'presentacion no disponible',
+				knownCustomerName:
+					session.knownCustomerName ?? session.collectedCustomerName,
+				isFirstInteraction: isFirstTurn,
+				currency,
+				lastBotMessage: session.lastBotMessage,
+				conversationHistory: session.conversationHistory,
+				cart: confirmCart && confirmCart.length > 0 ? confirmCart : undefined,
+				bulkUnavailable: {
+					productName: product.name,
+					bulkLabel,
+					kiloUnits: cappedUnits,
+					kiloUnitPrice: kiloVariant.price,
+				},
+			})
+			.catch(() => {
+				const total = kiloVariant.price
+					? ` (${formatPrice(String(Number(kiloVariant.price) * cappedUnits), currency)})`
+					: '';
+				const summary =
+					confirmCart && confirmCart.length > 0
+						? `${this.buildCartSummary(confirmCart, currency)}\n\n`
+						: '';
+				return `${summary}Esa base no la tenemos en ${bulkLabel} por ahora; sí la manejamos de a kilo. ¿Le agrego ${cappedUnits}${total}?`;
+			});
+	};
+
+	/**
+	 * Interceptor de la elección de presentación pendiente: si el cliente responde
+	 * a la pregunta "kilos sueltos vs bloque/caja", resuelve, agrega/reemplaza en el
+	 * carrito y confirma. Si la respuesta no expresa una preferencia clara, limpia el
+	 * pendiente y devuelve null para que el mensaje se procese con el flujo normal.
+	 */
+	resolvePendingPresentationChoice = async (
+		session: UserSession,
+		phoneNumber: string,
+		text: string,
+		normalizedText: string,
+		countryInfo: CountryContext | null,
+	): Promise<string | null> => {
+		const choice = session.pendingPresentationChoice;
+		if (!choice) return null;
+
+		const pref = classifyPresentationPreference(normalizedText);
+		let chosen: PresentationOption | undefined;
+		if (pref === 'unit') {
+			chosen = choice.kilo;
+		} else if (pref === 'bulk' && choice.bulk.length > 0) {
+			// Casar por nombre de variante (ej. dice "caja" → variante con "caja"); si no, la primera (mayor: bloque)
+			const byName = choice.bulk.find(b =>
+				normalizeText(b.variantName)
+					.split(/\s+/)
+					.some(w => w.length > 2 && normalizedText.includes(w)),
+			);
+			chosen = byName ?? choice.bulk[0];
+		} else if (choice.bulk.length > 0) {
+			// Respuesta por peso ("el de 10 kilos", "la de 5") → opción a granel cuyo
+			// gramaje por unidad coincide con lo que menciona el cliente.
+			const g = detectRequestedWeightGrams(normalizedText);
+			if (g !== null) {
+				chosen = choice.bulk.find(
+					b => parseVariantWeightGrams(b.variantName) === g,
+				);
+			}
+		}
+
+		// Bloque/caja agotado: solo se ofreció la opción por kilo. Un "sí" la confirma;
+		// un "no" la descarta.
+		if (!chosen && choice.bulkUnavailable) {
+			const affirm =
+				/\b(si|sii+|claro|dale|listo|bueno|buenas?|ok|oka|okay|okey|de una|hagale|hagalo|dele|perfecto|va|vale|correcto|exacto|asi es|de acuerdo|obvio|sip|sipi|porfa|por favor|melo|dejemelo|dejelas?|dejelos?)\b/.test(
+					normalizedText,
+				);
+			const negate =
+				/\b(no|nel|nop|nope|mejor no|ninguno|ninguna|asi no|nada)\b/.test(
+					normalizedText,
+				);
+			if (negate && !affirm) {
+				session.pendingPresentationChoice = null;
+				await redis.set(
+					`session:${phoneNumber}`,
+					JSON.stringify(session),
+					'EX',
+					SESSION_TTL_SECONDS,
+				);
+				return 'Listo, lo dejo así. ¿Le ayudo con algo más?';
+			}
+			if (affirm) chosen = choice.kilo;
+		}
+
+		// Sin preferencia clara → no consumir; limpiar y dejar que el NLU maneje el mensaje.
+		if (!chosen) {
+			session.pendingPresentationChoice = null;
+			await redis.set(
+				`session:${phoneNumber}`,
+				JSON.stringify(session),
+				'EX',
+				SESSION_TTL_SECONDS,
+			);
+			return null;
+		}
+
+		session.pendingPresentationChoice = null;
+		const currency = choice.currency;
+
+		// mode 'edit': quitar el ítem previo (la presentación anterior) antes de agregar la nueva
+		if (choice.mode === 'edit' && choice.cartItemVariantId) {
+			const idx = (session.cart ?? []).findIndex(
+				i => i.productVariantId === choice.cartItemVariantId,
+			);
+			if (idx >= 0) session.cart!.splice(idx, 1);
+		}
+
+		const cappedUnits = Math.min(chosen.units, chosen.totalQty);
+		const stockExceeded = cappedUnits < chosen.units;
+		const productEntry: ProductListEntry = {
+			productId: choice.productId,
+			name: choice.productName,
+			variants: [
+				{
+					variantId: chosen.variantId,
+					stockItemId: chosen.stockItemId,
+					name: chosen.variantName,
+					totalQty: chosen.totalQty,
+					price: chosen.unitPrice,
+				},
+			],
+		};
+		if (cappedUnits > 0) {
+			addToCart(session, productEntry, cappedUnits, currency, productEntry.variants[0]);
+			session.selectedProduct = choice.productName;
+			session.selectedVariantName = chosen.variantName;
+		}
+		await redis.set(
+			`session:${phoneNumber}`,
+			JSON.stringify(session),
+			'EX',
+			SESSION_TTL_SECONDS,
+		);
+
+		if (cappedUnits <= 0) {
+			return this.openai
+				.generateReply({
+					userMessage: text,
+					intent: 'edit_cart',
+					cart: session.cart,
+					currency,
+					editOutcomeNotes: [
+						`NO se pudo agregar ${choice.productName}: sin stock. Dilo natural y breve, sin listar el pedido.`,
+					],
+					conversationHistory: session.conversationHistory,
+				})
+				.catch(
+					() =>
+						'Ese producto no tiene stock disponible en este momento. ¿Le ayudo con otra base?',
+				);
+		}
+
+		// Igual que al agregar un producto: confirmar y mostrar el pedido de forma
+		// NATURAL y VARIADA (vía modelo, no plantilla fija), reflejando lo agregado.
+		const addedLabel = `${choice.productName} ${chosen.variantName}`.trim();
+		const addedNote =
+			`AGREGADO: ${cappedUnits}x ${addedLabel}` +
+			(chosen.unitPrice
+				? ` = ${formatPrice(String(Number(chosen.unitPrice) * cappedUnits), currency)}`
+				: '') +
+			(stockExceeded
+				? `. STOCK: pidió ${chosen.units}, solo había ${cappedUnits} — menciónalo`
+				: '');
+		return this.openai
+			.generateReply({
+				userMessage: text,
+				intent: 'edit_cart',
+				cart: session.cart,
+				currency,
+				editOutcomeNotes: [addedNote],
+				conversationHistory: session.conversationHistory,
+			})
+			.catch(() => {
+				const summary = this.buildCartSummary(session.cart ?? [], currency);
+				return `${summary}\n\n¿Necesita algo más?`;
+			});
+	};
+
 	private handleIntentShowCart = async (
 		ctx: IntentContext,
 	): Promise<string> => {
@@ -2559,6 +3554,40 @@ export class IntentHandlerService {
 			console.log(
 				`[WhatsApp Agent] Processed product list for quote: ${session.cart?.length ?? 0} items added to cart`,
 			);
+			// Presentación a granel agotada aquí: en un solo mensaje (vía modelo, variado)
+			// confirmar lo agregado y aclarar el no disponible + ofrecer kilos, antes de cotizar.
+			if (listResult.bulkUnavailable.length > 0) {
+				const bu = listResult.bulkUnavailable[0];
+				return this.offerKiloForUnavailableBulk(
+					session,
+					phoneNumber,
+					bu.product,
+					bu.requestedGrams,
+					bu.kiloVariant,
+					bu.bulkName,
+					currency,
+					'add',
+					undefined,
+					session.cart,
+					ctx.isFirstInteraction,
+				);
+			}
+
+			// Peso ambiguo (kilos sueltos vs bloque/caja): preguntar antes de armar la
+			// cotización. Los ítems no ambiguos ya quedaron en el carrito; al resolver la
+			// presentación el cliente puede volver a pedir la cotización.
+			if (listResult.presentationChoices.length > 0) {
+				const choice = listResult.presentationChoices[0];
+				return this.askPresentationChoice(
+					session,
+					phoneNumber,
+					choice.product,
+					choice.requestedGrams,
+					choice.ambiguous,
+					currency,
+					'add',
+				);
+			}
 		} else if (aiProductList && aiProductList.length > 0 && cartHasItems) {
 			console.log(
 				`[WhatsApp Agent] Skipped aiProductList for quote (cart already has ${session.cart?.length} items) to avoid phantom additions`,
@@ -2762,63 +3791,131 @@ export class IntentHandlerService {
 			'purchase',
 		);
 		console.log(
-			`[WhatsApp Agent] multi_product_add: added=${result.added}, outOfStock=${result.outOfStock.join(',')}`,
+			`[WhatsApp Agent] multi_product_add: added=${result.added}, outOfStock=${result.outOfStock.join(',')}, presentationChoices=${result.presentationChoices.length}, bulkUnavailable=${result.bulkUnavailable.length}`,
 		);
+
+		// Presentación a granel (bloque/caja) pedida pero agotada aquí. En un solo mensaje
+		// (vía modelo, variado): confirma lo que SÍ quedó en el pedido y al final aclara el
+		// no disponible ofreciendo los kilos.
+		if (result.bulkUnavailable.length > 0) {
+			const bu = result.bulkUnavailable[0];
+			return this.offerKiloForUnavailableBulk(
+				session,
+				phoneNumber,
+				bu.product,
+				bu.requestedGrams,
+				bu.kiloVariant,
+				bu.bulkName,
+				currency,
+				'add',
+				undefined,
+				session.cart,
+				ctx.isFirstInteraction,
+			);
+		}
+
+		// Ítem con peso ambiguo (kilos sueltos vs bloque/caja): preguntar antes de asumir.
+		// Los demás ítems ya quedaron en el carrito; se listan como preámbulo.
+		if (result.presentationChoices.length > 0) {
+			const choice = result.presentationChoices[0];
+			const question = await this.askPresentationChoice(
+				session,
+				phoneNumber,
+				choice.product,
+				choice.requestedGrams,
+				choice.ambiguous,
+				currency,
+				'add',
+			);
+			if (session.cart && session.cart.length > 0) {
+				const addedLines = session.cart
+					.map(item => {
+						const name = item.variantName
+							? `${item.productName} ${item.variantName}`
+							: item.productName;
+						return `- ${item.quantity}x ${name}`;
+					})
+					.join('\n');
+				return `Le agregué:\n${addedLines}\n\n${question}`;
+			}
+			return question;
+		}
+
 		if (!session.cart || session.cart.length === 0) {
+			// No se agregó nada, pero la presentación pedida (bloque/caja) existe y está
+			// agotada: informar con la alternativa en vez de decir "no encontré".
+			if (result.outOfStockDetails.length > 0) {
+				const lines = result.outOfStockDetails
+					.map(p => {
+						const alt =
+							p.alternatives.length > 0
+								? `; sí disponible en: ${p.alternatives.map(a => `${a.name} (${a.stock})`).join(', ')}`
+								: '';
+						return `- ${p.name} (no disponible${alt})`;
+					})
+					.join('\n');
+				return `Sobre lo que pidió:\n${lines}\n\n¿Le dejo la presentación disponible?`;
+			}
 			const hints = productList.map(i => `"${i.productHint}"`).join(', ');
 			return `No encontré los productos solicitados (${hints}). ¿Puede revisar los nombres?`;
 		}
-		const cartLines = session.cart
-			.map(item => {
-				const name = item.variantName
-					? `${item.productName} ${item.variantName}`
-					: item.productName;
-				const total = item.unitPrice
-					? formatPrice(
-							String(Number(item.unitPrice) * item.quantity),
-							item.currency,
-						)
-					: null;
-				return total
-					? `- ${item.quantity}x ${name} = ${total}`
-					: `- ${item.quantity}x ${name}`;
-			})
-			.join('\n');
-		const grandTotal = session.cart.reduce(
-			(sum, item) =>
-				sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
-			0,
-		);
-		const grandTotalFormatted = formatPrice(String(grandTotal), currency);
-		let reply = `Listo, aquí está su pedido:\n${cartLines}\n\nTotal: ${grandTotalFormatted}`;
+		// Notas para el modelo: lo agregado (para confirmar y detectar "con gusto") + avisos
+		// de sin-stock. Se responde por el mismo formato edit_cart (saludo de primer mensaje,
+		// resumen con lista + total, cierre variado / nombre+ciudad) para ser consistentes
+		// con el resto de flujos de "agregar".
+		const editOutcomeNotes: string[] = session.cart.map(item => {
+			const name = item.variantName
+				? `${item.productName} ${item.variantName}`
+				: item.productName;
+			const total = item.unitPrice
+				? ` = ${formatPrice(String(Number(item.unitPrice) * item.quantity), item.currency)}`
+				: '';
+			return `AGREGADO: ${item.quantity}x ${name}${total}`;
+		});
 		if (result.outOfStockDetails.length > 0) {
-			const trueOutOfStock = result.outOfStockDetails
-				.filter(p => p.currentStock === 0)
-				.map(p => p.name);
-			const insufficient = result.outOfStockDetails.filter(
-				p => p.currentStock > 0,
-			);
-			if (trueOutOfStock.length > 0) {
-				reply += `\n\n⚠️ Los siguientes productos no están disponibles: ${trueOutOfStock.join(', ')}.`;
-			}
-			if (insufficient.length > 0) {
-				const lines = insufficient
-					.map(
-						p =>
-							`Solo tenemos ${p.currentStock} disponible${p.currentStock !== 1 ? 's' : ''} de ${p.name}`,
-					)
-					.join('\n');
-				reply += `\n\n⚠️ ${lines}.`;
+			for (const p of result.outOfStockDetails) {
+				if (p.currentStock === 0) {
+					const alt =
+						p.alternatives.length > 0
+							? `; sí disponible en: ${p.alternatives.map(a => `${a.name} (${a.stock})`).join(', ')}`
+							: '';
+					editOutcomeNotes.push(
+						`NO DISPONIBLE (no se agregó): ${p.name}${alt} — infórmalo al cliente`,
+					);
+				} else {
+					editOutcomeNotes.push(
+						`STOCK INSUFICIENTE: solo hay ${p.currentStock} de ${p.name} — infórmalo`,
+					);
+				}
 			}
 		}
-		reply += '\n\n¿Necesita algo más?';
 		await redis.set(
 			`session:${phoneNumber}`,
 			JSON.stringify(session),
 			'EX',
 			SESSION_TTL_SECONDS,
 		);
-		return reply;
+		return this.openai
+			.generateReply({
+				userMessage: ctx.text,
+				intent: 'edit_cart',
+				cart: session.cart,
+				currency,
+				editOutcomeNotes,
+				isFirstInteraction: ctx.isFirstInteraction,
+				knownCustomerName: ctx.knownCustomerName,
+				askNameAndCity: ctx.awaitingNameAndCity,
+				conversationHistory: session.conversationHistory,
+			})
+			.catch(() => {
+				const summary = this.buildCartSummary(session.cart ?? [], currency);
+				return (
+					summary +
+					(ctx.awaitingNameAndCity
+						? '\n\nPor cierto, ¿me regala su nombre y desde qué ciudad nos escribe?'
+						: '\n\n¿Necesita algo más?')
+				);
+			});
 	};
 
 	private handleIntentPurchaseIntent = async (
@@ -3005,6 +4102,18 @@ export class IntentHandlerService {
 				intent: 'name_collected',
 				isFirstInteraction: false,
 				knownCustomerName: ctx.knownCustomerName,
+				// Carrito: si ya venía armando un pedido, el cierre debe ser sobre el pedido.
+				cart: ctx.session.cart,
+				// Producto que estaba consultando (para ofrecérselo tras dar sus datos):
+				// solo si el carrito está vacío (aún no ha agregado nada).
+				pendingOfferProduct:
+					!ctx.session.cart?.length && ctx.session.lastProductList?.length
+						? ctx.session.lastProductList[0].name
+						: undefined,
+				currency:
+					ctx.session.lastCountryInfo?.currency ??
+					ctx.countryInfo?.currency ??
+					'COP',
 				conversationHistory: ctx.session.conversationHistory,
 			})
 			.catch(

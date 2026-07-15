@@ -64,6 +64,26 @@ export interface CartChangeResult {
 	mentionMismatch?: boolean;
 	/** Nota para la respuesta al cliente (ej. peso no múltiplo de la presentación) */
 	note?: string;
+	/** Peso ambiguo (kilos sueltos vs bloque/caja) detectado al agregar: el handler pregunta */
+	presentationChoice?: {
+		product: ProductListEntry;
+		requestedGrams: number;
+	};
+	/** Presentación a granel pedida pero agotada aquí: el handler ofrece los kilos */
+	bulkUnavailable?: {
+		product: ProductListEntry;
+		bulkName: string;
+		requestedGrams: number;
+		kiloVariant: ProductListEntry['variants'][0];
+	};
+	/** El cliente pidió MÁS de lo disponible: NO se aplicó el cambio; el handler
+	 * informa cuánto hay y pregunta si quiere esa cantidad (un "sí" la agrega). */
+	stockShortage?: {
+		product: ProductListEntry;
+		variant: ProductListEntry['variants'][0];
+		requested: number;
+		available: number;
+	};
 }
 
 export interface PendingQuoteFlow {
@@ -165,6 +185,44 @@ export interface ConversationTurn {
 	ts: number;
 }
 
+/** Una forma concreta de cubrir el peso pedido: N unidades de una presentación. */
+export interface PresentationOption {
+	variantId: string;
+	stockItemId: string | null;
+	variantName: string;
+	/** Unidades de esta presentación necesarias para cubrir el peso pedido */
+	units: number;
+	unitPrice: string | null;
+	totalQty: number;
+}
+
+/**
+ * Elección de presentación pendiente: cuando el cliente pide un peso a partir del
+ * cual conviene un bloque/caja PERO también podría llevarlo en kilos sueltos
+ * (ej. "10 kilos" de una base que se vende por KILO y en bloque de 10 kilos), no
+ * asumimos: preguntamos y guardamos aquí las opciones para resolver su respuesta.
+ */
+export interface PendingPresentationChoice {
+	productId: string;
+	productName: string;
+	/** Peso pedido en gramos (para recalcular unidades según la opción elegida) */
+	requestedGrams: number;
+	currency: string;
+	/** Opción "kilos sueltos" (variante por KILO × N) */
+	kilo: PresentationOption;
+	/** Opciones a granel (bloque, caja…) que cubren exactamente el peso pedido */
+	bulk: PresentationOption[];
+	/** 'add' = agregar nuevo al carrito; 'edit' = reemplazar la presentación de un ítem existente */
+	mode: 'add' | 'edit';
+	/** Variante del ítem del carrito a reemplazar cuando mode === 'edit' */
+	cartItemVariantId?: string;
+	/** true cuando la presentación a granel pedida existe pero está AGOTADA en el país
+	 *  del cliente: solo se ofrece la opción por kilo (bulk vacío) y un "sí" la confirma. */
+	bulkUnavailable?: boolean;
+	/** Nombre de la presentación a granel agotada (para nombrarla en el mensaje) */
+	unavailableBulkName?: string;
+}
+
 export interface UserSession {
 	lastProductList?: ProductListEntry[];
 	remainingProductList?: ProductListEntry[];
@@ -189,6 +247,8 @@ export interface UserSession {
 	lastQuoteSerial?: string;
 	/** Cantidad capeada al stock cuando fue insuficiente; el siguiente "Sí" la confirma */
 	pendingStockConfirmQty?: number;
+	/** Elección de presentación pendiente (kilos sueltos vs bloque/caja) a resolver en el siguiente turno */
+	pendingPresentationChoice?: PendingPresentationChoice | null;
 	/** true si el número NUNCA ha interactuado con el bot según los logs (se evalúa una vez por sesión) */
 	isFirstEverInteraction?: boolean;
 	/** Nombre completo del cliente en BD (cacheado en Redis para evitar query repetido) */
@@ -205,6 +265,13 @@ export interface UserSession {
 	conversationHistory?: ConversationTurn[];
 	/** true cuando el bot le pidió nombre y ciudad al cliente y aún no los ha recibido */
 	awaitingNameAndCity?: boolean;
+	/** true después de que el bot ya pidió nombre y ciudad UNA vez en esta sesión.
+	 *  Evita repetir la solicitud en cada mensaje si el cliente no la responde
+	 *  (los datos se recogen más adelante en el flujo de cotización/compra). */
+	askedNameAndCity?: boolean;
+	/** Nº de mensajes de frustración/queja del cliente en esta sesión (intent complaint).
+	 *  Al alcanzar el umbral, la respuesta ofrece transferir con una persona del equipo. */
+	frustrationCount?: number;
 	/** Nombre del cliente recogido informalmente en el chat (sin estar en BD) */
 	collectedCustomerName?: string;
 	/** Ciudad del cliente recogida informalmente en el chat */
