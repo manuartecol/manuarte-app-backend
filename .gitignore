@@ -85,6 +85,7 @@ web_modules/
 .env.test.local
 .env.production.local
 .env.local
+.env.backup*
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -176,6 +177,12 @@ models
 data
 
 /docs
-/scripts
+
+# scripts/ es local por defecto (p. ej. load-rag-docs.js), salvo los fixtures
+# del webhook de WhatsApp y su script de replay, que son material de pruebas
+# compartido y deben viajar con el repo.
+/scripts/*
+!/scripts/wa-replay.js
+!/scripts/wa-fixtures/
 
 # End of https://www.toptal.com/developers/gitignore/api/node,windows

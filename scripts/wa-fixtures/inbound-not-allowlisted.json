@@ -1,0 +1,39 @@
+{
+	"object": "whatsapp_business_account",
+	"entry": [
+		{
+			"id": "102290129340398",
+			"changes": [
+				{
+					"value": {
+						"messaging_product": "whatsapp",
+						"metadata": {
+							"display_phone_number": "__LINE_BUSINESS_PHONE__",
+							"phone_number_id": "__LINE_PHONE_NUMBER_ID__"
+						},
+						"contacts": [
+							{
+								"profile": {
+									"name": "Cliente Prueba"
+								},
+								"wa_id": "573009998877"
+							}
+						],
+						"messages": [
+							{
+								"from": "573009998877",
+								"id": "wamid.FIXTURE-INBOUND-002",
+								"timestamp": "0",
+								"type": "text",
+								"text": {
+									"body": "Buenas, precio del pigmento?"
+								}
+							}
+						]
+					},
+					"field": "messages"
+				}
+			]
+		}
+	]
+}

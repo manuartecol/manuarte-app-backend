@@ -1,0 +1,39 @@
+{
+	"object": "whatsapp_business_account",
+	"entry": [
+		{
+			"id": "102290129340398",
+			"changes": [
+				{
+					"value": {
+						"messaging_product": "whatsapp",
+						"metadata": {
+							"display_phone_number": "__LINE_BUSINESS_PHONE__",
+							"phone_number_id": "999999999999999"
+						},
+						"contacts": [
+							{
+								"profile": {
+									"name": "Cliente Prueba"
+								},
+								"wa_id": "__CUSTOMER_PHONE__"
+							}
+						],
+						"messages": [
+							{
+								"from": "__CUSTOMER_PHONE__",
+								"id": "wamid.FIXTURE-INBOUND-003",
+								"timestamp": "0",
+								"type": "text",
+								"text": {
+									"body": "Mensaje a una linea no registrada"
+								}
+							}
+						]
+					},
+					"field": "messages"
+				}
+			]
+		}
+	]
+}

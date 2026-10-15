@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "dev": "ts-node-dev src/index.ts",
+    "dev": "ts-node-dev --respawn src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "generate:migration": "npx sequelize-cli migration:generate --name",
@@ -15,6 +15,7 @@
     "seed:undo": "npx sequelize-cli db:seed:undo",
     "seed:undo:all": "npx sequelize-cli db:seed:undo:all",
     "rag:load": "node scripts/load-rag-docs.js",
+    "wa:replay": "node scripts/wa-replay.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
