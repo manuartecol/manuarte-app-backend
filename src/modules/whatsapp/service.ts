@@ -17,7 +17,7 @@ export class WhatsAppService {
 	uploadMedia = async (
 		buffer: Buffer,
 		filename: string,
-		phoneNumberId: string = ENV.WHATSAPP_PHONE_NUMBER_ID,
+		phoneNumberId: string = ENV.WHATSAPP_DOCS_PHONE_NUMBER_ID,
 		contentType: string = 'application/pdf',
 	): Promise<string> => {
 		const form = new FormData();
@@ -50,8 +50,8 @@ export class WhatsAppService {
 		phoneNumberId: string,
 		filename: string,
 		caption: string,
-	): Promise<void> => {
-		await axios.post(
+	): Promise<string | null> => {
+		const response = await axios.post(
 			`${GRAPH_API_BASE}/${phoneNumberId}/messages`,
 			{
 				messaging_product: 'whatsapp',
@@ -71,6 +71,8 @@ export class WhatsAppService {
 				},
 			},
 		);
+
+		return response.data?.messages?.[0]?.id ?? null;
 	};
 
 	sendImage = async (
@@ -78,8 +80,8 @@ export class WhatsAppService {
 		mediaId: string,
 		phoneNumberId: string,
 		caption?: string,
-	): Promise<void> => {
-		await axios.post(
+	): Promise<string | null> => {
+		const response = await axios.post(
 			`${GRAPH_API_BASE}/${phoneNumberId}/messages`,
 			{
 				messaging_product: 'whatsapp',
@@ -98,6 +100,8 @@ export class WhatsAppService {
 				},
 			},
 		);
+
+		return response.data?.messages?.[0]?.id ?? null;
 	};
 
 	sendTemplate = async (
@@ -108,7 +112,7 @@ export class WhatsAppService {
 		const { customerName, serialNumber, total, docName, templateName } = params;
 
 		await axios.post(
-			`${GRAPH_API_BASE}/${ENV.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+			`${GRAPH_API_BASE}/${ENV.WHATSAPP_DOCS_PHONE_NUMBER_ID}/messages`,
 			{
 				messaging_product: 'whatsapp',
 				recipient_type: 'individual',

@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { redis } from '../../../config/redis';
+import { saveSession } from '../session.store';
 import { OpenAIService, OpenAIProduct } from '../openai.service';
 import { PaymentLinkService } from '../payment-link.service';
 import { ProductSearchService } from './product-search.service';
@@ -17,7 +17,7 @@ import {
 	PRODUCT_FAMILY_WORDS,
 	normalizeRagQuery,
 } from '../utils';
-import { SESSION_TTL_SECONDS, MAX_PRODUCT_RESULTS } from '../constants';
+import { MAX_PRODUCT_RESULTS } from '../constants';
 import { RagDocService, RagSearchResult } from '../../rag-docs/service';
 import {
 	ProductListEntry,
@@ -543,12 +543,7 @@ export class IntentHandlerService {
 							...best.product,
 							variants: [best.variant],
 						};
-						await redis.set(
-							`session:${phoneNumber}`,
-							JSON.stringify(session),
-							'EX',
-							SESSION_TTL_SECONDS,
-						);
+						await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 						return this.openai
 							.generateReply({
 								userMessage: text,
@@ -614,12 +609,7 @@ export class IntentHandlerService {
 				}
 			}
 
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 			const selectedProductForReply = resolvedVariant
 				? { ...selectedItems[0], variants: [resolvedVariant] }
 				: selectedItems[0];
@@ -760,6 +750,7 @@ export class IntentHandlerService {
 					return this.askPresentationChoice(
 						session,
 						phoneNumber,
+						ctx.botPhoneNumberId,
 						product,
 						requestedGrams,
 						wp,
@@ -802,6 +793,7 @@ export class IntentHandlerService {
 						return this.offerKiloForUnavailableBulk(
 							session,
 							phoneNumber,
+							ctx.botPhoneNumberId,
 							product,
 							requestedGrams,
 							kiloVariant,
@@ -936,12 +928,7 @@ export class IntentHandlerService {
 			}
 		}
 
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 
 		// Detect "ya les llegó / ya llegó / volvió a llegar" arrival queries
 		const isArrivalQuery =
@@ -1078,6 +1065,7 @@ export class IntentHandlerService {
 						context: 'logQuery',
 						error: err,
 						phoneNumber,
+						botPhoneNumberId: ctx.botPhoneNumberId,
 						rawText: text,
 					})
 					.catch(e =>
@@ -1109,12 +1097,7 @@ export class IntentHandlerService {
 			];
 			session.remainingProductList = newRemaining;
 			session.awaitingMoreProducts = newRemaining.length > 0;
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -1151,12 +1134,7 @@ export class IntentHandlerService {
 			session.remainingProductList = result.remainingProducts;
 			session.awaitingMoreProducts = result.remainingProducts.length > 0;
 			session.lastCountryInfo = countryInfo ?? session.lastCountryInfo ?? null;
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -1260,12 +1238,7 @@ export class IntentHandlerService {
 				availableStock > 0
 			) {
 				session.pendingStockConfirmQty = availableStock;
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
+				await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 				return this.openai
 					.generateReply({
 						userMessage: text,
@@ -1290,12 +1263,7 @@ export class IntentHandlerService {
 					sessionVariantAff,
 				);
 			}
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -1369,10 +1337,11 @@ export class IntentHandlerService {
 	};
 
 	/**
-	 * El cliente pide hablar con una persona, expresa insatisfacción con el servicio o
-	 * tiene un reclamo. Por ahora solo respondemos con empatía y confirmamos que alguien
-	 * del equipo lo atenderá (la lógica real de transferencia se agregará luego). Nunca
-	 * se le ofrecen productos ni recetas aquí: es un momento sensible de atención.
+	 * El cliente pide hablar con una persona. Aquí solo se compone la despedida;
+	 * el traspaso real lo ejecuta `doProcessAndReply`, que tras enviar esta
+	 * respuesta pausa la IA para esta conversación con el mismo mecanismo que una
+	 * intervención humana (`wa:ai-pause:*`). Nunca se le ofrecen productos ni
+	 * recetas aquí: es un momento sensible de atención.
 	 */
 	private handleIntentHumanHandoff = async (
 		ctx: IntentContext,
@@ -1408,12 +1377,7 @@ export class IntentHandlerService {
 		session.frustrationCount = (session.frustrationCount ?? 0) + 1;
 		const escalateToHuman =
 			session.frustrationCount >= this.FRUSTRATION_HANDOFF_THRESHOLD;
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 		return this.openai
 			.generateReply({
 				userMessage: text,
@@ -2082,6 +2046,7 @@ export class IntentHandlerService {
 							return this.askPresentationChoice(
 								session,
 								ctx.phoneNumber,
+								ctx.botPhoneNumberId,
 								productEntry,
 								requestedGrams,
 								wp,
@@ -2119,6 +2084,7 @@ export class IntentHandlerService {
 								return this.offerKiloForUnavailableBulk(
 									session,
 									ctx.phoneNumber,
+									ctx.botPhoneNumberId,
 									productEntry,
 									requestedGrams,
 									kiloV,
@@ -2228,12 +2194,7 @@ export class IntentHandlerService {
 			session.selectedVariantName = ss.variant.name;
 			session.lastProductList = [{ ...ss.product, variants: [ss.variant] }];
 			session.pendingStockConfirmQty = ss.available;
-			await redis.set(
-				`session:${ctx.phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, ctx.phoneNumber, session);
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -2257,6 +2218,7 @@ export class IntentHandlerService {
 			return this.offerKiloForUnavailableBulk(
 				session,
 				ctx.phoneNumber,
+				ctx.botPhoneNumberId,
 				bu.product,
 				bu.requestedGrams,
 				bu.kiloVariant,
@@ -2281,6 +2243,7 @@ export class IntentHandlerService {
 				return this.askPresentationChoice(
 					session,
 					ctx.phoneNumber,
+					ctx.botPhoneNumberId,
 					pcResult.presentationChoice.product,
 					pcResult.presentationChoice.requestedGrams,
 					wp,
@@ -3192,6 +3155,7 @@ export class IntentHandlerService {
 	private askPresentationChoice = async (
 		session: UserSession,
 		phoneNumber: string,
+		botPhoneNumberId: string,
 		product: ProductListEntry,
 		requestedGrams: number,
 		ambiguous: Extract<WeightedPresentationResult, { mode: 'ambiguous' }>,
@@ -3210,12 +3174,7 @@ export class IntentHandlerService {
 			cartItemVariantId,
 		};
 		session.pendingPresentationChoice = choice;
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(botPhoneNumberId, phoneNumber, session);
 
 		const kg = requestedGrams / 1000;
 		const kgLabel = kg % 1 === 0 ? `${kg}` : kg.toFixed(1);
@@ -3245,6 +3204,7 @@ export class IntentHandlerService {
 	private offerKiloForUnavailableBulk = async (
 		session: UserSession,
 		phoneNumber: string,
+		botPhoneNumberId: string,
 		product: ProductListEntry,
 		requestedGrams: number,
 		kiloVariant: ProductListEntry['variants'][0],
@@ -3269,12 +3229,7 @@ export class IntentHandlerService {
 		if (cappedUnits <= 0) {
 			// Ni bloque ni kilo disponibles: nada que ofrecer.
 			session.pendingPresentationChoice = null;
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(botPhoneNumberId, phoneNumber, session);
 			return this.openai
 				.generateReply({
 					userMessage: 'sin stock',
@@ -3306,12 +3261,7 @@ export class IntentHandlerService {
 			bulkUnavailable: true,
 			unavailableBulkName: bulkName,
 		};
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(botPhoneNumberId, phoneNumber, session);
 
 		return this.openai
 			.generateReply({
@@ -3351,6 +3301,7 @@ export class IntentHandlerService {
 	resolvePendingPresentationChoice = async (
 		session: UserSession,
 		phoneNumber: string,
+		botPhoneNumberId: string,
 		text: string,
 		normalizedText: string,
 		countryInfo: CountryContext | null,
@@ -3394,12 +3345,7 @@ export class IntentHandlerService {
 				);
 			if (negate && !affirm) {
 				session.pendingPresentationChoice = null;
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
+				await saveSession(botPhoneNumberId, phoneNumber, session);
 				return 'Listo, lo dejo así. ¿Le ayudo con algo más?';
 			}
 			if (affirm) chosen = choice.kilo;
@@ -3408,12 +3354,7 @@ export class IntentHandlerService {
 		// Sin preferencia clara → no consumir; limpiar y dejar que el NLU maneje el mensaje.
 		if (!chosen) {
 			session.pendingPresentationChoice = null;
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(botPhoneNumberId, phoneNumber, session);
 			return null;
 		}
 
@@ -3448,12 +3389,7 @@ export class IntentHandlerService {
 			session.selectedProduct = choice.productName;
 			session.selectedVariantName = chosen.variantName;
 		}
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(botPhoneNumberId, phoneNumber, session);
 
 		if (cappedUnits <= 0) {
 			return this.openai
@@ -3561,6 +3497,7 @@ export class IntentHandlerService {
 				return this.offerKiloForUnavailableBulk(
 					session,
 					phoneNumber,
+					ctx.botPhoneNumberId,
 					bu.product,
 					bu.requestedGrams,
 					bu.kiloVariant,
@@ -3581,6 +3518,7 @@ export class IntentHandlerService {
 				return this.askPresentationChoice(
 					session,
 					phoneNumber,
+					ctx.botPhoneNumberId,
 					choice.product,
 					choice.requestedGrams,
 					choice.ambiguous,
@@ -3640,12 +3578,7 @@ export class IntentHandlerService {
 									]
 								: [],
 						});
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -3685,12 +3618,7 @@ export class IntentHandlerService {
 						personId: existingCustomer.personId,
 					},
 				};
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
+				await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 				let reply = await this.openai
 					.generateReply({
 						userMessage: text,
@@ -3727,12 +3655,7 @@ export class IntentHandlerService {
 						outOfStockFromList.length > 0 ? outOfStockFromList : undefined,
 					collectedData: { phoneNumber: localPhone },
 				};
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
+				await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 				return this.openai
 					.generateReply({
 						userMessage: text,
@@ -3802,6 +3725,7 @@ export class IntentHandlerService {
 			return this.offerKiloForUnavailableBulk(
 				session,
 				phoneNumber,
+				ctx.botPhoneNumberId,
 				bu.product,
 				bu.requestedGrams,
 				bu.kiloVariant,
@@ -3821,6 +3745,7 @@ export class IntentHandlerService {
 			const question = await this.askPresentationChoice(
 				session,
 				phoneNumber,
+				ctx.botPhoneNumberId,
 				choice.product,
 				choice.requestedGrams,
 				choice.ambiguous,
@@ -3889,12 +3814,7 @@ export class IntentHandlerService {
 				}
 			}
 		}
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 		return this.openai
 			.generateReply({
 				userMessage: ctx.text,
@@ -4060,12 +3980,7 @@ export class IntentHandlerService {
 						);
 				}
 			}
-			await redis.set(
-				`session:${phoneNumber}`,
-				JSON.stringify(session),
-				'EX',
-				SESSION_TTL_SECONDS,
-			);
+			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
 		}
 	};
 

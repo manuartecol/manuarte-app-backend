@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { AiStateService } from './ai-state.service';
 import fs from 'fs';
 import path from 'path';
 import { PersonModel } from '../../person/model';
@@ -33,6 +34,7 @@ export class FlowsService {
 		private whatsAppService: WhatsAppService,
 		private paymentLinkService: PaymentLinkService,
 		private productSearchService: ProductSearchService,
+		private aiStateService: AiStateService,
 	) {}
 
 	/**
@@ -53,12 +55,13 @@ export class FlowsService {
 				botPhoneNumberId,
 				'image/jpeg',
 			);
-			await this.whatsAppService.sendImage(
+			const sentId = await this.whatsAppService.sendImage(
 				phoneNumber,
 				mediaId,
 				botPhoneNumberId,
 				caption,
 			);
+			await this.aiStateService.registerSelfSend(sentId);
 			return true;
 		} catch (err) {
 			console.error(
@@ -632,7 +635,7 @@ export class FlowsService {
 						discountType: 'FIXED',
 						discount: 0,
 						shipping: 0,
-						requestedBy: ENV.WHATSAPP_BOT_USER_ID,
+						requestedBy: ENV.AGENT_SYSTEM_USER_ID,
 						currency: currency as 'COP' | 'USD',
 					},
 					customerData: {
@@ -712,13 +715,14 @@ export class FlowsService {
 						const formattedTotal = formatCurrency(total);
 						const caption = `📄 Cotización #${serial} por un total de ${formattedTotal}.\n\n`;
 
-						await this.whatsAppService.sendDocument(
+						const sentId = await this.whatsAppService.sendDocument(
 							recipientPhone,
 							mediaId,
 							botPhoneNumberId,
 							filename,
 							caption,
 						);
+						await this.aiStateService.registerSelfSend(sentId);
 					}
 				} catch (err) {
 					console.error(

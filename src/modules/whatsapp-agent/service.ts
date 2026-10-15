@@ -1,6 +1,5 @@
 import axios, { AxiosError } from 'axios';
 import { ENV } from '../../config/env';
-import { redis } from '../../config/redis';
 import { WhatsAppLogService } from './logging/log.service';
 import { CountryService } from './agent-services/country.service';
 import { MediaHandlerService } from './agent-services/media-handler.service';
@@ -8,7 +7,7 @@ import { OpenAIService, NLUIntent } from './openai.service';
 import { PaymentLinkService } from './payment-link.service';
 import { ProductSearchService } from './agent-services/product-search.service';
 import { FlowsService } from './agent-services/flows.service';
-import { normalizeText } from './utils';
+import { isWithinOfficeHours, normalizeText } from './utils';
 import { QuoteService } from '../quote/service';
 import { QuoteModel } from '../quote/model';
 
@@ -25,17 +24,27 @@ import {
 	WHATSAPP_API_TIMEOUT_MS,
 	BUFFER_WAIT_MS,
 	REPLY_DELAY_MS,
-	SESSION_TTL_SECONDS,
 	CONVERSATION_HISTORY_MAX_TURNS,
 	CONVERSATION_HISTORY_MESSAGE_MAX_CHARS,
 } from './constants';
 import {
 	BufferEntry,
 	CartChange,
+	CoexistenceWebhookPayload,
 	ConversationTurn,
 	UserSession,
+	WebhookChange,
+	WebhookMessage,
+	WebhookValue,
 } from './types';
-import { stripCallingCode } from './helpers/intent-detection';
+import {
+	isExplicitHumanRequest,
+	stripCallingCode,
+} from './helpers/intent-detection';
+import { getSession, saveSession } from './session.store';
+import { AiStateService } from './agent-services/ai-state.service';
+import { isAiAllowed, normalizePhone } from './helpers/phone-access';
+import { getLineByPhoneNumberId, logRegisteredLines, WhatsAppLine } from './lines';
 
 import {
 	IntentHandlerService,
@@ -45,8 +54,47 @@ import { RagDocService } from '../rag-docs/service';
 import { RagDocModel } from '../rag-docs/model';
 
 export class WhatsAppAgentService {
+	// Buffer y cola se clavean por <phoneNumberId>:<teléfono>, igual que la
+	// sesión y la pausa en Redis. Sin el prefijo de línea, el mismo cliente
+	// escribiendo a dos líneas compartiría buffer: sus mensajes se mezclarían
+	// en un solo turno y se procesarían con el país de la primera línea.
 	private messageBuffer = new Map<string, BufferEntry>();
 	private processingQueue = new Map<string, Promise<void>>();
+
+	private conversationKey = (
+		botPhoneNumberId: string,
+		phoneNumber: string,
+	): string => `${botPhoneNumberId}:${phoneNumber}`;
+
+	/**
+	 * Aviso honesto cuando el traspaso ocurre con la tienda cerrada. Sin esto la
+	 * IA promete "enseguida le atienden" un domingo por la noche y el cliente se
+	 * queda en silencio hasta que alguien abra.
+	 */
+	private offHoursHandoffNote = (): string =>
+		isWithinOfficeHours()
+			? ''
+			: `\n\n⏰ Nuestro equipo está fuera de horario ahora mismo (L–V 8–18h, Sáb 8–14h), pero verán su mensaje y le responderán a la brevedad.`;
+
+	/**
+	 * Una conversación en pausa no puede conservar flujos a medias: al expirar
+	 * el TTL la IA no debe retomar un formulario que una persona ya resolvió por
+	 * su cuenta. El contexto (nombre, ciudad, historial) sí se conserva.
+	 */
+	private clearInFlightFlows = async (
+		botPhoneNumberId: string,
+		phoneNumber: string,
+	): Promise<void> => {
+		const session = await getSession(botPhoneNumberId, phoneNumber);
+		if (!session.pendingPurchaseFlow && !session.pendingQuoteFlow) return;
+
+		session.pendingPurchaseFlow = null;
+		session.pendingQuoteFlow = null;
+		await saveSession(botPhoneNumberId, phoneNumber, session);
+		console.log(
+			`[WhatsApp Agent] Cleared in-flight flows for ${phoneNumber}: the conversation moved to a human.`,
+		);
+	};
 	private logService = new WhatsAppLogService();
 	private openai = new OpenAIService();
 	private paymentLinkService = new PaymentLinkService();
@@ -57,6 +105,7 @@ export class WhatsAppAgentService {
 	private customerService = new CustomerService(CustomerModel);
 	private cityService = new CityService(CityModel);
 	private countryService = new CountryService(this.logService);
+	private aiStateService = new AiStateService();
 	private productSearchService = new ProductSearchService(this.logService);
 	private flowsService = new FlowsService(
 		this.openai,
@@ -67,18 +116,21 @@ export class WhatsAppAgentService {
 		this.whatsAppService,
 		this.paymentLinkService,
 		this.productSearchService,
+		this.aiStateService,
 	);
 	private mediaHandlerService!: MediaHandlerService;
 	private intentHandlerService!: IntentHandlerService;
 	private ragDocService = new RagDocService(RagDocModel, this.openai);
 
 	constructor() {
+		logRegisteredLines();
 		this.mediaHandlerService = new MediaHandlerService(
 			this.countryService,
 			this.quoteService,
 			this.whatsAppService,
 			this.sendReply,
 			this.billingService,
+			this.aiStateService,
 		);
 		this.intentHandlerService = new IntentHandlerService(
 			this.openai,
@@ -123,115 +175,22 @@ export class WhatsAppAgentService {
 	};
 
 	receiveMessage = async (body: unknown) => {
-		const payload = body as {
-			entry?: Array<{
-				changes?: Array<{
-					value?: {
-						messages?: Array<{
-							text?: { body?: string };
-							from?: string;
-							timestamp?: string;
-							id?: string;
-						}>;
-						statuses?: unknown[];
-						metadata?: { phone_number_id?: string };
-					};
-				}>;
-			}>;
-		};
+		const payload = body as CoexistenceWebhookPayload;
+
+		// Los eventos `history` y `smb_app_state_sync` usan otro sobre
+		// (event/data, sin `entry`). No los usamos: se descartan aquí.
 		if (!payload?.entry) {
 			console.warn('[WhatsApp Agent] Payload without entry, ignoring.');
 			return { status: 200, message: 'Sin datos para procesar.' };
 		}
 
 		try {
-			const entry = payload?.entry?.[0];
-			const changes = entry?.changes?.[0];
-			const value = changes?.value;
-			const messages = value?.messages?.[0];
-
-			if (value?.statuses) {
-				console.log('[WhatsApp Agent] Status update event, ignoring.');
-				return { status: 200, message: 'Status update ignorado.' };
-			}
-
-			const text = messages?.text?.body ?? null;
-			const imageId =
-				(messages as { image?: { id?: string } } | undefined)?.image?.id ??
-				null;
-			const documentId =
-				(messages as { document?: { id?: string } } | undefined)?.document
-					?.id ?? null;
-			const botPhoneNumberId = value?.metadata?.phone_number_id ?? null;
-			const phoneNumber = messages?.from ?? null;
-			const timestamp = messages?.timestamp ?? null;
-			const message_id = messages?.id ?? null;
-
-			if (timestamp) {
-				const ageMs = Date.now() - Number(timestamp) * 1000;
-				const MAX_AGE_MS = 5 * 60 * 1000; // 5 minutos
-				if (ageMs > MAX_AGE_MS) {
-					console.warn(
-						`[WhatsApp Agent] Stale message (${Math.round(ageMs / 1000)}s old), ignoring.`,
-					);
-					return { status: 200, message: 'Mensaje antiguo ignorado.' };
+			// Un mismo POST puede traer varias entries, varios changes y varios
+			// mensajes o echoes. Leer solo el índice [0] perdería mensajes.
+			for (const entry of payload.entry) {
+				for (const change of entry?.changes ?? []) {
+					await this.handleWebhookChange(change);
 				}
-			}
-
-			if (!botPhoneNumberId) {
-				console.warn(
-					'[WhatsApp Agent] Event without phone_number_id (status update?), ignoring.',
-				);
-				return { status: 200, message: 'Evento sin phoneNumberId del bot.' };
-			}
-
-			if (
-				ENV.WHATSAPP_AGENT_PHONE_NUMBER_ID &&
-				botPhoneNumberId !== ENV.WHATSAPP_AGENT_PHONE_NUMBER_ID
-			) {
-				console.log(
-					'[WhatsApp Agent] botPhoneNumberId no coincide con el configurado, ignorando mensaje de:',
-					phoneNumber,
-				);
-				return { status: 200, message: 'botPhoneNumberId no autorizado.' };
-			}
-
-			console.log('[WhatsApp Agent] Incoming message:', {
-				text,
-				botPhoneNumberId,
-				phoneNumber,
-				timestamp,
-				message_id,
-			});
-
-			if (!messages) {
-				console.warn('[WhatsApp Agent] Event without messages, ignoring.');
-				return { status: 200, message: 'Evento sin mensajes.' };
-			}
-
-			const mediaId = imageId ?? documentId ?? null;
-			const mediaType = imageId
-				? ('image' as const)
-				: documentId
-					? ('document' as const)
-					: null;
-
-			if (!text && !mediaId) {
-				console.warn('[WhatsApp Agent] Event without text or media, ignoring.');
-				return { status: 200, message: 'Evento sin texto ni media.' };
-			}
-
-			if (mediaId && mediaType && phoneNumber && botPhoneNumberId) {
-				this.handleIncomingImage(
-					phoneNumber,
-					botPhoneNumberId,
-					mediaId,
-					mediaType,
-				).catch(err =>
-					console.error('[WhatsApp Agent] Error handling incoming media:', err),
-				);
-			} else if (text && phoneNumber && botPhoneNumberId) {
-				this.bufferMessage(phoneNumber, botPhoneNumberId, text);
 			}
 		} catch (error) {
 			console.error('[WhatsApp Agent] Error processing message:', error);
@@ -245,27 +204,366 @@ export class WhatsAppAgentService {
 		return { status: 200, message: 'Mensaje recibido.' };
 	};
 
+	/**
+	 * Demultiplexor: el campo `field` del change decide el tipo de evento. Con
+	 * Coexistence conviven en el mismo webhook los mensajes del cliente
+	 * (`messages`) y los que el personal escribe desde WhatsApp Business App o
+	 * WhatsApp Web (`smb_message_echoes`).
+	 */
+	private handleWebhookChange = async (
+		change: WebhookChange,
+	): Promise<void> => {
+		const value = change?.value;
+		const phoneNumberId = value?.metadata?.phone_number_id ?? null;
+
+		// La línea identifica la operación (país, tienda, inventario, moneda) y
+		// aísla el estado. Un phone_number_id no registrado se ignora: falla
+		// cerrado en vez de atender con una configuración indeterminada.
+		const line = getLineByPhoneNumberId(phoneNumberId);
+		if (!line) {
+			console.log(
+				`[WhatsApp Agent] Unregistered phone_number_id (${phoneNumberId ?? 'none'}), ignoring event.`,
+			);
+			return;
+		}
+
+		switch (change.field) {
+			case 'messages':
+				await this.handleMessagesChange(line, value);
+				return;
+			case 'smb_message_echoes':
+				await this.handleEchoesChange(line, value);
+				return;
+			default:
+				console.log(
+					`[WhatsApp Agent] Unhandled webhook field "${change.field ?? 'undefined'}", ignoring.`,
+				);
+		}
+	};
+
+	/**
+	 * Ejecuta el manejo de un evento liberando su marcador de deduplicación si
+	 * falla. `markSeen` se consume al principio para que un reintento de Meta no
+	 * duplique la respuesta, pero si el trabajo posterior revienta (Redis caído,
+	 * por ejemplo) devolvemos 500 y Meta reintenta: sin liberar el marcador, ese
+	 * reintento se descartaría por duplicado y el evento se perdería. Para un
+	 * echo eso significa que la IA seguiría respondiendo pese a que una persona
+	 * ya había intervenido.
+	 */
+	private withSeenRollback = async (
+		messageId: string | null,
+		run: () => Promise<void>,
+	): Promise<void> => {
+		try {
+			await run();
+		} catch (error) {
+			await this.aiStateService
+				.releaseSeen(messageId)
+				.catch(e =>
+					console.error('[WhatsApp Agent] Failed to release seen marker:', e),
+				);
+			throw error;
+		}
+	};
+
+	/** Mensajes entrantes de clientes. */
+	private handleMessagesChange = async (
+		line: WhatsAppLine,
+		value: WebhookValue | undefined,
+	): Promise<void> => {
+		if (value?.statuses?.length) {
+			console.log('[WhatsApp Agent] Status update event, ignoring.');
+			return;
+		}
+
+		for (const message of value?.messages ?? []) {
+			await this.withSeenRollback(message?.id ?? null, () =>
+				this.handleInboundMessage(line, message),
+			);
+		}
+	};
+
+	private handleInboundMessage = async (
+		line: WhatsAppLine,
+		message: WebhookMessage,
+	): Promise<void> => {
+		const botPhoneNumberId = line.phoneNumberId;
+		// Se normaliza una sola vez en la entrada para que buffer, cola, sesión,
+		// pausa y logs usen exactamente la misma clave de conversación.
+		const phoneNumber = normalizePhone(message?.from) || null;
+		const timestamp = message?.timestamp ?? null;
+		const messageId = message?.id ?? null;
+		const text = message?.text?.body ?? null;
+		const imageId = message?.image?.id ?? null;
+		const documentId = message?.document?.id ?? null;
+
+		if (!phoneNumber) {
+			console.warn('[WhatsApp Agent] Inbound message without sender, ignoring.');
+			return;
+		}
+
+		if (timestamp) {
+			const ageMs = Date.now() - Number(timestamp) * 1000;
+			const MAX_AGE_MS = 5 * 60 * 1000; // 5 minutos
+			if (ageMs > MAX_AGE_MS) {
+				console.warn(
+					`[WhatsApp Agent] Stale message (${Math.round(ageMs / 1000)}s old), ignoring.`,
+				);
+				return;
+			}
+		}
+
+		// Idempotencia: Meta reintenta el POST si tardamos en responder. Sin esto,
+		// el mismo mensaje se contestaría dos veces.
+		if (!(await this.aiStateService.markSeen(messageId))) {
+			console.log(
+				`[WhatsApp Agent] Duplicate message ${messageId}, already processed.`,
+			);
+			return;
+		}
+
+		console.log('[WhatsApp Agent] Incoming message:', {
+			text,
+			botPhoneNumberId,
+			phoneNumber,
+			timestamp,
+			messageId,
+		});
+
+		const mediaId = imageId ?? documentId ?? null;
+		const mediaType = imageId
+			? ('image' as const)
+			: documentId
+				? ('document' as const)
+				: null;
+
+		if (!text && !mediaId) {
+			console.warn('[WhatsApp Agent] Event without text or media, ignoring.');
+			return;
+		}
+
+		const access = isAiAllowed(line, phoneNumber);
+		if (!access.allowed) {
+			console.log(
+				`[WhatsApp Agent] AI not enabled for ${phoneNumber} (${access.reason}), leaving it to human attention.`,
+			);
+			this.logInbound(
+				line,
+				phoneNumber,
+				text ?? `[${mediaType ?? 'media'}]`,
+				`skipped:${access.reason}`,
+				messageId,
+			);
+			return;
+		}
+
+		// Una persona está atendiendo esta conversación. El mensaje se registra
+		// como historial pero NO se encola: al expirar la pausa no debe
+		// procesarse retrospectivamente, solo un mensaje nuevo posterior
+		// reactiva la IA.
+		if (await this.aiStateService.isPaused(botPhoneNumberId, phoneNumber)) {
+			console.log(
+				`[WhatsApp Agent] Conversation with ${phoneNumber} is handled by a human, skipping AI.`,
+			);
+			this.logInbound(
+				line,
+				phoneNumber,
+				text ?? `[${mediaType ?? 'media'}]`,
+				'skipped:paused',
+				messageId,
+			);
+			return;
+		}
+
+		if (mediaId && mediaType) {
+			this.handleIncomingImage(
+				phoneNumber,
+				botPhoneNumberId,
+				mediaId,
+				mediaType,
+			).catch(err =>
+				console.error('[WhatsApp Agent] Error handling incoming media:', err),
+			);
+		} else if (text) {
+			this.bufferMessage(phoneNumber, botPhoneNumberId, text);
+		}
+	};
+
+	/**
+	 * Echoes: mensajes salientes del negocio escritos desde WhatsApp Business
+	 * App o WhatsApp Web. Son la señal de intervención humana.
+	 *
+	 * Meta NO marca el origen en el payload, así que un envío del propio agente
+	 * sería indistinguible de uno escrito a mano. De ahí la comprobación contra
+	 * los wamid que registramos al enviar.
+	 */
+	private handleEchoesChange = async (
+		line: WhatsAppLine,
+		value: WebhookValue | undefined,
+	): Promise<void> => {
+		for (const echo of value?.message_echoes ?? []) {
+			await this.withSeenRollback(echo?.id ?? null, () =>
+				this.handleBusinessEcho(line, echo),
+			);
+		}
+	};
+
+	private handleBusinessEcho = async (
+		line: WhatsAppLine,
+		echo: WebhookMessage,
+	): Promise<void> => {
+		// Un `revoke` es la eliminación de un mensaje anterior, no actividad nueva.
+		if (echo?.type === 'revoke') {
+			console.log('[WhatsApp Agent] Echo of a revoked message, ignoring.');
+			return;
+		}
+
+		const messageId = echo?.id ?? null;
+
+		if (!(await this.aiStateService.markSeen(messageId))) {
+			console.log(
+				`[WhatsApp Agent] Duplicate echo ${messageId}, already processed.`,
+			);
+			return;
+		}
+
+		if (await this.aiStateService.isSelfSend(messageId)) {
+			console.log(
+				`[WhatsApp Agent] Echo ${messageId} is one of our own sends, ignoring.`,
+			);
+			return;
+		}
+
+		// En un echo, `from` es el número del negocio y `to` el del cliente.
+		// Tomar `from` aquí resolvería todas las conversaciones a la misma clave.
+		const customerPhone = normalizePhone(echo?.to) || null;
+		if (!customerPhone) {
+			console.warn('[WhatsApp Agent] Echo without recipient, ignoring.');
+			return;
+		}
+
+		// Las notificaciones de pedido que el propio bot envía a las tiendas
+		// también generan echo: no son una intervención sobre un cliente.
+		const access = isAiAllowed(line, customerPhone);
+		if (!access.allowed && access.reason === 'denylist') {
+			console.log(
+				`[WhatsApp Agent] Echo addressed to an internal number (${customerPhone}), ignoring.`,
+			);
+			return;
+		}
+
+		console.log(
+			`[WhatsApp Agent] Human agent replied to ${customerPhone} on line ${line.isoCode}; pausing AI.`,
+		);
+
+		await this.aiStateService.pause(
+			line.phoneNumberId,
+			customerPhone,
+			'human_reply',
+		);
+		await this.clearInFlightFlows(line.phoneNumberId, customerPhone);
+
+		// Si había mensajes del cliente esperando el debounce, se descartan: la
+		// persona ya contestó y una respuesta de la IA sería duplicada.
+		this.discardBufferedMessages(line.phoneNumberId, customerPhone);
+
+		this.logService
+			.logMessage({
+				phoneNumber: customerPhone,
+				botPhoneNumberId: line.phoneNumberId,
+				direction: 'outbound',
+				text: this.describeEchoContent(echo),
+				intent: 'human_agent',
+				countryPrefix: this.countryPrefixOf(customerPhone),
+				source: 'human',
+				messageId,
+			})
+			.catch(err =>
+				console.error('[WhatsApp Agent] Error saving human agent log:', err),
+			);
+	};
+
+	/** Texto legible de un echo, para el historial. */
+	private describeEchoContent = (echo: WebhookMessage): string => {
+		if (echo?.text?.body) return echo.text.body;
+		if (echo?.type === 'edit') {
+			return echo.edit?.message?.text?.body ?? '[mensaje editado]';
+		}
+		return `[${echo?.type ?? 'mensaje'}]`;
+	};
+
+	/**
+	 * Prefijo telefónico del CLIENTE. Es un dato descriptivo para el log: no
+	 * decide la operación, que viene dada por la línea.
+	 */
+	private countryPrefixOf = (phoneNumber: string): string | null =>
+		phoneNumber.startsWith('593')
+			? '+593'
+			: phoneNumber.startsWith('57')
+				? '+57'
+				: null;
+
+	private logInbound = (
+		line: WhatsAppLine,
+		phoneNumber: string,
+		text: string,
+		intent: string | null,
+		messageId: string | null,
+	): void => {
+		this.logService
+			.logMessage({
+				phoneNumber,
+				botPhoneNumberId: line.phoneNumberId,
+				direction: 'inbound',
+				text,
+				intent,
+				countryPrefix: this.countryPrefixOf(phoneNumber),
+				source: 'customer',
+				messageId,
+			})
+			.catch(err =>
+				console.error('[WhatsApp Agent] Error saving inbound log:', err),
+			);
+	};
+
+	/** Cancela el debounce pendiente de un cliente y descarta lo acumulado. */
+	private discardBufferedMessages = (
+		botPhoneNumberId: string,
+		phoneNumber: string,
+	): void => {
+		const key = this.conversationKey(botPhoneNumberId, phoneNumber);
+		const buffered = this.messageBuffer.get(key);
+		if (!buffered) return;
+
+		clearTimeout(buffered.timer);
+		this.messageBuffer.delete(key);
+		console.log(
+			`[WhatsApp Agent] Discarded ${buffered.texts.length} buffered message(s) from ${phoneNumber}: a human took over.`,
+		);
+	};
+
 	private bufferMessage = (
 		phoneNumber: string,
 		botPhoneNumberId: string,
 		text: string,
 	) => {
-		const existing = this.messageBuffer.get(phoneNumber);
+		const key = this.conversationKey(botPhoneNumberId, phoneNumber);
+		const existing = this.messageBuffer.get(key);
 
 		if (existing) {
 			clearTimeout(existing.timer);
 			existing.texts.push(text);
 		} else {
-			this.messageBuffer.set(phoneNumber, {
+			this.messageBuffer.set(key, {
 				botPhoneNumberId,
 				texts: [text],
 				timer: setTimeout(() => {}, 0), // placeholder, se reemplaza abajo
 			});
 		}
 
-		const entry = this.messageBuffer.get(phoneNumber)!;
+		const entry = this.messageBuffer.get(key)!;
 		entry.timer = setTimeout(() => {
-			this.messageBuffer.delete(phoneNumber);
+			this.messageBuffer.delete(key);
 			const combined = entry.texts.join('\n');
 			console.log(
 				`[WhatsApp Agent] Processing ${entry.texts.length} buffered message(s) from ${phoneNumber}: "${entry.texts.join(' | ')}"`,
@@ -274,7 +572,12 @@ export class WhatsAppAgentService {
 				err => {
 					console.error('[WhatsApp Agent] Error in processAndReply:', err);
 					this.logService
-						.logError({ context: 'processAndReply', error: err, phoneNumber })
+						.logError({
+							context: 'processAndReply',
+							error: err,
+							phoneNumber,
+							botPhoneNumberId: entry.botPhoneNumberId,
+						})
 						.catch(e =>
 							console.error('[WhatsApp Agent] Failed to save error log:', e),
 						);
@@ -291,21 +594,30 @@ export class WhatsAppAgentService {
 		// Cola serial por usuario: garantiza que no se procesen dos mensajes del
 		// mismo número en paralelo, evitando que un handler sobrescriba los
 		// cambios de sesión (carrito) que hizo otro handler concurrente.
-		const prev = this.processingQueue.get(phoneNumber);
+		const key = this.conversationKey(botPhoneNumberId, phoneNumber);
+		const prev = this.processingQueue.get(key);
 		let resolveCurrent!: () => void;
 		const current = new Promise<void>(resolve => {
 			resolveCurrent = resolve;
 		});
-		this.processingQueue.set(phoneNumber, current);
+		this.processingQueue.set(key, current);
 		if (prev) await prev;
 
 		try {
 			await this.doProcessAndReply(phoneNumber, botPhoneNumberId, text);
+
+			// Invariante al cerrar el turno, cualquiera que sea la salida: una
+			// conversación en pausa no conserva flujos a medias. Cubre tanto el
+			// traspaso como el caso en que un empleado tomó la conversación
+			// mientras este turno se procesaba.
+			if (await this.aiStateService.isPaused(botPhoneNumberId, phoneNumber)) {
+				await this.clearInFlightFlows(botPhoneNumberId, phoneNumber);
+			}
 		} finally {
 			resolveCurrent();
 			// Limpiar la entrada solo si sigue siendo la nuestra (no hay otra en cola)
-			if (this.processingQueue.get(phoneNumber) === current) {
-				this.processingQueue.delete(phoneNumber);
+			if (this.processingQueue.get(key) === current) {
+				this.processingQueue.delete(key);
 			}
 		}
 	};
@@ -318,18 +630,14 @@ export class WhatsAppAgentService {
 		const normalizedText = normalizeText(text);
 
 		// Read session first so we can reuse cached countryInfo
-		const raw = await redis.get(`session:${phoneNumber}`);
-		const session: UserSession = raw ? JSON.parse(raw) : {};
+		const session: UserSession = await getSession(botPhoneNumberId, phoneNumber);
 
 		// Use cached country info from session if available — avoids a DB query on every message
+		const line = getLineByPhoneNumberId(botPhoneNumberId);
 		const countryInfo =
 			session.lastCountryInfo ??
-			(await this.countryService.detectFromPhone(phoneNumber));
-		const countryPrefix = phoneNumber.startsWith('593')
-			? '+593'
-			: phoneNumber.startsWith('57')
-				? '+57'
-				: null;
+			(line ? await this.countryService.resolveForLine(line) : null);
+		const countryPrefix = this.countryPrefixOf(phoneNumber);
 		const now = Date.now();
 		const RESUMPTION_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutos
 		const hasActiveList = (session.lastProductList?.length ?? 0) > 0;
@@ -344,7 +652,7 @@ export class WhatsAppAgentService {
 			const isoCode = countryInfo?.isoCode ?? 'CO';
 			const localPhone = stripCallingCode(phoneNumber);
 			const [hadPrior, existingCustomer] = await Promise.all([
-				this.logService.hasInteractedBefore(phoneNumber),
+				this.logService.hasInteractedBefore(phoneNumber, botPhoneNumberId),
 				this.customerService.findByPhone(localPhone, isoCode),
 			]);
 			session.isFirstEverInteraction = !hadPrior;
@@ -388,12 +696,46 @@ export class WhatsAppAgentService {
 		}
 
 		session.lastActivityAt = now;
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(botPhoneNumberId, phoneNumber, session);
+
+		// ── Petición explícita de hablar con una persona, por encima del flujo ──
+		// Los interceptores de compra y cotización responden antes de que el NLU
+		// llegue a clasificar, así que sin esta salida un cliente atascado en el
+		// formulario pediría ayuda y el bot le seguiría pidiendo la cédula: justo
+		// el momento en que más falta hace el traspaso.
+		if (
+			(session.pendingPurchaseFlow || session.pendingQuoteFlow) &&
+			isExplicitHumanRequest(normalizedText)
+		) {
+			const handoffReply =
+				'Con gusto le comunico con una persona del equipo. Dejo aquí la conversación para que le atiendan. 🙌' +
+				this.offHoursHandoffNote();
+
+			session.lastBotMessage = handoffReply;
+			await saveSession(botPhoneNumberId, phoneNumber, session);
+			await this.sendReply(phoneNumber, botPhoneNumberId, handoffReply);
+			await this.aiStateService.pause(
+				botPhoneNumberId,
+				phoneNumber,
+				'customer_request',
+			);
+			console.log(
+				`[WhatsApp Agent] ${phoneNumber} asked for a human while in a flow; pausing AI.`,
+			);
+			this.logService
+				.logMessage({
+					phoneNumber,
+					botPhoneNumberId,
+					direction: 'outbound',
+					text: handoffReply,
+					intent: 'human_handoff',
+					countryPrefix: this.countryPrefixOf(phoneNumber),
+				})
+				.catch(err =>
+					console.error('[WhatsApp Agent] Error saving outbound log:', err),
+				);
+			return;
+		}
 
 		// ── Interceptor: flujo de compra activo ──
 		if (session.pendingPurchaseFlow) {
@@ -411,12 +753,7 @@ export class WhatsAppAgentService {
 				if (purchaseReply) {
 					session.lastBotMessage = purchaseReply;
 				}
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
+				await saveSession(botPhoneNumberId, phoneNumber, session);
 				if (purchaseReply) {
 					await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
 					await this.sendReply(phoneNumber, botPhoneNumberId, purchaseReply);
@@ -428,9 +765,7 @@ export class WhatsAppAgentService {
 						direction: 'outbound',
 						text: purchaseReply || session.lastBotMessage || '',
 						intent: 'purchase_flow',
-						countryPrefix: countryInfo
-							? `+${phoneNumber.startsWith('593') ? '593' : '57'}`
-							: null,
+						countryPrefix: this.countryPrefixOf(phoneNumber),
 					})
 					.catch(err =>
 						console.error('[WhatsApp Agent] Error saving outbound log:', err),
@@ -451,15 +786,8 @@ export class WhatsAppAgentService {
 			);
 			if (quoteReply !== null) {
 				session.lastBotMessage = quoteReply;
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
-				const countryPrefix = countryInfo
-					? `+${phoneNumber.startsWith('593') ? '593' : '57'}`
-					: null;
+				await saveSession(botPhoneNumberId, phoneNumber, session);
+				const countryPrefix = this.countryPrefixOf(phoneNumber);
 				await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
 				await this.sendReply(phoneNumber, botPhoneNumberId, quoteReply);
 				this.logService
@@ -488,6 +816,7 @@ export class WhatsAppAgentService {
 				await this.intentHandlerService.resolvePendingPresentationChoice(
 					session,
 					phoneNumber,
+					botPhoneNumberId,
 					text,
 					normalizedText,
 					countryInfo,
@@ -512,12 +841,7 @@ export class WhatsAppAgentService {
 					presentationUserTurn,
 					presentationBotTurn,
 				].slice(-CONVERSATION_HISTORY_MAX_TURNS * 2);
-				await redis.set(
-					`session:${phoneNumber}`,
-					JSON.stringify(session),
-					'EX',
-					SESSION_TTL_SECONDS,
-				);
+				await saveSession(botPhoneNumberId, phoneNumber, session);
 				await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
 				await this.sendReply(phoneNumber, botPhoneNumberId, presentationReply);
 				this.logService
@@ -711,6 +1035,7 @@ export class WhatsAppAgentService {
 						context: 'logMessage:inbound',
 						error: err,
 						phoneNumber,
+						botPhoneNumberId,
 						rawText: text,
 					})
 					.catch(e =>
@@ -758,7 +1083,13 @@ export class WhatsAppAgentService {
 			session.askedNameAndCity = true;
 		}
 
-		const replyText = await this.intentHandlerService.handle(intent, ctx);
+		const handlerReply = await this.intentHandlerService.handle(intent, ctx);
+		// Misma honestidad que en la salida desde un flujo: si la tienda está
+		// cerrada, no prometemos atención inmediata.
+		const replyText =
+			intent === 'human_handoff' && handlerReply
+				? handlerReply + this.offHoursHandoffNote()
+				: handlerReply;
 
 		// Marcar que el bot ya se presentó como Gema (solo si es el primer contacto real)
 		if (
@@ -799,16 +1130,27 @@ export class WhatsAppAgentService {
 			botTurn,
 		].slice(-CONVERSATION_HISTORY_MAX_TURNS * 2);
 
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(botPhoneNumberId, phoneNumber, session);
 
 		if (!handlerSentOwnMessage) {
 			await new Promise(resolve => setTimeout(resolve, REPLY_DELAY_MS));
 			await this.sendReply(phoneNumber, botPhoneNumberId, replyText);
+		}
+
+		// El cliente pidió hablar con una persona: la IA se aparta y deja la
+		// conversación al equipo, igual que si el personal hubiera escrito.
+		// Va DESPUÉS de enviar a propósito: `sendReply` suprime cualquier mensaje
+		// si la conversación ya está en pausa, así que pausar antes silenciaría
+		// la propia despedida y el cliente se quedaría sin respuesta.
+		if (intent === 'human_handoff') {
+			await this.aiStateService.pause(
+				botPhoneNumberId,
+				phoneNumber,
+				'customer_request',
+			);
+			console.log(
+				`[WhatsApp Agent] ${phoneNumber} asked for a human on line ${botPhoneNumberId}; pausing AI.`,
+			);
 		}
 
 		this.logService
@@ -826,16 +1168,17 @@ export class WhatsAppAgentService {
 					err,
 				);
 				this.logService
-					.logError({ context: 'logMessage:outbound', error: err, phoneNumber })
+					.logError({
+					context: 'logMessage:outbound',
+					error: err,
+					phoneNumber,
+					botPhoneNumberId,
+				})
 					.catch(e =>
 						console.error('[WhatsApp Agent] Failed to save error log:', e),
 					);
 			});
 	};
-
-	/**
-	 * Notifica al proveedor del pedido por WhatsApp.
-	 */
 
 	private handleIncomingImage = (
 		phoneNumber: string,
@@ -857,6 +1200,18 @@ export class WhatsAppAgentService {
 		botPhoneNumberId: string,
 		replyText: string,
 	) => {
+		// Último punto de control antes de salir. El turno puede tardar más de
+		// 15 s (debounce + LLM + REPLY_DELAY_MS), de sobra para que un empleado
+		// conteste mientras se procesa: sin esta comprobación la IA respondería
+		// encima de la persona. Cubre también los interceptores de flujo, que
+		// envían por su cuenta.
+		if (await this.aiStateService.isPaused(botPhoneNumberId, to)) {
+			console.log(
+				`[WhatsApp Agent] Reply to ${to} suppressed: a human took over mid-turn.`,
+			);
+			return;
+		}
+
 		if (!ENV.WHATSAPP_ACCESS_TOKEN) {
 			console.error('[WhatsApp Agent] WHATSAPP_ACCESS_TOKEN not set.');
 			this.logService
@@ -864,6 +1219,7 @@ export class WhatsAppAgentService {
 					context: 'sendReply',
 					error: new Error('WHATSAPP_ACCESS_TOKEN not set'),
 					phoneNumber: to,
+					botPhoneNumberId,
 				})
 				.catch(e =>
 					console.error('[WhatsApp Agent] Failed to save error log:', e),
@@ -872,7 +1228,7 @@ export class WhatsAppAgentService {
 		}
 
 		try {
-			await axios.post(
+			const response = await axios.post(
 				`https://graph.facebook.com/v21.0/${botPhoneNumberId}/messages`,
 				{
 					messaging_product: 'whatsapp',
@@ -890,13 +1246,23 @@ export class WhatsAppAgentService {
 					timeout: WHATSAPP_API_TIMEOUT_MS,
 				},
 			);
+			// Se registra el wamid propio para que su eventual echo no se
+			// interprete como una intervención humana.
+			await this.aiStateService.registerSelfSend(
+				response.data?.messages?.[0]?.id ?? null,
+			);
 			console.log(`[WhatsApp Agent] Reply sent to ${to}`);
 		} catch (error) {
 			if (error instanceof AxiosError) {
 				if (error.code === 'ECONNABORTED') {
 					console.error(`[WhatsApp Agent] Timeout sending reply to ${to}`);
 					this.logService
-						.logError({ context: 'sendReply:timeout', error, phoneNumber: to })
+						.logError({
+							context: 'sendReply:timeout',
+							error,
+							phoneNumber: to,
+							botPhoneNumberId,
+						})
 						.catch(e =>
 							console.error('[WhatsApp Agent] Failed to save error log:', e),
 						);
@@ -910,6 +1276,7 @@ export class WhatsAppAgentService {
 							context: `sendReply:apiError:${error.response?.status ?? 'unknown'}`,
 							error,
 							phoneNumber: to,
+							botPhoneNumberId,
 						})
 						.catch(e =>
 							console.error('[WhatsApp Agent] Failed to save error log:', e),
@@ -921,7 +1288,12 @@ export class WhatsAppAgentService {
 					error,
 				);
 				this.logService
-					.logError({ context: 'sendReply:unexpected', error, phoneNumber: to })
+					.logError({
+						context: 'sendReply:unexpected',
+						error,
+						phoneNumber: to,
+						botPhoneNumberId,
+					})
 					.catch(e =>
 						console.error('[WhatsApp Agent] Failed to save error log:', e),
 					);

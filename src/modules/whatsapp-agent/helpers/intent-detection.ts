@@ -79,3 +79,38 @@ export function isFarewellOnly(normalizedText: string): boolean {
 	const hasAnchor = tokens.some(w => anchorWords.has(w));
 	return allInVocabulary && hasAnchor;
 }
+
+/**
+ * Petición explícita de hablar con una persona. Se usa SOLO para dejar salir al
+ * cliente de un flujo en curso (compra o cotización): ahí los interceptores
+ * responden antes de que el NLU llegue a clasificar, así que sin esto un
+ * cliente atascado en el formulario pediría ayuda y el bot le seguiría pidiendo
+ * la cédula. Fuera de los flujos, la intención la sigue decidiendo el LLM.
+ *
+ * El patrón es deliberadamente estrecho —verbo + "persona/humano/asesor"— para
+ * no confundirlo con una respuesta legítima del formulario. Convive con las
+ * expresiones de cancelación que los propios flujos ya usan.
+ */
+export function isExplicitHumanRequest(normalizedText: string): boolean {
+	// "hablar con una persona", "pasame con un asesor", "comunicar con alguien".
+	// Entre el verbo y el sustantivo solo se admiten conectores: así "quiero la
+	// vela de persona grande" no se confunde con una petición de traspaso.
+	const contactarConPersona =
+		/\b(hablar|conversar|comunicar|comunicarme|contactar|contactarme|pasar|pasame|pasenme|transferir|atienda|atiendan)\s+(con\s+)?(un|una|algun|alguna)?\s*(persona|humano|humana|asesor|asesora|agente|vendedor|vendedora|operador|operadora|alguien)\b/i;
+
+	// "quiero hablar", "necesito comunicarme" a secas. El lookahead descarta
+	// hablar *de* algo ("quiero hablar de la cotización"), que es conversación
+	// normal y no una petición de traspaso.
+	const quererHablar =
+		/\b(quiero|necesito|deseo|puedo|podria|quisiera)\s+(hablar|conversar|comunicarme|contactarme)\b(?!\s+(de|del|sobre|acerca)\b)/i;
+
+	// "quiero un asesor", "necesito una persona".
+	const quererPersona =
+		/\b(quiero|necesito|deseo|quisiera)\s+(un|una)\s+(persona|humano|humana|asesor|asesora|agente|vendedor|vendedora|operador|operadora)\b/i;
+
+	return (
+		contactarConPersona.test(normalizedText) ||
+		quererHablar.test(normalizedText) ||
+		quererPersona.test(normalizedText)
+	);
+}

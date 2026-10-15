@@ -1,13 +1,14 @@
-import { redis } from '../../../config/redis';
+import { getSession, saveSession } from '../session.store';
+import { getLineByPhoneNumberId } from '../lines';
 import { ENV } from '../../../config/env';
 import { WhatsAppService } from '../../whatsapp/service';
 import { QuoteService } from '../../quote/service';
 import { CountryService } from './country.service';
+import { AiStateService } from './ai-state.service';
 import { BillingService } from '../../billing/service';
 import { BillingStatus, PaymentMethod } from '../../billing/types';
-import { SESSION_TTL_SECONDS } from '../constants';
-import { formatPrice, isWithinOfficeHours } from '../utils';
-import { PendingPurchaseFlow, UserSession } from '../types';
+import { isWithinOfficeHours } from '../utils';
+import { UserSession } from '../types';
 import { StockItemModel } from '../../stock-item/model';
 import { ProductVariantModel } from '../../product-variant/model';
 
@@ -24,6 +25,7 @@ export class MediaHandlerService {
 		private whatsAppService: WhatsAppService,
 		private sendReply: SendReplyFn,
 		private billingService: BillingService,
+		private aiStateService: AiStateService,
 	) {}
 
 	handleIncomingImage = (
@@ -33,12 +35,16 @@ export class MediaHandlerService {
 		mediaType: 'image' | 'document',
 		processingQueue: Map<string, Promise<void>>,
 	): Promise<void> => {
-		const prev = processingQueue.get(phoneNumber);
+		// Misma clave que el agente (<phoneNumberId>:<teléfono>): comparten Map,
+		// así que un comprobante y un texto del mismo cliente en la misma línea
+		// se siguen procesando en serie, y dos líneas no se bloquean entre sí.
+		const key = `${botPhoneNumberId}:${phoneNumber}`;
+		const prev = processingQueue.get(key);
 		let resolveCurrent!: () => void;
 		const current = new Promise<void>(resolve => {
 			resolveCurrent = resolve;
 		});
-		processingQueue.set(phoneNumber, current);
+		processingQueue.set(key, current);
 		const run = async () => {
 			if (prev) await prev;
 			try {
@@ -50,8 +56,8 @@ export class MediaHandlerService {
 				);
 			} finally {
 				resolveCurrent();
-				if (processingQueue.get(phoneNumber) === current) {
-					processingQueue.delete(phoneNumber);
+				if (processingQueue.get(key) === current) {
+					processingQueue.delete(key);
 				}
 			}
 		};
@@ -64,8 +70,18 @@ export class MediaHandlerService {
 		mediaId: string,
 		mediaType: 'image' | 'document',
 	): Promise<void> => {
-		const raw = await redis.get(`session:${phoneNumber}`);
-		const session: UserSession = raw ? JSON.parse(raw) : {};
+		// Segunda comprobación: la media llega por una vía propia y se procesa en
+		// cola, así que un empleado puede haber tomado la conversación entre la
+		// recepción y este punto. Procesar un comprobante aquí generaría una
+		// factura mientras una persona ya está atendiendo el caso.
+		if (await this.aiStateService.isPaused(botPhoneNumberId, phoneNumber)) {
+			console.log(
+				`[WhatsApp Agent] Media from ${phoneNumber} skipped: a human is handling the conversation.`,
+			);
+			return;
+		}
+
+		const session: UserSession = await getSession(botPhoneNumberId, phoneNumber);
 
 		const step = session.pendingPurchaseFlow?.step;
 		if (
@@ -80,8 +96,10 @@ export class MediaHandlerService {
 		}
 
 		const flow = session.pendingPurchaseFlow!;
-		const countryInfo = await this.countryService.detectFromPhone(phoneNumber);
-		const isoCode = countryInfo?.isoCode ?? 'CO';
+		const line = getLineByPhoneNumberId(botPhoneNumberId);
+		const countryInfo = line
+			? await this.countryService.resolveForLine(line)
+			: null;
 
 		const shopId =
 			flow.quoteShopId ??
@@ -157,7 +175,7 @@ export class MediaHandlerService {
 						shipping: '0',
 						comments: 'Pedido realizado por WhatsApp',
 						currency: flow.currency ?? 'USD',
-						requestedBy: ENV.WHATSAPP_BOT_USER_ID,
+						requestedBy: ENV.AGENT_SYSTEM_USER_ID,
 						clientRequestId: flow.paymentRef,
 						...(flow.quoteId ? { quoteId: flow.quoteId } : {}),
 						items: validItems.map(i => ({
@@ -186,7 +204,9 @@ export class MediaHandlerService {
 					},
 				});
 				billSerial = billingResult.newBilling?.serialNumber;
-				console.log(`[WhatsApp Agent] Billing created: serial=${billSerial}`);
+				console.log(
+					`[WhatsApp Agent] Billing created: serial=${billSerial}, receipt=${mediaType}:${mediaId}`,
+				);
 			} catch (billingErr) {
 				console.error('[WhatsApp Agent] Error creating billing:', billingErr);
 			}
@@ -202,20 +222,11 @@ export class MediaHandlerService {
 			);
 		}
 
-		// Notificar al vendedor (después del billing para incluir el serial)
-		await this.notifyVendor(
-			botPhoneNumberId,
-			isoCode,
-			flow,
-			mediaId,
-			mediaType,
-			billSerial,
-		).catch(err =>
-			console.error(
-				'[WhatsApp Agent] Error notifying vendor with receipt:',
-				err,
-			),
-		);
+		// El aviso de pedido nuevo a la tienda se retiró: con Coexistence el
+		// personal ya ve el comprobante y la confirmación en este mismo chat, y
+		// la línea del agente es la propia tienda, así que el aviso se enviaría a
+		// sí misma. Queda pendiente decidir cómo avisar de una venta hecha por la
+		// IA sin duplicar lo que ya está a la vista.
 
 		// Eliminar cotización si se creó la factura exitosamente
 		if (billSerial && flow.quoteId) {
@@ -243,12 +254,7 @@ export class MediaHandlerService {
 		// "gracias por su compra / un gusto atenderlo", no a "me avisa cualquier cosa".
 		session.lastPurchaseAt = Date.now();
 
-		await redis.set(
-			`session:${phoneNumber}`,
-			JSON.stringify(session),
-			'EX',
-			SESSION_TTL_SECONDS,
-		);
+		await saveSession(botPhoneNumberId, phoneNumber, session);
 
 		const offHoursNote = !isWithinOfficeHours()
 			? '\n\n⏰ Nuestro equipo está fuera de horario ahora mismo (L–V 8–18h, Sáb 8–14h), pero recibirán su pedido y le contactarán a la brevedad.'
@@ -261,84 +267,5 @@ export class MediaHandlerService {
 			`\n\n¡Gracias por su compra! 🎉`;
 
 		await this.sendReply(phoneNumber, botPhoneNumberId, reply);
-	};
-
-	private notifyVendor = async (
-		botPhoneNumberId: string,
-		isoCode: string,
-		flow: PendingPurchaseFlow,
-		receiptMediaId?: string,
-		receiptMediaType?: 'image' | 'document',
-		billSerial?: string,
-	): Promise<void> => {
-		const vendorPhone =
-			isoCode === 'CO' ? ENV.SHOP_CO_PHONE_NUMBER : ENV.SHOP_EC_PHONE_NUMBER;
-
-		if (!vendorPhone) {
-			console.warn(
-				`[WhatsApp Agent] No vendor phone configured for isoCode=${isoCode}`,
-			);
-			return;
-		}
-
-		const d = flow.collectedData ?? {};
-		const itemLines =
-			flow.items && flow.items.length > 0
-				? flow.items
-						.map(item => {
-							const name = item.variantName
-								? `${item.productName} – ${item.variantName}`
-								: item.productName;
-							return `  • ${item.quantity}x ${name}`;
-						})
-						.join('\n')
-				: `• Revisar factura${billSerial ? ` #${billSerial}` : ''}`;
-
-		const totalLine =
-			flow.total != null
-				? `\nTotal: ${formatPrice(String(flow.total), flow.currency ?? 'USD')}`
-				: '';
-
-		const refLine = flow.paymentRef ? `\nRef pago: ${flow.paymentRef}` : '';
-		const quoteRefLine = billSerial ? `\nFactura: #${billSerial}` : '';
-
-		const message =
-			`📦 *Nueva orden de compra*` +
-			`\n\nCliente: ${d.fullName ?? '-'}` +
-			`\nCédula: ${d.dni ?? '-'}` +
-			`\nTeléfono: ${d.phoneNumber ?? '-'}` +
-			`\nDirección: ${d.location ?? '-'}` +
-			`\nCiudad: ${d.cityName ?? '-'}` +
-			`\n\nProductos:\n${itemLines}` +
-			totalLine +
-			refLine +
-			quoteRefLine +
-			`\n\n✅ El cliente confirmó el pago. Por favor, verificar y procesar el pedido.`;
-
-		if (receiptMediaId) {
-			const sendMedia =
-				receiptMediaType === 'document'
-					? this.whatsAppService.sendDocument(
-							vendorPhone,
-							receiptMediaId,
-							botPhoneNumberId,
-							'comprobante.pdf',
-							message,
-						)
-					: this.whatsAppService.sendImage(
-							vendorPhone,
-							receiptMediaId,
-							botPhoneNumberId,
-							message,
-						);
-			await sendMedia.catch(err =>
-				console.error(
-					'[WhatsApp Agent] Error forwarding receipt to vendor:',
-					err,
-				),
-			);
-		} else {
-			await this.sendReply(vendorPhone, botPhoneNumberId, message);
-		}
 	};
 }

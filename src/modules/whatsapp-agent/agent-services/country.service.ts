@@ -1,8 +1,8 @@
-import { ENV } from '../../../config/env';
 import { ShopModel } from '../../shop/model';
 import { StockModel } from '../../stock/model';
 import { CountryModel } from '../../country/model';
 import { WhatsAppLogService } from '../logging/log.service';
+import { WhatsAppLine } from '../lines';
 
 export type CountryContext = {
 	currency: string;
@@ -14,36 +14,20 @@ export type CountryContext = {
 export class CountryService {
 	constructor(private logService: WhatsAppLogService) {}
 
-	detectFromPhone = async (
-		phoneNumber: string,
+	/**
+	 * Resuelve el contexto operativo (tienda, stock, moneda, país) a partir de la
+	 * LÍNEA por la que entró el mensaje, no del teléfono del cliente.
+	 *
+	 * Un cliente puede escribir a cualquiera de las líneas, así que su prefijo
+	 * telefónico no dice nada sobre qué catálogo, precios o inventario le
+	 * corresponden: eso lo define el número del negocio al que escribió.
+	 */
+	resolveForLine = async (
+		line: WhatsAppLine,
 	): Promise<CountryContext | null> => {
 		try {
-			// Detect callingCode from number (E.164 format without +)
-			const prefixes = ['593', '57']; // Ecuador first (longer prefix)
-			const matchedPrefix = prefixes.find(p => phoneNumber.startsWith(p));
-
-			// ── TESTING BLOCK ──────────────────────────────────────────────────
-			// TEST_FORCE_COUNTRY_ISO forces a specific country ignoring the phone
-			// prefix. Allows testing Ecuador bot from Colombia.
-			// ⚠️ Remove or leave as '' in production.
-			const forcedIso = ENV.TEST_FORCE_COUNTRY_ISO?.toUpperCase();
-			const effectivePrefix =
-				forcedIso === 'EC' ? '593' : forcedIso === 'CO' ? '57' : matchedPrefix;
-			// ── END TESTING BLOCK ──────────────────────────────────────────────
-
-			if (!effectivePrefix) {
-				console.warn(
-					`[WhatsApp Agent] Unknown country prefix for ${phoneNumber}`,
-				);
-				return null;
-			}
-
-			// Resolve shop by country using slug (same convention as customer-balance)
-			const shopSlug =
-				effectivePrefix === '57' ? 'manuarte-barranquilla' : 'manuarte-quito';
-
 			const shop = await ShopModel.findOne({
-				where: { slug: shopSlug },
+				where: { slug: line.shopSlug },
 				attributes: ['id', 'currency'],
 				include: [
 					{
@@ -59,23 +43,32 @@ export class CountryService {
 				],
 			});
 
-			if (!shop) return null;
+			if (!shop) {
+				console.error(
+					`[WhatsApp Agent] Shop not found for line ${line.isoCode} (slug: ${line.shopSlug})`,
+				);
+				return null;
+			}
 
 			const stock = shop.get('stock') as { id: string } | null;
 			const country = shop.get('country') as { isoCode: string } | null;
 			const stockIds = stock ? [stock.id] : [];
 			const currency = (shop.get('currency') as string | undefined) ?? 'USD';
-			const isoCode =
-				country?.isoCode ?? (effectivePrefix === '57' ? 'CO' : 'EC');
+			const isoCode = country?.isoCode ?? line.isoCode;
 
 			console.log(
-				`[WhatsApp Agent] Country detected: +${effectivePrefix}, currency: ${currency}, shop: ${shopSlug}, stocks: ${stockIds.join(', ')}`,
+				`[WhatsApp Agent] Line context resolved: phoneNumberId=${line.phoneNumberId}, ` +
+					`shop=${line.shopSlug}, currency=${currency}, isoCode=${isoCode}, stocks=${stockIds.join(', ')}`,
 			);
 			return { currency, stockIds, shopId: shop.id, isoCode };
 		} catch (error) {
-			console.error('[WhatsApp Agent] Error detecting country:', error);
+			console.error('[WhatsApp Agent] Error resolving line context:', error);
 			this.logService
-				.logError({ context: 'detectCountryFromPhone', error, phoneNumber })
+				.logError({
+					context: 'resolveLineContext',
+					error,
+					botPhoneNumberId: line.phoneNumberId,
+				})
 				.catch(e =>
 					console.error('[WhatsApp Agent] Failed to save error log:', e),
 				);

@@ -281,3 +281,56 @@ export interface UserSession {
 	 *  genéricas de "me avisa cualquier cosa". */
 	lastPurchaseAt?: number;
 }
+
+// ── Payload del webhook de WhatsApp ───────────────────────────────────────
+// Solo se declaran los campos que el agente lee. Con Coexistence el mismo
+// webhook entrega mensajes de clientes (`messages`) y mensajes que el personal
+// escribió desde WhatsApp Business App o WhatsApp Web (`message_echoes`), que
+// llegan en un change con `field: 'smb_message_echoes'`.
+
+/** Un mensaje o un echo: comparten forma salvo los campos de edit/revoke. */
+export interface WebhookMessage {
+	/** Remitente. En un echo es el número del NEGOCIO, no el del cliente. */
+	from?: string;
+	/** Destinatario. Presente solo en echoes: es el número del CLIENTE. */
+	to?: string;
+	id?: string;
+	timestamp?: string;
+	type?: string;
+	text?: { body?: string };
+	image?: { id?: string };
+	document?: { id?: string };
+	/** Echo de edición: referencia al original y el contenido nuevo. */
+	edit?: {
+		original_message_id?: string;
+		message?: { text?: { body?: string } };
+	};
+	/** Echo de eliminación. */
+	revoke?: { original_message_id?: string };
+}
+
+export interface WebhookValue {
+	messaging_product?: string;
+	metadata?: {
+		display_phone_number?: string;
+		phone_number_id?: string;
+	};
+	messages?: WebhookMessage[];
+	/** Mensajes del personal (campo `smb_message_echoes`). */
+	message_echoes?: WebhookMessage[];
+	statuses?: unknown[];
+}
+
+export interface WebhookChange {
+	/** Discrimina el tipo de evento: 'messages' | 'smb_message_echoes' | … */
+	field?: string;
+	value?: WebhookValue;
+}
+
+export interface CoexistenceWebhookPayload {
+	object?: string;
+	entry?: Array<{
+		id?: string;
+		changes?: WebhookChange[];
+	}>;
+}
