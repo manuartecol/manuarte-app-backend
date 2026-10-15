@@ -7,6 +7,8 @@ export class WhatsAppErrorLogModel extends Model {
 	public errorMessage!: string;
 	public errorStack!: string | null;
 	public phoneNumber!: string | null;
+	/** Línea por la que se produjo el error. Null cuando no se pudo determinar. */
+	public botPhoneNumberId!: string | null;
 	public rawText!: string | null;
 }
 
@@ -31,6 +33,10 @@ WhatsAppErrorLogModel.init(
 			allowNull: true,
 		},
 		phoneNumber: {
+			type: DataTypes.STRING,
+			allowNull: true,
+		},
+		botPhoneNumberId: {
 			type: DataTypes.STRING,
 			allowNull: true,
 		},

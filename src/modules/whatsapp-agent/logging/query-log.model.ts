@@ -4,7 +4,7 @@ import { sequelize } from '../../../config/database';
 export class WhatsAppQueryLogModel extends Model {
 	public id!: string;
 	public phoneNumber!: string;
-	public phoneNumberId!: string;
+	public botPhoneNumberId!: string;
 	public rawText!: string;
 	public searchTerms!: string[];
 	public productFound!: boolean;

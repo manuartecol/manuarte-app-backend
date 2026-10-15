@@ -1,14 +1,23 @@
 import { DataTypes, Model } from 'sequelize';
 import { sequelize } from '../../../config/database';
 
+/**
+ * Quién originó el mensaje. `direction` dice si entra o sale; `source`
+ * distingue lo que el agente envió de lo que una persona escribió desde
+ * WhatsApp Business App, que con Coexistence sale por el mismo número.
+ */
+export type MessageSource = 'customer' | 'ai' | 'human';
+
 export class WhatsAppMessageLogModel extends Model {
 	public id!: string;
 	public phoneNumber!: string;
-	public phoneNumberId!: string;
+	public botPhoneNumberId!: string;
 	public direction!: 'inbound' | 'outbound';
 	public text!: string;
 	public intent!: string | null;
 	public countryPrefix!: string | null;
+	public source!: MessageSource | null;
+	public messageId!: string | null;
 }
 
 WhatsAppMessageLogModel.init(
@@ -41,6 +50,14 @@ WhatsAppMessageLogModel.init(
 		},
 		countryPrefix: {
 			type: DataTypes.STRING(10),
+			allowNull: true,
+		},
+		source: {
+			type: DataTypes.STRING(16),
+			allowNull: true,
+		},
+		messageId: {
+			type: DataTypes.STRING,
 			allowNull: true,
 		},
 		createdDate: {
