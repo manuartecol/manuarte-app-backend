@@ -85,8 +85,8 @@ export class DocsController {
 
 			const shopPhone =
 				quote.countryIsoCode === 'CO'
-					? ENV.SHOP_CO_PHONE_NUMBER
-					: ENV.SHOP_EC_PHONE_NUMBER;
+					? ENV.SHOP_NOTIFY_CO_PHONE
+					: ENV.SHOP_NOTIFY_EC_PHONE;
 
 			if (shopPhone) {
 				this.whatsAppService
@@ -163,8 +163,8 @@ export class DocsController {
 
 			const shopPhone =
 				billing.countryIsoCode === 'CO'
-					? ENV.SHOP_CO_PHONE_NUMBER
-					: ENV.SHOP_EC_PHONE_NUMBER;
+					? ENV.SHOP_NOTIFY_CO_PHONE
+					: ENV.SHOP_NOTIFY_EC_PHONE;
 
 			if (shopPhone) {
 				this.whatsAppService

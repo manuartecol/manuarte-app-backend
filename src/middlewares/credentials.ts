@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { ENV } from '../config/env';
 
-const allowedOrigins = ['http://localhost:3000', ENV.CLIENT_URL];
+const allowedOrigins = ['http://localhost:3000', ENV.FRONTEND_URL];
 
 export const credentials = (
 	req: Request,

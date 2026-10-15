@@ -1,7 +1,7 @@
 import { CorsOptions } from 'cors';
 import { ENV } from '../config/env';
 
-const allowedOrigins = ['http://localhost:3000', ENV.CLIENT_URL];
+const allowedOrigins = ['http://localhost:3000', ENV.FRONTEND_URL];
 
 export const corsOptions: CorsOptions = {
 	origin: (
