@@ -124,6 +124,14 @@ export const ENV = {
 		process.env.PAYMENT_QR_EC_INFO ||
 		'[QR de transferencia Ecuador - pendiente de configurar]',
 
+	/**
+	 * Habilita los comandos de prueba en el chat (ver `TEST_COMMANDS` en
+	 * service.ts). Apagada por defecto: con clientes reales el comando sería
+	 * visible en su conversación, porque en Coexistence no hay canal privado.
+	 */
+	WHATSAPP_AGENT_TEST_COMMANDS:
+		process.env.WHATSAPP_AGENT_TEST_COMMANDS === 'true',
+
 	// ── Overrides de prueba ──────────────────────────────────────────────────
 	// Con 'true' fuerza PayPhone aunque el país sea Colombia. Dejar vacío en
 	// producción.

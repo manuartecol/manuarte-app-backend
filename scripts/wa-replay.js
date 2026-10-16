@@ -10,11 +10,14 @@
  *   npm run wa:replay -- echo-human-agent
  *   npm run wa:replay -- inbound-customer --fresh-ids
  *   npm run wa:replay -- inbound-customer --from 573001112233
+ *   npm run wa:replay -- inbound-customer --line EC
  *   npm run wa:replay -- inbound-customer --url http://localhost:5050
  *   npm run wa:replay -- --list
  *
  * Los fixtures NO llevan la línea escrita: usan marcadores que se resuelven
- * aquí desde el .env, igual que los lee la aplicación. Así no vuelven a quedar
+ * aquí desde el .env, igual que los lee la aplicación. Por eso el mismo fixture
+ * sirve para cualquier línea: --line elige cuál (CO por defecto), que es como se
+ * comprueba que dos líneas no comparten sesión ni pausa. Así no vuelven a quedar
  * obsoletos cada vez que cambia el número, que es justo lo que pasó cuando la
  * línea de pruebas se sustituyó por la de la tienda.
  *
@@ -45,8 +48,10 @@ const listFixtures = () =>
 		.map(f => f.replace(/\.json$/, ''))
 		.sort();
 
-const firstAllowlisted = () =>
-	(process.env.WHATSAPP_LINE_CO_AI_ALLOWLIST || '')
+const LINES = ['CO', 'EC'];
+
+const firstAllowlisted = iso =>
+	(process.env[`WHATSAPP_LINE_${iso}_AI_ALLOWLIST`] || '')
 		.split(',')
 		.map(n => n.replace(/\D/g, ''))
 		.find(n => n.length > 0) || '';
@@ -56,22 +61,22 @@ const firstAllowlisted = () =>
  * mensaje de error dice qué configurar, en vez de enviar un payload a medias
  * que el agente descartaría en silencio.
  */
-const placeholders = from => ({
+const placeholders = (from, iso) => ({
 	__LINE_PHONE_NUMBER_ID__: {
-		value: process.env.WHATSAPP_LINE_CO_PHONE_NUMBER_ID,
-		hint: 'WHATSAPP_LINE_CO_PHONE_NUMBER_ID en .env',
+		value: process.env[`WHATSAPP_LINE_${iso}_PHONE_NUMBER_ID`],
+		hint: `WHATSAPP_LINE_${iso}_PHONE_NUMBER_ID en .env`,
 	},
 	__LINE_BUSINESS_PHONE__: {
-		value: process.env.WHATSAPP_LINE_CO_BUSINESS_PHONE,
-		hint: 'WHATSAPP_LINE_CO_BUSINESS_PHONE en .env',
+		value: process.env[`WHATSAPP_LINE_${iso}_BUSINESS_PHONE`],
+		hint: `WHATSAPP_LINE_${iso}_BUSINESS_PHONE en .env`,
 	},
 	__CUSTOMER_PHONE__: {
-		value: from || firstAllowlisted(),
-		hint: '--from <número>, o el primer número de WHATSAPP_LINE_CO_AI_ALLOWLIST',
+		value: from || firstAllowlisted(iso),
+		hint: `--from <número>, o el primer número de WHATSAPP_LINE_${iso}_AI_ALLOWLIST`,
 	},
 	__SHOP_PHONE__: {
-		value: process.env.SHOP_NOTIFY_CO_PHONE,
-		hint: 'SHOP_NOTIFY_CO_PHONE en .env',
+		value: process.env[`SHOP_NOTIFY_${iso}_PHONE`],
+		hint: `SHOP_NOTIFY_${iso}_PHONE en .env`,
 	},
 });
 
@@ -111,7 +116,7 @@ const main = async () => {
 		console.log('Fixtures disponibles:\n');
 		for (const name of listFixtures()) console.log(`  ${name}`);
 		console.log(
-			'\nUso: npm run wa:replay -- <fixture> [--from <número>] [--url <base>] [--fresh-ids]',
+			'\nUso: npm run wa:replay -- <fixture> [--line CO|EC] [--from <número>] [--url <base>] [--fresh-ids]',
 		);
 		process.exit(args.length === 0 ? 1 : 0);
 	}
@@ -124,6 +129,12 @@ const main = async () => {
 	const baseUrl = valueAfter('--url') || DEFAULT_URL;
 	const from = (valueAfter('--from') || '').replace(/\D/g, '');
 	const freshIds = args.includes('--fresh-ids');
+	const iso = (valueAfter('--line') || 'CO').toUpperCase();
+
+	if (!LINES.includes(iso)) {
+		console.error(`Línea desconocida: ${iso}. Opciones: ${LINES.join(', ')}`);
+		process.exit(1);
+	}
 
 	const fixturePath = path.join(FIXTURES_DIR, `${name}.json`);
 	if (!fs.existsSync(fixturePath)) {
@@ -133,7 +144,7 @@ const main = async () => {
 	}
 
 	const raw = fs.readFileSync(fixturePath, 'utf8');
-	const table = placeholders(from);
+	const table = placeholders(from, iso);
 	const needed = placeholdersIn(raw, Object.keys(table));
 
 	const missing = needed.filter(n => !table[n].value);
@@ -159,7 +170,9 @@ const main = async () => {
 	});
 
 	const target = `${baseUrl}${WEBHOOK_PATH}`;
-	console.log(`POST ${target}  (fixture: ${name}${freshIds ? ', fresh ids' : ''})`);
+	console.log(
+		`POST ${target}  (fixture: ${name}, línea: ${iso}${freshIds ? ', fresh ids' : ''})`,
+	);
 	for (const [marker, value] of Object.entries(resolved)) {
 		console.log(`  ${marker} = ${value}`);
 	}

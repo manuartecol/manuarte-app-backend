@@ -111,6 +111,17 @@ export class AiStateService {
 		);
 	};
 
+	/**
+	 * Levanta la pausa. La reactivación normal es la expiración del TTL: esto
+	 * existe solo para el comando de prueba, que permite al equipo devolver la
+	 * conversación a la IA sin esperar.
+	 */
+	clearPause = async (
+		phoneNumberId: string,
+		customerPhone: string,
+	): Promise<boolean> =>
+		(await redis.del(this.pauseKey(phoneNumberId, customerPhone))) === 1;
+
 	isPaused = async (
 		phoneNumberId: string,
 		customerPhone: string,

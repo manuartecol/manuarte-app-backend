@@ -5,6 +5,7 @@ Meta entregue un evento real. Se envían con:
 
 ```bash
 npm run wa:replay -- <fixture>
+npm run wa:replay -- <fixture> --line EC
 npm run wa:replay -- --list
 ```
 
@@ -22,12 +23,16 @@ los once fixtures quedaron apuntando a un `phone_number_id` ya inexistente: el
 webhook devolvía 200 y el agente lo ignoraba por línea no registrada, así que
 parecían funcionar sin ejercitar nada.
 
-| Marcador | Sale de |
+`--line CO|EC` elige la línea; por defecto `CO`. Como el mismo fixture se
+resuelve contra cualquiera de las dos, enviarlo a una y a otra es la forma de
+comprobar que no comparten sesión ni pausa.
+
+| Marcador | Sale de (`<L>` = línea elegida) |
 |---|---|
-| `__LINE_PHONE_NUMBER_ID__` | `WHATSAPP_LINE_CO_PHONE_NUMBER_ID` |
-| `__LINE_BUSINESS_PHONE__` | `WHATSAPP_LINE_CO_BUSINESS_PHONE` |
-| `__CUSTOMER_PHONE__` | `--from <número>`, o el primer número de `WHATSAPP_LINE_CO_AI_ALLOWLIST` |
-| `__SHOP_PHONE__` | `SHOP_NOTIFY_CO_PHONE` |
+| `__LINE_PHONE_NUMBER_ID__` | `WHATSAPP_LINE_<L>_PHONE_NUMBER_ID` |
+| `__LINE_BUSINESS_PHONE__` | `WHATSAPP_LINE_<L>_BUSINESS_PHONE` |
+| `__CUSTOMER_PHONE__` | `--from <número>`, o el primer número de `WHATSAPP_LINE_<L>_AI_ALLOWLIST` |
+| `__SHOP_PHONE__` | `SHOP_NOTIFY_<L>_PHONE` |
 
 Si falta alguno, el script **no envía nada** y dice qué configurar, en vez de
 mandar un payload que se descartaría en silencio.
@@ -61,7 +66,7 @@ concreto:
 | `echo-batch-multiple` | Dos echoes en un payload → **ambos** procesados |
 | `echo-self-send` | `wamid` registrado como envío propio → no pausa |
 | `echo-revoke` | Mensaje eliminado → no se trata como actividad nueva |
-| `echo-to-shop-number` | Echo dirigido a un número de tienda → ignorado por denylist. Hoy `SHOP_NOTIFY_CO_PHONE` coincide con el número de la propia línea, así que prueba la denylist pero no distingue ambos casos |
+| `echo-to-shop-number` | Echo dirigido a un número de tienda → ignorado por denylist. Con `--line CO`, `SHOP_NOTIFY_CO_PHONE` coincide hoy con el número de la propia línea, así que prueba la denylist sin distinguir ambos casos; con `--line EC` el número de tienda sí es distinto del de la línea |
 
 `echo-self-send` solo demuestra su efecto si el `wamid` está registrado en
 Redis. Para provocarlo de verdad, basta con que el agente haya enviado una

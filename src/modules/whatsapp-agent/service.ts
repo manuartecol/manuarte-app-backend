@@ -61,6 +61,29 @@ export class WhatsAppAgentService {
 	private messageBuffer = new Map<string, BufferEntry>();
 	private processingQueue = new Map<string, Promise<void>>();
 
+	/**
+	 * Comando de pruebas que el equipo escribe en el chat para devolver la
+	 * conversación a la IA sin esperar al TTL. Solo se reconoce en un echo —es
+	 * decir, escrito por el personal—, nunca en un mensaje del cliente: si no,
+	 * un cliente podría reactivar la IA mientras una persona lo atiende.
+	 *
+	 * Requiere WHATSAPP_AGENT_TEST_COMMANDS=true, que viene apagada. En
+	 * Coexistence no hay canal privado, así que el cliente ve el comando en su
+	 * conversación: es aceptable mientras ambos lados son personas probando, y
+	 * no debe estar activo con clientes reales.
+	 */
+	private readonly RESUME_COMMAND = '#gema-on';
+
+	/**
+	 * Acepta `#gema-on`, `#gema on` y `#gemaon`, en cualquier capitalización.
+	 * La tolerancia es deliberada: con una comparación exacta, una errata del
+	 * personal no reactivaría la IA sino que la *pausaría* —el comando pasaría
+	 * por mensaje normal— y quien lo escribió creería haber hecho lo contrario
+	 * de lo que hizo. Nadie escribe esto por accidente.
+	 */
+	private isResumeCommand = (text: string | null | undefined): boolean =>
+		/^#gema[\s-]?on$/i.test((text ?? '').trim());
+
 	private conversationKey = (
 		botPhoneNumberId: string,
 		phoneNumber: string,
@@ -75,6 +98,38 @@ export class WhatsAppAgentService {
 		isWithinOfficeHours()
 			? ''
 			: `\n\n⏰ Nuestro equipo está fuera de horario ahora mismo (L–V 8–18h, Sáb 8–14h), pero verán su mensaje y le responderán a la brevedad.`;
+
+	/**
+	 * Al devolver la conversación a la IA, su hilo de diálogo ya no vale: el
+	 * historial solo tiene lo que ocurrió ANTES de la intervención, porque los
+	 * mensajes del personal llegan por el canal de echo y nunca entran en el
+	 * contexto. Si no se limpia, la IA retoma como si el cliente siguiera donde
+	 * lo dejó y puede repetir o contradecir lo que la persona acaba de resolver.
+	 * Se conserva la identidad (nombre, ciudad, país); se descarta el diálogo.
+	 *
+	 * Por el camino normal esto ocurre solo: la sesión dura 2 h y la pausa más,
+	 * así que al expirar ya no hay hilo. El comando reactiva al instante, así
+	 * que hay que hacerlo explícito para que ambos caminos se comporten igual.
+	 */
+	private resetDialogueState = async (
+		botPhoneNumberId: string,
+		phoneNumber: string,
+	): Promise<void> => {
+		const session = await getSession(botPhoneNumberId, phoneNumber);
+		if (Object.keys(session).length === 0) return;
+
+		session.conversationHistory = [];
+		session.lastBotMessage = undefined;
+		session.lastProductList = undefined;
+		session.remainingProductList = undefined;
+		session.awaitingMoreProducts = undefined;
+		session.lastSearchQuery = undefined;
+		session.selectedProduct = undefined;
+		session.selectedVariantName = undefined;
+		session.pendingPresentationChoice = null;
+		session.pendingStockConfirmQty = undefined;
+		await saveSession(botPhoneNumberId, phoneNumber, session);
+	};
 
 	/**
 	 * Una conversación en pausa no puede conservar flujos a medias: al expirar
@@ -124,6 +179,12 @@ export class WhatsAppAgentService {
 
 	constructor() {
 		logRegisteredLines();
+		if (ENV.WHATSAPP_AGENT_TEST_COMMANDS) {
+			console.warn(
+				`[WhatsApp Agent] ⚠️  Test commands enabled: "${this.RESUME_COMMAND}" written by the staff resumes the AI. ` +
+					'Customers can read it in their own chat — do not leave this on in production.',
+			);
+		}
 		this.mediaHandlerService = new MediaHandlerService(
 			this.countryService,
 			this.quoteService,
@@ -449,6 +510,40 @@ export class WhatsAppAgentService {
 			console.log(
 				`[WhatsApp Agent] Echo addressed to an internal number (${customerPhone}), ignoring.`,
 			);
+			return;
+		}
+
+		// El personal devuelve la conversación a la IA. Va antes de pausar: este
+		// mensaje no es una intervención, es el final de una.
+		if (
+			ENV.WHATSAPP_AGENT_TEST_COMMANDS &&
+			this.isResumeCommand(echo?.text?.body)
+		) {
+			const wasPaused = await this.aiStateService.clearPause(
+				line.phoneNumberId,
+				customerPhone,
+			);
+			if (wasPaused) {
+				await this.resetDialogueState(line.phoneNumberId, customerPhone);
+			}
+			console.log(
+				`[WhatsApp Agent] Test command "${this.RESUME_COMMAND}" from staff for ${customerPhone} on line ${line.isoCode}: ` +
+					`${wasPaused ? 'AI resumed' : 'the conversation was not paused'}.`,
+			);
+			this.logService
+				.logMessage({
+					phoneNumber: customerPhone,
+					botPhoneNumberId: line.phoneNumberId,
+					direction: 'outbound',
+					text: this.describeEchoContent(echo),
+					intent: 'test_command:resume',
+					countryPrefix: this.countryPrefixOf(customerPhone),
+					source: 'human',
+					messageId,
+				})
+				.catch(err =>
+					console.error('[WhatsApp Agent] Error saving test command log:', err),
+				);
 			return;
 		}
 

@@ -1,4 +1,3 @@
-import { ENV } from '../../../config/env';
 import { WhatsAppLine } from '../lines';
 
 /**
@@ -28,10 +27,10 @@ export type AiAccessDecision =
 /**
  * Decide si la IA puede responder a un número en una línea concreta.
  *
- * La denylist es permanente e independiente del modo de pruebas: incluye el
- * propio número del negocio y los números de tienda, que reciben copia de las
- * cotizaciones y facturas en PDF. Sin ella, la réplica de un vendedor se
- * trataría como la de un cliente cualquiera.
+ * La denylist es permanente e independiente del modo de pruebas: la resuelve
+ * el registro de líneas e incluye el número de cualquier línea y los de tienda
+ * que reciben copia de las cotizaciones y facturas en PDF. Sin ella, la réplica
+ * de un vendedor se trataría como la de un cliente cualquiera.
  */
 export function isAiAllowed(
 	line: WhatsAppLine,
@@ -39,13 +38,7 @@ export function isAiAllowed(
 ): AiAccessDecision {
 	const phone = normalizePhone(customerPhone);
 
-	const denylist = [
-		line.businessPhone,
-		normalizePhone(ENV.SHOP_NOTIFY_CO_PHONE),
-		normalizePhone(ENV.SHOP_NOTIFY_EC_PHONE),
-	].filter(entry => entry.length > 0);
-
-	if (denylist.includes(phone)) {
+	if (line.denylist.includes(phone)) {
 		return { allowed: false, reason: 'denylist' };
 	}
 

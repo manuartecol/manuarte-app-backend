@@ -20,6 +20,13 @@ export interface WhatsAppLine {
 	/** Modo de pruebas: si está activo, solo responde a los números de `allowlist`. */
 	allowlistEnabled: boolean;
 	allowlist: string[];
+	/**
+	 * Números internos a los que la IA nunca responde, sea cual sea el modo:
+	 * el de cualquier línea registrada y los de tienda que reciben las copias
+	 * en PDF. Se calcula una vez conocidas todas las líneas, porque una línea
+	 * escribiendo a otra no es un cliente.
+	 */
+	denylist: string[];
 }
 
 const buildLine = (
@@ -29,7 +36,7 @@ const buildLine = (
 	shopSlug: string,
 	allowlistEnabled: string,
 	allowlist: string,
-): WhatsAppLine => ({
+): Omit<WhatsAppLine, 'denylist'> => ({
 	isoCode,
 	phoneNumberId: phoneNumberId.trim(),
 	businessPhone: normalizePhone(businessPhone),
@@ -40,7 +47,7 @@ const buildLine = (
 	allowlist: parsePhoneList(allowlist),
 });
 
-const CONFIGURED_LINES: WhatsAppLine[] = [
+const CONFIGURED_LINES: Omit<WhatsAppLine, 'denylist'>[] = [
 	buildLine(
 		'CO',
 		ENV.WHATSAPP_LINE_CO_PHONE_NUMBER_ID,
@@ -64,7 +71,7 @@ const CONFIGURED_LINES: WhatsAppLine[] = [
  * registradas. Una línea sin configurar simplemente no existe: Ecuador queda
  * inerte hasta que se le asigne su número, sin ramas condicionales.
  */
-const LINES_BY_PHONE_NUMBER_ID = new Map<string, WhatsAppLine>();
+const registered: Omit<WhatsAppLine, 'denylist'>[] = [];
 
 for (const line of CONFIGURED_LINES) {
 	if (line.phoneNumberId.length === 0 || line.shopSlug.length === 0) continue;
@@ -72,7 +79,9 @@ for (const line of CONFIGURED_LINES) {
 	// Dos líneas con el mismo phone_number_id es siempre un error de
 	// configuración: el Map se quedaría con la última y toda una operación
 	// atendería con el catálogo, el stock y la moneda del otro país.
-	const clash = LINES_BY_PHONE_NUMBER_ID.get(line.phoneNumberId);
+	const clash = registered.find(
+		other => other.phoneNumberId === line.phoneNumberId,
+	);
 	if (clash) {
 		throw new Error(
 			`[WhatsApp Agent] Lines ${clash.isoCode} and ${line.isoCode} share phone_number_id ` +
@@ -80,8 +89,28 @@ for (const line of CONFIGURED_LINES) {
 		);
 	}
 
-	LINES_BY_PHONE_NUMBER_ID.set(line.phoneNumberId, line);
+	registered.push(line);
 }
+
+// Los números internos son los mismos para todas las líneas: el de cualquier
+// línea registrada (una línea escribiendo a otra no es un cliente) y los de
+// tienda que reciben las copias en PDF.
+const INTERNAL_PHONES = [
+	...new Set(
+		[
+			...registered.map(line => line.businessPhone),
+			normalizePhone(ENV.SHOP_NOTIFY_CO_PHONE),
+			normalizePhone(ENV.SHOP_NOTIFY_EC_PHONE),
+		].filter(phone => phone.length > 0),
+	),
+];
+
+const LINES_BY_PHONE_NUMBER_ID = new Map<string, WhatsAppLine>(
+	registered.map(line => [
+		line.phoneNumberId,
+		{ ...line, denylist: INTERNAL_PHONES },
+	]),
+);
 
 export const getLineByPhoneNumberId = (
 	phoneNumberId: string | null | undefined,
@@ -109,7 +138,8 @@ export const logRegisteredLines = () => {
 		console.log(
 			`[WhatsApp Agent] Line ${line.isoCode} registered: phoneNumberId=${line.phoneNumberId}, ` +
 				`businessPhone=${line.businessPhone}, shop=${line.shopSlug}, ` +
-				`allowlist=${line.allowlistEnabled ? `${line.allowlist.length} number(s)` : 'disabled'}`,
+				`allowlist=${line.allowlistEnabled ? `${line.allowlist.length} number(s)` : 'disabled'}, ` +
+				`denylist=${line.denylist.join(', ')}`,
 		);
 	}
 };
