@@ -178,11 +178,14 @@ data
 
 /docs
 
-# scripts/ es local por defecto (p. ej. load-rag-docs.js), salvo los fixtures
-# del webhook de WhatsApp y su script de replay, que son material de pruebas
-# compartido y deben viajar con el repo.
+# scripts/ es local por defecto (p. ej. load-rag-docs.js). Las excepciones son
+# material compartido que tiene que viajar con el repo: los fixtures del
+# webhook de WhatsApp con su script de replay, y las herramientas de migración,
+# que package.json referencia desde el script migrate:env.
 /scripts/*
 !/scripts/wa-replay.js
 !/scripts/wa-fixtures/
+!/scripts/migrate.ps1
+!/scripts/db-target.js
 
 # End of https://www.toptal.com/developers/gitignore/api/node,windows
