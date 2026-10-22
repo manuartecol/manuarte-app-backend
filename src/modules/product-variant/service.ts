@@ -225,102 +225,84 @@ export class ProductVariantService {
 
 	bulkSearch = async (productVariantCodes: string[], stockId: string) => {
 		try {
-			const productVariantsWithStockInfo = await Promise.all(
-				productVariantCodes.map(async pvCode => {
-					try {
-						const productVariant = await this.productVariantModel.findOne({
-							where: { vId: pvCode },
-							attributes: [
-								'id',
-								'name',
-								[sequelize.col('product.name'), 'productName'],
-								[sequelize.col('stockItems.id'), 'stockItemId'],
-								[sequelize.col('stockItems.quantity'), 'quantity'],
-							],
-							include: [
-								{
-									model: this.productModel,
-									as: 'product',
-									attributes: [],
-								},
-								{
-									model: StockItemModel,
-									as: 'stockItems',
-									where: { stockId },
-									attributes: [],
-									through: { attributes: [] },
-								},
-							],
-						});
+			// Una sola consulta para todos los códigos. Antes era una por código,
+			// más otra por código para armar `stocks`.
+			const productVariants = await this.productVariantModel.findAll({
+				where: { vId: { [Op.in]: productVariantCodes } },
+				attributes: [
+					'id',
+					'name',
+					'vId',
+					[sequelize.col('product.name'), 'productName'],
+					[sequelize.col('stockItems.id'), 'stockItemId'],
+					[sequelize.col('stockItems.quantity'), 'quantity'],
+					// Bodegas donde la presentación existe y está activa
+					[
+						sequelize.literal(`(
+                            SELECT COALESCE(array_agg(DISTINCT si."stockId"), '{}')
+                            FROM stock_item_product_variant sipv
+                            INNER JOIN stock_item si ON si.id = sipv."stockItemId"
+                            WHERE sipv."productVariantId" = "ProductVariantModel"."id"
+                            AND si.active = true
+                        )`),
+						'stocks',
+					],
+				],
+				include: [
+					{
+						model: this.productModel,
+						as: 'product',
+						attributes: [],
+					},
+					{
+						// `required: false` conserva la presentación aunque no esté en esta
+						// bodega, para poder distinguir "no existe" de "no está aquí"
+						model: StockItemModel,
+						as: 'stockItems',
+						where: { stockId },
+						attributes: [],
+						through: { attributes: [] },
+						required: false,
+					},
+				],
+			});
 
-						if (!productVariant) {
-							const missingProductInStock =
-								await this.productVariantModel.findOne({
-									where: { vId: pvCode },
-									attributes: [
-										'name',
-										[sequelize.col('product.name'), 'productName'],
-									],
-									include: [
-										{
-											model: this.productModel,
-											as: 'product',
-											attributes: [],
-										},
-									],
-								});
-							if (!missingProductInStock) {
-								throw new Error(
-									`No existe el producto con código ${pvCode}. Por favor revisa bien los datos e intentalo nuevamente!`,
-								);
-							}
-							const { name, productName } = missingProductInStock.dataValues;
-
-							throw new Error(
-								`No fue posible encontrar en la bodega el item ${productName} - ${name}. Por favor revisa bien los datos e intentalo nuevamente!`,
-							);
-						}
-
-						if (!productVariant || !productVariant.dataValues) {
-							throw new Error(
-								`No se pudo obtener los datos del producto con código ${pvCode}.`,
-							);
-						}
-						const { productName, name, ...rest } = productVariant.dataValues;
-
-						return {
-							...rest,
-							name: `${productName} - ${name}`,
-							productCode: pvCode,
-						};
-					} catch (error) {
-						console.error(`Error interno con el código ${pvCode}:`, error);
-						throw error;
-					}
-				}),
+			const byCode = new Map(
+				productVariants.map(productVariant => [
+					productVariant.dataValues.vId,
+					productVariant.dataValues,
+				]),
 			);
 
-			const productVariantsResult = await Promise.all(
-				productVariantsWithStockInfo.map(async productVariant => {
-					if (productVariant) {
-						const stockItems = await StockItemModel.findAll({
-							include: [
-								{
-									model: this.productVariantModel,
-									as: 'productVariants',
-									where: { id: productVariant.id },
-									through: { attributes: [] },
-								},
-							],
-						});
+			// Se recorren los códigos y no el resultado, para devolverlos en el
+			// mismo orden en que llegaron
+			const productVariantsResult = productVariantCodes.map(pvCode => {
+				const productVariant = byCode.get(pvCode);
 
-						return {
-							...productVariant,
-							stocks: stockItems.map(item => item.dataValues.stockId),
-						};
-					}
-				}),
-			);
+				if (!productVariant) {
+					throw new Error(
+						`No existe el producto con código ${pvCode}. Por favor revisa bien los datos e intentalo nuevamente!`,
+					);
+				}
+
+				const { productName, name, stockItemId, quantity, stocks } =
+					productVariant;
+
+				if (!stockItemId) {
+					throw new Error(
+						`No fue posible encontrar en la bodega el item ${productName} - ${name}. Por favor revisa bien los datos e intentalo nuevamente!`,
+					);
+				}
+
+				return {
+					id: productVariant.id,
+					name: `${productName} - ${name}`,
+					quantity,
+					stockItemId,
+					stocks,
+					productCode: pvCode,
+				};
+			});
 
 			return { status: 200, productVariants: productVariantsResult };
 		} catch (error) {
@@ -392,6 +374,17 @@ export class ProductVariantService {
 							'priceDis',
 						],
 						[sequelize.col('stockItems.currency'), 'currency'],
+						// Bodegas donde la presentación existe y está activa
+						[
+							sequelize.literal(`(
+                                SELECT COALESCE(array_agg(DISTINCT si."stockId"), '{}')
+                                FROM stock_item_product_variant sipv
+                                INNER JOIN stock_item si ON si.id = sipv."stockItemId"
+                                WHERE sipv."productVariantId" = "ProductVariantModel"."id"
+																AND si.active = true
+                            )`),
+							'stocks',
+						],
 					],
 					include: [
 						{
@@ -411,25 +404,9 @@ export class ProductVariantService {
 					order: [[sequelize.col('stockItems.quantity'), 'DESC']],
 				});
 
-			const productVariantsResult = [];
-			for (const productVariant of productVariantsWithStockInfo) {
-				const stockItems = await StockItemModel.findAll({
-					include: [
-						{
-							model: this.productVariantModel,
-							as: 'productVariants',
-							where: { id: productVariant.dataValues.id },
-							through: { attributes: [] },
-						},
-					],
-				});
-				productVariantsResult.push({
-					...productVariant.dataValues,
-					stocks: stockItems.map(item => item.dataValues.stockId),
-				});
-			}
-
-			return productVariantsResult;
+			return productVariantsWithStockInfo.map(
+				productVariant => productVariant.dataValues,
+			);
 		} catch (error) {
 			console.error('Error obteniendo productos con información de stock');
 			throw error;
@@ -454,7 +431,7 @@ export class ProductVariantService {
 						SELECT sipv."productVariantId"
 						FROM "stock_item_product_variant" AS sipv
 						INNER JOIN "stock_item" AS si ON si."id" = sipv."stockItemId"
-						WHERE si."stockId" = '${stockId}'
+						WHERE si."stockId" = :stockId
 					)`),
 					},
 				},
@@ -471,6 +448,7 @@ export class ProductVariantService {
 						where: { deletedDate: null },
 					},
 				],
+				replacements: { stockId },
 			});
 
 			return missingProductVariants;
