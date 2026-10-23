@@ -44,11 +44,13 @@ export class ProductVariantController {
 			const { stockId } = req.params;
 			const search = (req.query.search as string) || '';
 			const missingProducts = req.query.missingProducts === 'true';
+			const includeInactive = req.query.includeInactive === 'true';
 
 			const result = await this.productVariantService.searchByNameOrCode(
 				stockId,
 				search,
 				missingProducts as boolean,
+				includeInactive,
 			);
 			if (result.status !== 200) {
 				res.sendStatus(400);

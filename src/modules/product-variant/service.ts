@@ -210,11 +210,12 @@ export class ProductVariantService {
 		stockId: string,
 		search: string,
 		missingProducts: boolean,
+		includeInactive = false,
 	) => {
 		try {
 			const productVariants = missingProducts
 				? await this.getMissing(search, stockId)
-				: await this.getWithStockInfo(search, stockId);
+				: await this.getWithStockInfo(search, stockId, includeInactive);
 
 			return { status: 200, productVariants };
 		} catch (error) {
@@ -236,6 +237,11 @@ export class ProductVariantService {
 					[sequelize.col('product.name'), 'productName'],
 					[sequelize.col('stockItems.id'), 'stockItemId'],
 					[sequelize.col('stockItems.quantity'), 'quantity'],
+					// Se devuelve el estado en lugar de filtrar por él: filtrar aquí
+					// haría que un item desactivado cayera en el mensaje genérico de
+					// "no se encontró en la bodega", que es falso. Quien llama decide
+					// qué decirle al usuario.
+					[sequelize.col('stockItems.active'), 'activeInOrigin'],
 					// Bodegas donde la presentación existe y está activa
 					[
 						sequelize.literal(`(
@@ -285,8 +291,14 @@ export class ProductVariantService {
 					);
 				}
 
-				const { productName, name, stockItemId, quantity, stocks } =
-					productVariant;
+				const {
+					productName,
+					name,
+					stockItemId,
+					quantity,
+					stocks,
+					activeInOrigin,
+				} = productVariant;
 
 				if (!stockItemId) {
 					throw new Error(
@@ -300,6 +312,7 @@ export class ProductVariantService {
 					quantity,
 					stockItemId,
 					stocks,
+					activeInOrigin,
 					productCode: pvCode,
 				};
 			});
@@ -327,7 +340,19 @@ export class ProductVariantService {
 		}
 	};
 
-	private getWithStockInfo = async (search: string, stockId?: string) => {
+	/**
+	 * `includeInactive` devuelve también las presentaciones cuyo item de stock
+	 * está desactivado en esta bodega, marcadas con `activeInOrigin: false`, para
+	 * que el buscador pueda mostrarlas atenuadas en lugar de no mostrar nada: un
+	 * código válido que no aparece sin explicación es indistinguible de un código
+	 * mal escrito. Por defecto queda apagado, así que los formularios de factura
+	 * y cotización siguen viendo solo lo activo.
+	 */
+	private getWithStockInfo = async (
+		search: string,
+		stockId?: string,
+		includeInactive = false,
+	) => {
 		try {
 			const productVariantsWithStockInfo =
 				await this.productVariantModel.findAll({
@@ -374,6 +399,7 @@ export class ProductVariantService {
 							'priceDis',
 						],
 						[sequelize.col('stockItems.currency'), 'currency'],
+						[sequelize.col('stockItems.active'), 'activeInOrigin'],
 						// Bodegas donde la presentación existe y está activa
 						[
 							sequelize.literal(`(
@@ -396,11 +422,13 @@ export class ProductVariantService {
 						{
 							model: StockItemModel,
 							as: 'stockItems',
-							where: { stockId, active: true },
+							where: includeInactive ? { stockId } : { stockId, active: true },
 							attributes: [],
 							through: { attributes: [] },
 						},
 					],
+					// Los desactivados tienen cantidad 0, así que este orden ya los
+					// deja al final sin necesidad de un criterio aparte
 					order: [[sequelize.col('stockItems.quantity'), 'DESC']],
 				});
 
