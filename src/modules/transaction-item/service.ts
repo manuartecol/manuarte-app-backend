@@ -18,6 +18,10 @@ export class TransactionItemService {
 
 	getByTransactionId = async (transactionId: string, stockId: string) => {
 		try {
+			// El item de stock de la bodega entra por JOIN. Antes era una llamada a
+			// `getOneByStock` por cada ítem: un movimiento de 171 ítems gastaba 172
+			// consultas, y cada una traía además `pricePvp`, `priceDis` y `stocks`,
+			// que en esta ruta no los usa nadie.
 			const transactionItems = await this.transactionItemModel.findAll({
 				where: { transactionId },
 				attributes: [
@@ -27,6 +31,11 @@ export class TransactionItemService {
 					'productVariantId',
 					[sequelize.col('productVariants.name'), 'productVariantName'],
 					[sequelize.col('productVariants.product.name'), 'productName'],
+					[sequelize.col('productVariants.stockItems.id'), 'stockItemId'],
+					[
+						sequelize.col('productVariants.stockItems.quantity'),
+						'stockItemQuantity',
+					],
 				],
 				include: [
 					{
@@ -39,23 +48,50 @@ export class TransactionItemService {
 								as: 'product',
 								attributes: [],
 							},
+							{
+								// `required: false` porque el 3% de los ítems históricos ya no
+								// tiene item de stock en esa bodega, y perderlos cambiaría el
+								// detalle de movimientos viejos
+								model: StockItemModel,
+								as: 'stockItems',
+								where: { stockId },
+								attributes: [],
+								through: { attributes: [] },
+								required: false,
+							},
 						],
 					},
 				],
 				order: [[sequelize.col('productVariants.product.name'), 'ASC']],
 			});
 
+			// Dos normalizaciones sobre el resultado del JOIN:
+			//
+			// 1. Sin item de stock, el JOIN deja `null` donde el bucle dejaba
+			//    `undefined`. La diferencia se nota: `TransactionsForm` calcula el
+			//    máximo editable con `Number(quantity) + Number(stockItemQuantity)
+			//    || 1`, y `Number(null)` es 0 mientras `Number(undefined)` es NaN,
+			//    así que el tope cambiaría en esos ítems.
+			//
+			// 2. Una línea por `transaction_item`. Nada en la base impide que dos
+			//    `stock_item` de la misma bodega apunten a la misma presentación: la
+			//    clave de `stock_item_product_variant` es (stockItemId,
+			//    productVariantId), así que el par (presentación, bodega) no es
+			//    único. Hoy no ocurre en ninguna fila, pero si ocurriera el JOIN
+			//    duplicaría líneas del movimiento y el total del panel saldría
+			//    inflado. El `findOne` que había antes era inmune por construcción,
+			//    y esto le devuelve esa garantía.
+			const seen = new Set<string>();
 			const formattedItems = [];
+
 			for (const item of transactionItems) {
-				const stockItem = await this.stockItemService.getOneByStock(
-					item?.dataValues?.productVariantId,
-					stockId,
-				);
+				if (seen.has(item.dataValues.id)) continue;
+				seen.add(item.dataValues.id);
 
 				formattedItems.push({
 					...item.dataValues,
-					stockItemId: stockItem?.dataValues?.id,
-					stockItemQuantity: stockItem?.dataValues?.quantity,
+					stockItemId: item.dataValues.stockItemId ?? undefined,
+					stockItemQuantity: item.dataValues.stockItemQuantity ?? undefined,
 				});
 			}
 
