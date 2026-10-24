@@ -268,7 +268,7 @@ export class StockItemService {
                         SELECT ARRAY_AGG(DISTINCT si."stockId")
                         FROM stock_item si
                         INNER JOIN stock_item_product_variant sipv ON sipv."stockItemId" = si.id
-                        WHERE sipv."productVariantId" = '${productVariantId}'
+                        WHERE sipv."productVariantId" = :productVariantId
                     )`),
 						'stocks',
 					],
@@ -288,6 +288,9 @@ export class StockItemService {
 						required: true,
 					},
 				],
+				// El id iba interpolado dentro del literal. Sequelize no escapa lo
+				// que va en un `literal`, así que lo sustituye él con replacements
+				replacements: { productVariantId },
 			});
 
 			return stockItem;
