@@ -698,6 +698,7 @@ export class FlowsService {
 				const serial = result.newQuote.serialNumber;
 
 				// Enviar PDF por WhatsApp antes de devolver el mensaje de confirmación
+				let pdfSent = false;
 				try {
 					const buffer = await this.docsService.generateQuote(serial);
 					const filename = `CTZ-${serial}.pdf`;
@@ -723,12 +724,21 @@ export class FlowsService {
 							caption,
 						);
 						await this.aiStateService.registerSelfSend(sentId);
+						pdfSent = true;
 					}
 				} catch (err) {
 					console.error(
 						`[WhatsApp Agent] Error sending quote PDF for ${serial}:`,
 						err,
 					);
+				}
+
+				// Sin el documento, el mensaje de siempre daba por hecho que el cliente
+				// lo tenía. La cotización sí quedó creada, así que el flujo sigue igual;
+				// solo se le dice la verdad y cómo pedirlo. No se promete que alguien
+				// se lo envíe por iniciativa propia, porque la tienda no recibe aviso
+				if (!pdfSent) {
+					return `Su cotización #${serial} quedó registrada, pero no pude adjuntarle el documento en este momento. Si lo necesita, pídame hablar con un asesor y se lo enviarán. ¿Desea proceder con el pago?`;
 				}
 
 				return 'Con gusto le ayudo a completar la compra ¿Desea proceder con el pago?';

@@ -1,3 +1,4 @@
+import axios from 'axios';
 import { Handler } from 'express';
 import { DocsService } from './service';
 import { QuoteService } from '../quote/service';
@@ -5,6 +6,21 @@ import { BillingService } from '../billing/service';
 import { WhatsAppService } from '../whatsapp/service';
 import { calculateTotals } from './utils';
 import { ENV } from '../../config/env';
+
+/**
+ * Un fallo de la API de WhatsApp llega como error de axios, con un mensaje en
+ * inglés ("Request failed with status code 400") que el panel le mostraría tal
+ * cual al vendedor. Se cambia por uno que entienda; el detalle de Meta (status y
+ * cuerpo de la respuesta) sigue en el error que registra el errorHandler. Los
+ * errores propios, como el de un PDF que no se pudo generar, ya traen su
+ * mensaje y pasan sin tocarse.
+ */
+const toSendError = (error: unknown) => {
+	if (axios.isAxiosError(error)) {
+		error.message = 'No se pudo enviar el documento por WhatsApp';
+	}
+	return error;
+};
 
 export class DocsController {
 	private docsService;
@@ -76,12 +92,16 @@ export class DocsController {
 				templateName: 'send_quote',
 			};
 
+			// Sin `.catch`, igual que en facturas: si el envío al cliente falla, el
+			// error sube y el vendedor lo ve. Antes se registraba y la respuesta
+			// seguía siendo "PDF enviado correctamente" aunque no hubiera llegado.
+			// La copia a la tienda sí va aparte, porque su fallo no afecta al cliente
 			const recipientPhone = `${quote.callingCode}${quote.phoneNumber}`;
-			await this.whatsAppService
-				.sendTemplate(recipientPhone, mediaId, templateParams)
-				.catch(err =>
-					console.error('Error sending WhatsApp to customer:', err.message),
-				);
+			await this.whatsAppService.sendTemplate(
+				recipientPhone,
+				mediaId,
+				templateParams,
+			);
 
 			const shopPhone =
 				quote.countryIsoCode === 'CO'
@@ -98,7 +118,7 @@ export class DocsController {
 
 			res.status(200).json({ message: 'PDF enviado correctamente' });
 		} catch (error) {
-			next(error);
+			next(toSendError(error));
 		}
 	};
 
@@ -176,7 +196,7 @@ export class DocsController {
 
 			res.status(200).json({ message: 'PDF enviado correctamente' });
 		} catch (error) {
-			next(error);
+			next(toSendError(error));
 		}
 	};
 }
