@@ -85,13 +85,21 @@ export class UserService {
 				{ fullName, dni },
 				{ transaction },
 			);
-			if (!person) return { status: 500, message: 'Error creando usuario' };
+			// Cada salida anticipada cierra la transacción. Un `return` sin rollback
+			// dejaba la conexión retenida para siempre, y el pool solo tiene cinco
+			if (!person) {
+				await transaction.rollback();
+				return { status: 500, message: 'Error creando usuario' };
+			}
 
 			const user = await this.userModel.create(
 				{ roleId, shopId, email, password, personId: person.id },
 				{ transaction },
 			);
-			if (!user) return { status: 500, message: 'Error creando usuario' };
+			if (!user) {
+				await transaction.rollback();
+				return { status: 500, message: 'Error creando usuario' };
+			}
 
 			const userRegistered = {
 				id: user.id,
@@ -135,6 +143,7 @@ export class UserService {
 				where: { personId },
 			});
 			if (!userToUpdate || !personToUpdate) {
+				await transaction.rollback();
 				return { status: 404, message: 'Usuario no encontrado' };
 			}
 
@@ -191,6 +200,9 @@ export class UserService {
 				return { status: 200, message: 'Usuario eliminado con éxito' };
 			}
 
+			// Sin rollback, además de retener la conexión, la persona que ya se
+			// había borrado en esta misma transacción quedaba en el aire
+			await transaction.rollback();
 			return { status: 404, message: 'Usuario no encontrado' };
 		} catch (error) {
 			await transaction.rollback();
