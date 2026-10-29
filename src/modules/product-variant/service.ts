@@ -427,9 +427,46 @@ export class ProductVariantService {
 							through: { attributes: [] },
 						},
 					],
-					// Los desactivados tienen cantidad 0, así que este orden ya los
-					// deja al final sin necesidad de un criterio aparte
-					order: [[sequelize.col('stockItems.quantity'), 'DESC']],
+					// Antes solo por cantidad, así que el orden no tenía que ver con lo
+					// escrito: un "Vinilo blanco mate" con poco stock salía por debajo
+					// de otros vinilos que se parecían menos. Ahora, por prioridad:
+					order: [
+						// 1. Tres grupos, cada uno junto: con existencias, agotados y
+						//    desactivados (estos solo llegan con `includeInactive`). Ir
+						//    juntos agotados y desactivados los dejaba intercalados
+						[
+							sequelize.literal(
+								`CASE
+									WHEN NOT "stockItems"."active" THEN 2
+									WHEN "stockItems"."quantity" > 0 THEN 0
+									ELSE 1
+								END`,
+							),
+							'ASC',
+						],
+						// 2. Qué tanto se parece a lo escrito: el código exacto (lo que
+						//    llega al escanear o pegar un vId), luego los nombres que
+						//    empiezan por el texto y por último los que solo lo contienen
+						[
+							sequelize.literal(
+								`CASE
+									WHEN lower("ProductVariantModel"."vId") = lower(:search) THEN 0
+									WHEN concat("product"."name", ' ', "ProductVariantModel"."name") ILIKE (:search || '%') THEN 1
+									ELSE 2
+								END`,
+							),
+							'ASC',
+						],
+						// 3. Alfabético por producto y presentación. Sin la cantidad como
+						//    criterio: casi nunca empata, así que tapaba al alfabético y
+						//    la lista seguía pareciendo ordenada por stock, sin lógica a
+						//    la vista. La cantidad ya se muestra en cada opción
+						[sequelize.col('product.name'), 'ASC'],
+						['name', 'ASC'],
+					],
+					// El texto del usuario va por replacements y no interpolado: un
+					// `literal` no se escapa
+					replacements: { search },
 				});
 
 			return productVariantsWithStockInfo.map(
