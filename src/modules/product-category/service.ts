@@ -36,10 +36,28 @@ export class ProductCategoryService {
 		}
 	};
 
-	create = async ({ name, requestedBy }: CreateProductCategoryDto) => {
+	getGroups = async () => {
+		try {
+			return await ProductCategoryGroupModel.findAll({
+				attributes: ['id', 'name'],
+				where: { deletedDate: null },
+				order: [['name', 'ASC']],
+			});
+		} catch (error) {
+			console.error('ServiceError obteniendo grupos de categoría: ', error);
+			throw error;
+		}
+	};
+
+	create = async ({
+		name,
+		productCategoryGroupId,
+		requestedBy,
+	}: CreateProductCategoryDto) => {
 		try {
 			const newProductCategory = this.productCategoryModel.build({
 				name,
+				productCategoryGroupId: productCategoryGroupId ?? null,
 				createdBy: requestedBy,
 				updatedBy: requestedBy,
 			});
@@ -48,14 +66,19 @@ export class ProductCategoryService {
 
 			await newProductCategory.save();
 
-			return newProductCategory.dataValues;
+			return await this.withGroupName(newProductCategory);
 		} catch (error) {
 			console.error('ServiceError creando categoría de producto: ', error);
 			throw error;
 		}
 	};
 
-	update = async ({ id, name, requestedBy }: UpdateProductCategoryDto) => {
+	update = async ({
+		id,
+		name,
+		productCategoryGroupId,
+		requestedBy,
+	}: UpdateProductCategoryDto) => {
 		try {
 			const productCategoryToUpdate =
 				await this.productCategoryModel.findByPk(id);
@@ -67,14 +90,30 @@ export class ProductCategoryService {
 
 			await productCategoryToUpdate.update({
 				name,
+				productCategoryGroupId,
 				updatedBy: requestedBy,
 			});
 
-			return productCategoryToUpdate.dataValues;
+			return await this.withGroupName(productCategoryToUpdate);
 		} catch (error) {
 			console.error('ServiceError actualizando categoría de producto: ', error);
 			throw error;
 		}
+	};
+
+	// Misma forma que `getAll`, para que la tabla pinte el grupo sin recargar
+	private withGroupName = async (productCategory: ProductCategoryModel) => {
+		const groupId = productCategory.getDataValue('productCategoryGroupId');
+		const group = groupId
+			? await ProductCategoryGroupModel.findByPk(groupId, {
+					attributes: ['name'],
+				})
+			: null;
+
+		return {
+			...productCategory.dataValues,
+			groupName: group?.getDataValue('name') ?? null,
+		};
 	};
 
 	delete = async (id: string) => {

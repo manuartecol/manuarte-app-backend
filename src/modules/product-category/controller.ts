@@ -11,10 +11,11 @@ export class ProductCategoryController {
 
 	create: Handler = async (req, res, next) => {
 		try {
-			const { name } = req.body;
+			const { name, productCategoryGroupId } = req.body;
 			const requestedBy = (req as CustomRequest).requestedBy;
 			const newProductCategory = await this.productCategoryService.create({
 				name,
+				productCategoryGroupId,
 				requestedBy,
 			});
 
@@ -41,15 +42,26 @@ export class ProductCategoryController {
 		}
 	};
 
+	getGroups: Handler = async (_req, res, next) => {
+		try {
+			const groups = await this.productCategoryService.getGroups();
+
+			res.status(200).json(groups);
+		} catch (error) {
+			next(error);
+		}
+	};
+
 	update: Handler = async (req, res, next) => {
 		try {
 			const { id } = req.params;
-			const { name } = req.body;
+			const { name, productCategoryGroupId } = req.body;
 			const requestedBy = (req as CustomRequest).requestedBy;
 
 			const updatedProductCategory = await this.productCategoryService.update({
 				id,
 				name,
+				productCategoryGroupId,
 				requestedBy,
 			});
 

@@ -23,6 +23,11 @@ router.get(
 	authorize(ProductPermissions.PRODUCT_READ),
 	productCategoryController.getAll,
 );
+router.get(
+	'/groups',
+	authorize(ProductPermissions.PRODUCT_READ),
+	productCategoryController.getGroups,
+);
 router.put(
 	'/:id',
 	authorize(ProductPermissions.PRODUCT_UPDATE),

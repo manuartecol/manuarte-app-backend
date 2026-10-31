@@ -11,6 +11,8 @@ export interface ProductCategoryAttr {
 
 export interface CreateProductCategoryDto {
 	name: string;
+	// null quita el grupo; undefined lo deja como está
+	productCategoryGroupId?: string | null;
 	requestedBy: string;
 }
 
