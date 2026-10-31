@@ -68,14 +68,16 @@ export class ProductVariantModel extends Model {
 						this.name.toLowerCase(),
 					),
 					{ productId: this.productId },
+					// Mismo motivo que en `validateProductName`
+					{ id: { [Op.ne]: this.id } },
 				],
 			},
 			transaction,
 		});
 
-		if (existingProductVariant && existingProductVariant.id !== this.id) {
+		if (existingProductVariant) {
 			throw new Error(
-				'Ya existe una presentación del producto con este nombre (Ten en cuenta mayúsculas y minúsculas)',
+				'Ya existe una presentación del producto con este nombre, sin importar mayúsculas y minúsculas',
 			);
 		}
 	}

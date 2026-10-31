@@ -46,12 +46,15 @@ export class ProductController {
 	update: Handler = async (req, res, next) => {
 		try {
 			const { id } = req.params;
-			const { productVariant, stockIds, ...rest } = req.body;
+			const { productVariant, stockIds, name, description, productCategoryId } =
+				req.body;
 			const requestedBy = (req as CustomRequest).requestedBy;
 
+			// Solo los campos editables. Con el resto del body tal cual, se podía
+			// sobrescribir `pId` u otra columna mandándola en la petición
 			await this.productService.update({
 				id,
-				productData: { ...rest },
+				productData: { name, description, productCategoryId },
 				productVariantData: productVariant,
 				stockIds,
 				requestedBy,

@@ -8,7 +8,7 @@ export class ProductModel extends Model {
 	public id!: string;
 	public name!: string;
 	public pId!: string;
-	public description!: string;
+	public description!: string | null;
 	public productCategoryId!: string;
 	public createdBy!: string;
 	public updatedBy!: string;
@@ -54,17 +54,32 @@ export class ProductModel extends Model {
 		}
 	}
 
+	// Opcional: una descripción vacía o solo con espacios se guarda como NULL,
+	// para que Gema y los filtros no traten '' como si hubiera descripción
+	normalizeDescription() {
+		if (typeof this.description === 'string') {
+			this.description = this.description.trim() || null;
+		}
+	}
+
 	async validateProductName() {
+		// Se excluye a sí mismo en la consulta y no después: con dos productos ya
+		// duplicados, `findOne` podía devolver este mismo y dejar pasar el otro
 		const existingProduct = await ProductModel.findOne({
-			where: sequelize.where(
-				sequelize.fn('LOWER', sequelize.col('name')),
-				this.name.toLowerCase(),
-			),
+			where: {
+				[Op.and]: [
+					sequelize.where(
+						sequelize.fn('LOWER', sequelize.col('name')),
+						this.name.toLowerCase(),
+					),
+					{ id: { [Op.ne]: this.id } },
+				],
+			},
 		});
 
-		if (existingProduct && existingProduct.id !== this.id) {
+		if (existingProduct) {
 			throw new Error(
-				'Ya existe un producto con este nombre (Ten en cuenta mayúsculas y minúsculas)',
+				'Ya existe un producto con este nombre, sin importar mayúsculas y minúsculas',
 			);
 		}
 	}
@@ -84,7 +99,7 @@ ProductModel.init(
 		},
 		description: {
 			type: DataTypes.STRING,
-			allowNull: false,
+			allowNull: true,
 		},
 		pId: {
 			type: DataTypes.STRING(8),
@@ -145,16 +160,16 @@ ProductModel.init(
 		hooks: {
 			beforeCreate: async product => {
 				product.name = product.name.trim();
+				product.normalizeDescription();
 				await product.validateProductName();
 			},
+			// La categoría se puede cambiar. El `pId` no se regenera: los `vId` de
+			// las etiquetas impresas cuelgan de él, así que su prefijo de categoría
+			// queda como histórico
 			beforeUpdate: async product => {
 				product.name = product.name.trim();
+				product.normalizeDescription();
 				await product.validateProductName();
-				if (product.changed('productCategoryId')) {
-					throw new Error(
-						'No se permite actualizar la categoría del producto una vez creado',
-					);
-				}
 			},
 		},
 	},

@@ -3,7 +3,7 @@ import { PartialStockItem } from '../stock-item/types';
 export interface ProductAttr {
 	id?: string;
 	name: string;
-	description: string;
+	description?: string | null;
 	pId?: string;
 	productCategoryId: string;
 	createdBy: string;
