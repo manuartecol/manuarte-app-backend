@@ -60,7 +60,9 @@ export class ProductVariantService {
 			const { rows: productVariants, count: total } =
 				await this.productVariantModel.findAndCountAll({
 					where: {
-						active: filters?.showActiveOnly ?? true,
+						...(filters?.showActiveOnly !== null && {
+							active: filters?.showActiveOnly ?? true,
+						}),
 						...productVariantWhere,
 					},
 					attributes: {
@@ -149,34 +151,47 @@ export class ProductVariantService {
 		}
 	};
 
-	update = async ({
-		id,
-		name,
-		active,
-		stockIds,
-		requestedBy,
-	}: UpdateProductVariantDto) => {
+	update = async (
+		{ id, name, active, stockIds, requestedBy }: UpdateProductVariantDto,
+		transaction?: Transaction,
+	) => {
+		// Si no llega de `ProductService.update`, abre la suya: `setActiveStocks`
+		// actualiza varias bodegas y un fallo a mitad dejaba unas sí y otras no
+		const ownsTransaction = !transaction;
+		const t = transaction ?? (await sequelize.transaction());
 		try {
-			const productVariantToUpdate =
-				await this.productVariantModel.findByPk(id);
+			const productVariantToUpdate = await this.productVariantModel.findByPk(
+				id,
+				{ transaction: t },
+			);
 			if (!productVariantToUpdate) {
 				throw new Error(
 					`No se encontró la presentación de producto con id ${id}`,
 				);
 			}
 
-			await productVariantToUpdate.update({
-				name,
-				active,
-				updatedBy: requestedBy,
-			});
+			await productVariantToUpdate.update(
+				{
+					name,
+					active,
+					updatedBy: requestedBy,
+				},
+				{ transaction: t },
+			);
 
 			if (stockIds) {
-				await this.stockItemService.setActiveStocks(id, stockIds as string[]);
+				await this.stockItemService.setActiveStocks(
+					id,
+					stockIds as string[],
+					t,
+				);
 			}
+
+			if (ownsTransaction) await t.commit();
 
 			return productVariantToUpdate.dataValues;
 		} catch (error) {
+			if (ownsTransaction) await t.rollback();
 			console.error(
 				'ServiceError actualizando presentación de producto: ',
 				error,

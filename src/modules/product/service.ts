@@ -106,23 +106,37 @@ export class ProductService {
 		stockIds,
 		requestedBy,
 	}: UpdateProductDto) => {
+		// Producto y presentación en una sola transacción: antes, si la
+		// presentación fallaba (nombre repetido, stock que no se puede desactivar),
+		// el producto quedaba guardado a medias
+		const transaction = await sequelize.transaction();
 		try {
-			const productToUpdate = await this.productModel.findByPk(id);
+			const productToUpdate = await this.productModel.findByPk(id, {
+				transaction,
+			});
 			if (!productToUpdate)
 				throw new Error(`No fue posible encontrar el producto`);
 
-			await productToUpdate.update({
-				...productData,
-				updatedBy: requestedBy,
-			});
+			await productToUpdate.update(
+				{
+					...productData,
+					updatedBy: requestedBy,
+				},
+				{ transaction },
+			);
 
-			const updatedProductVariant = await this.productVariantService.update({
-				id: productVariantData.id,
-				name: productVariantData.name,
-				active: productVariantData.active,
-				stockIds,
-				requestedBy,
-			});
+			const updatedProductVariant = await this.productVariantService.update(
+				{
+					id: productVariantData.id,
+					name: productVariantData.name,
+					active: productVariantData.active,
+					stockIds,
+					requestedBy,
+				},
+				transaction,
+			);
+
+			await transaction.commit();
 
 			const categoryName = await this.getCategoryName(
 				productToUpdate?.productCategoryId,
@@ -134,6 +148,7 @@ export class ProductService {
 				productVariant: updatedProductVariant,
 			};
 		} catch (error) {
+			await transaction.rollback();
 			console.error('ServiceError actualizando producto: ', error);
 			throw error;
 		}

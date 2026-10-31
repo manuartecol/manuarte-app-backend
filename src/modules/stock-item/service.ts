@@ -1151,10 +1151,19 @@ export class StockItemService {
 	setActiveStocks = async (
 		productVariantId: string,
 		activeStockIds: string[], // Solo los stocks donde debe estar activo
+		transaction?: Transaction,
 	) => {
 		try {
 			// Obtener todos los stock items del producto
+			// Con transacción, las filas quedan bloqueadas hasta el commit: así un
+			// movimiento de stock no puede sumar unidades entre la validación y la
+			// desactivación. Solo `stock_item`, porque `stock` va por LEFT JOIN y
+			// Postgres no permite bloquear el lado nullable
 			const allStockItems = await this.stockItemModel.findAll({
+				transaction,
+				...(transaction && {
+					lock: { level: transaction.LOCK.UPDATE, of: this.stockItemModel },
+				}),
 				include: [
 					{
 						model: ProductVariantModel,
@@ -1193,22 +1202,25 @@ export class StockItemService {
 				);
 			}
 
-			// Actualizar cada stock item según si está en la lista o no
-			await Promise.all(
-				allStockItems.map(item => {
-					const shouldBeActive = activeStockIds.includes(item.stockId);
+			// Actualizar cada stock item según si está en la lista o no. En serie y
+			// validando antes de escribir: con `Promise.all`, un item que no se podía
+			// desactivar rechazaba la promesa con las demás escrituras aún en vuelo
+			for (const item of allStockItems) {
+				const shouldBeActive = activeStockIds.includes(item.stockId);
 
-					if (!shouldBeActive && Number(item.quantity) > 0 && item.active) {
-						return Promise.reject(
-							new Error(
-								`No se puede desactivar el item en ${item.getDataValue('stock').name}, ya que tiene ${item.quantity} unidades en el stock.`,
-							),
-						);
-					}
+				if (!shouldBeActive && Number(item.quantity) > 0 && item.active) {
+					throw new Error(
+						`No se puede desactivar el item en ${item.getDataValue('stock').name}, ya que tiene ${item.quantity} unidades en el stock.`,
+					);
+				}
+			}
 
-					return item.update({ active: shouldBeActive });
-				}),
-			);
+			for (const item of allStockItems) {
+				await item.update(
+					{ active: activeStockIds.includes(item.stockId) },
+					{ transaction },
+				);
+			}
 
 			const activatedCount = activeStockIds.length;
 			const deactivatedCount = allStockItems.length - activatedCount;

@@ -20,7 +20,12 @@ export class ProductVariantController {
 				variantName: req.query.name as string,
 				productDescription: req.query.productDescription as string,
 				productCategoryName: req.query.productCategoryName as string,
-				showActiveOnly: req.query.showActiveOnly === 'true',
+				// 'all' lista activas e inactivas. Sin el parámetro, solo activas,
+				// como antes: así no cambia ningún enlace ni cliente existente
+				showActiveOnly:
+					req.query.showActiveOnly === 'all'
+						? null
+						: req.query.showActiveOnly !== 'false',
 			};
 
 			const result = await this.productVariantService.getAll(

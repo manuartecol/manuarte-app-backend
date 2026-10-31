@@ -31,5 +31,5 @@ export interface ProductVariantFilters {
 	variantName?: string;
 	productDescription?: string;
 	productCategoryName?: string;
-	showActiveOnly?: boolean;
+	showActiveOnly?: boolean | null; // null: activas e inactivas
 }
