@@ -207,24 +207,87 @@ export class ProductService {
 		}
 	};
 
-	delete = async (productId: string, productVariantId: string) => {
+	/**
+	 * Lo que el panel muestra antes de confirmar un borrado. Sale del mismo
+	 * cálculo que `delete`, para que el aviso no pueda contradecir lo que ocurre
+	 * después
+	 */
+	getDeletionPreview = async (productId: string, productVariantId: string) => {
 		try {
-			const productVariantDeleted =
-				await this.productVariantService.delete(productVariantId);
+			await this.productVariantService.assertBelongsToProduct(
+				productVariantId,
+				productId,
+			);
 
-			const count = await this.productVariantService.count(productId);
+			const plan =
+				await this.productVariantService.getDeletionPlan(productVariantId);
 
-			let productDeleted = 0;
-			if (count === 0) {
-				productDeleted = await this.productModel.destroy({
-					where: { id: productId },
+			const liveVariants = await this.productVariantService.count(productId);
+
+			return {
+				...plan,
+				deletesProduct: plan.mode !== 'blocked' && liveVariants <= 1,
+			};
+		} catch (error) {
+			console.error('ServiceError calculando el borrado del producto: ', error);
+			throw error;
+		}
+	};
+
+	delete = async (productId: string, productVariantId: string) => {
+		// Presentación y producto en la misma transacción: si el producto falla, la
+		// presentación no puede quedarse borrada por su cuenta
+		const transaction = await sequelize.transaction();
+		try {
+			await this.productVariantService.assertBelongsToProduct(
+				productVariantId,
+				productId,
+				transaction,
+			);
+
+			const { mode } = await this.productVariantService.delete(
+				productVariantId,
+				transaction,
+			);
+
+			const liveVariants = await this.productVariantService.count(
+				productId,
+				transaction,
+			);
+
+			let productDeleted = false;
+
+			if (liveVariants === 0) {
+				const productToDelete = await this.productModel.findByPk(productId, {
+					transaction,
 				});
 
-				return { productVariantDeleted, productDeleted };
+				if (productToDelete) {
+					/**
+					 * Solo se borra de verdad si no le queda ninguna fila de
+					 * presentación, ni siquiera marcada como borrada: esas filas
+					 * referencian el producto y se quedarían huérfanas
+					 */
+					const remainingRows = await this.productVariantService.count(
+						productId,
+						transaction,
+						true,
+					);
+
+					await productToDelete.destroy({
+						force: remainingRows === 0,
+						transaction,
+					});
+
+					productDeleted = true;
+				}
 			}
 
-			return { productVariantDeleted, productDeleted };
+			await transaction.commit();
+
+			return { productDeleted, mode };
 		} catch (error) {
+			await transaction.rollback();
 			console.error('ServiceError eliminando producto: ', error);
 			throw error;
 		}

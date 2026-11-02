@@ -1,4 +1,4 @@
-import { DataTypes, Model, Transaction } from 'sequelize';
+import { DataTypes, Model, QueryTypes, Transaction } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { ProductModel } from '../product/model';
 import { Op } from 'sequelize';
@@ -25,10 +25,12 @@ export class ProductVariantModel extends Model {
 
 			const pId = associatedProduct.pId;
 
+			// Igual que el `pId`: el `vId` de una presentación borrada sigue ocupado
 			const maxItem = await ProductVariantModel.findOne({
 				where: { vId: { [Op.like]: `${pId}%` } },
 				order: [['vId', 'DESC']],
 				transaction,
+				paranoid: false,
 			});
 
 			let nextVId = `${pId}0001`;
@@ -146,6 +148,7 @@ ProductVariantModel.init(
 		tableName: 'product_variant',
 		schema: 'public',
 		timestamps: true,
+		paranoid: true,
 		createdAt: 'createdDate',
 		updatedAt: 'updatedDate',
 		deletedAt: 'deletedDate',
@@ -169,18 +172,64 @@ ProductVariantModel.init(
 				}
 				await productVariant.validateProductVariantName(options.transaction);
 			},
+			// Mismo criterio que en producto: el nombre se comprueba solo si cambia
 			beforeUpdate: async productVariant => {
 				productVariant.name = productVariant.name.trim();
-				await productVariant.validateProductVariantName();
+
+				if (productVariant.changed('name')) {
+					await productVariant.validateProductVariantName();
+				}
 			},
-			beforeDestroy: async productVariant => {
-				const count = await StockItemProductVariantModel.count({
+			/**
+			 * Última defensa del borrado definitivo. Qué presentación se borra de
+			 * verdad y cuál solo se marca lo decide `ProductVariantService`, pero si
+			 * llegara aquí un `force` con historial detrás, las líneas de factura,
+			 * cotización o movimiento quedarían apuntando a una fila que ya no está.
+			 *
+			 * Cuenta las filas sin mirar su `deletedDate`: una factura anulada sigue
+			 * siendo una fila que referencia a esta presentación. La consulta es
+			 * directa para no importar los tres modelos, que importan este a su vez
+			 */
+			beforeDestroy: async (productVariant, options) => {
+				if (!options.force) return;
+
+				const [history] = await sequelize.query<{
+					billingItems: string;
+					quoteItems: string;
+					transactionItems: string;
+				}>(
+					`
+						SELECT
+							(SELECT COUNT(*) FROM billing_item WHERE "productVariantId" = :productVariantId) AS "billingItems",
+							(SELECT COUNT(*) FROM quote_item WHERE "productVariantId" = :productVariantId) AS "quoteItems",
+							(SELECT COUNT(*) FROM transaction_item WHERE "productVariantId" = :productVariantId) AS "transactionItems"
+					`,
+					{
+						replacements: { productVariantId: productVariant.id },
+						type: QueryTypes.SELECT,
+						transaction: options.transaction,
+					},
+				);
+
+				const total =
+					Number(history.billingItems) +
+					Number(history.quoteItems) +
+					Number(history.transactionItems);
+
+				if (total > 0) {
+					throw new Error(
+						'No se puede borrar definitivamente la presentación, porque tiene historial de facturas, cotizaciones o movimientos',
+					);
+				}
+
+				const stockItems = await StockItemProductVariantModel.count({
 					where: { productVariantId: productVariant.id },
+					transaction: options.transaction,
 				});
 
-				if (count > 0) {
+				if (stockItems > 0) {
 					throw new Error(
-						'No se puede borrar la presentación del producto, porque se encuentra en stock',
+						'No se puede borrar definitivamente la presentación, porque todavía está en alguna bodega',
 					);
 				}
 			},

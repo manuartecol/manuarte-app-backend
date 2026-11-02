@@ -16,6 +16,7 @@ import { BillingItemModel } from '../billing-item/model';
 import { BillingModel } from '../billing/model';
 import { StockModel } from '../stock/model';
 import { StockItemPriceModel } from '../stock-item-price/model';
+import { StockItemProductVariantModel } from '../associations/stock-item-product-variant-model';
 import { PriceTypeModel } from '../price-type/model';
 import {
 	CreateStockItemDto,
@@ -315,15 +316,23 @@ export class StockItemService {
 				],
 				include: [
 					{
+						/**
+						 * `paranoid: false` en los dos: esta ruta la usa la edición de un
+						 * movimiento ya existente. Sin esto, un movimiento viejo que
+						 * contenga una presentación borrada no se podría editar, porque
+						 * el `required: true` descartaría su item de stock
+						 */
 						model: ProductVariantModel,
 						as: 'productVariants',
 						required: true,
 						attributes: [],
+						paranoid: false,
 						include: [
 							{
 								model: ProductModel,
 								as: 'product',
 								attributes: [],
+								paranoid: false,
 							},
 						],
 					},
@@ -1146,6 +1155,60 @@ export class StockItemService {
 			prices,
 			cost: currency === 'COP' ? costCop : costUsd,
 		};
+	};
+
+	/**
+	 * Quita de las bodegas una presentación que se borra definitivamente. Solo
+	 * borra el `stock_item` que queda sin ninguna presentación: uno compartido
+	 * seguiría sirviendo a otra. Los precios se van con él, por el
+	 * `ON DELETE CASCADE` de `stock_item_price`
+	 */
+	deleteByProductVariant = async (
+		productVariantId: string,
+		transaction: Transaction,
+	) => {
+		try {
+			const links = await StockItemProductVariantModel.findAll({
+				attributes: ['stockItemId'],
+				where: { productVariantId },
+				transaction,
+			});
+
+			const stockItemIds = links.map(link =>
+				link.getDataValue('stockItemId'),
+			) as string[];
+
+			if (stockItemIds.length === 0) return;
+
+			await StockItemProductVariantModel.destroy({
+				where: { productVariantId },
+				transaction,
+			});
+
+			const stillLinked = await StockItemProductVariantModel.findAll({
+				attributes: ['stockItemId'],
+				where: { stockItemId: { [Op.in]: stockItemIds } },
+				transaction,
+			});
+
+			const linkedIds = new Set(
+				stillLinked.map(link => link.getDataValue('stockItemId')),
+			);
+			const orphanIds = stockItemIds.filter(id => !linkedIds.has(id));
+
+			if (orphanIds.length === 0) return;
+
+			await this.stockItemModel.destroy({
+				where: { id: { [Op.in]: orphanIds } },
+				transaction,
+			});
+		} catch (error) {
+			console.error(
+				'ServiceError eliminando los items de stock de la presentación: ',
+				error,
+			);
+			throw error;
+		}
 	};
 
 	setActiveStocks = async (

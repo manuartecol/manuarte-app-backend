@@ -25,6 +25,25 @@ export interface UpdateProductVariantDto {
 	requestedBy: string;
 }
 
+/**
+ * `blocked` es inventario vivo: no se borra de ninguna forma. `logical` guarda
+ * la fila porque hay documentos que la referencian, y `physical` la quita
+ */
+export interface ProductVariantDeletionPlan {
+	mode: 'physical' | 'logical' | 'blocked';
+	/**
+	 * Todas las filas que referencian la presentación, incluidas las de facturas
+	 * anuladas o borradas: son las que deciden si el borrado puede ser físico.
+	 * Los tres conteos de abajo son solo de documentos vivos, que es lo que se le
+	 * muestra al usuario, y pueden sumar menos que esto
+	 */
+	historyRows: number;
+	billingItems: number;
+	quoteItems: number;
+	transactionItems: number;
+	stocksWithUnits: { name: string; quantity: number }[];
+}
+
 export interface ProductVariantFilters {
 	vId?: string;
 	productName?: string;

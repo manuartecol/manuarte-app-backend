@@ -1,4 +1,4 @@
-import { DataTypes, Model } from 'sequelize';
+import { DataTypes, Model, QueryTypes } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { Op } from 'sequelize';
 
@@ -9,9 +9,11 @@ export class ProductCategoryModel extends Model {
 
 	async generateCId() {
 		try {
+			// Igual que el `pId`: el `cId` de una categoría borrada sigue ocupado
 			const lastCategory = await ProductCategoryModel.findOne({
 				where: { cId: { [Op.not]: null } },
 				order: [['cId', 'DESC']],
+				paranoid: false,
 			});
 
 			let nextCId = '0001';
@@ -102,6 +104,7 @@ ProductCategoryModel.init(
 		tableName: 'product_category',
 		schema: 'public',
 		timestamps: true,
+		paranoid: true,
 		createdAt: 'createdDate',
 		updatedAt: 'updatedDate',
 		deletedAt: 'deletedDate',
@@ -125,6 +128,26 @@ ProductCategoryModel.init(
 			beforeUpdate: async productCategory => {
 				productCategory.name = productCategory.name.toUpperCase().trim();
 				await productCategory.validateProductCategoryName();
+			},
+			// Mismo criterio que en producto: los productos borrados siguen
+			// referenciando su categoría
+			beforeDestroy: async (productCategory, options) => {
+				if (!options.force) return;
+
+				const [products] = await sequelize.query<{ total: string }>(
+					'SELECT COUNT(*) AS total FROM product WHERE "productCategoryId" = :productCategoryId',
+					{
+						replacements: { productCategoryId: productCategory.id },
+						type: QueryTypes.SELECT,
+						transaction: options.transaction,
+					},
+				);
+
+				if (Number(products.total) > 0) {
+					throw new Error(
+						'No se puede borrar definitivamente la categoría, porque todavía tiene productos',
+					);
+				}
 			},
 		},
 	},

@@ -1,4 +1,4 @@
-import { DataTypes, Model } from 'sequelize';
+import { DataTypes, Model, QueryTypes } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { ProductCategoryModel } from '../product-category/model';
 import { ProductVariantModel } from '../product-variant/model';
@@ -27,9 +27,12 @@ export class ProductModel extends Model {
 
 			const cId = productCategory.cId;
 
+			// `paranoid: false`: un producto borrado conserva su fila y su `pId`, que
+			// sigue ocupado por el índice único. Sin esto se repetiría el número
 			const lastProduct = await ProductModel.findOne({
 				where: { pId: { [Op.like]: `${cId}%` } },
 				order: [['pId', 'DESC']],
+				paranoid: false,
 			});
 
 			let nextPId = `${cId}0001`;
@@ -142,6 +145,7 @@ ProductModel.init(
 		tableName: 'product',
 		schema: 'public',
 		timestamps: true,
+		paranoid: true,
 		createdAt: 'createdDate',
 		updatedAt: 'updatedDate',
 		deletedAt: 'deletedDate',
@@ -166,10 +170,41 @@ ProductModel.init(
 			// La categoría se puede cambiar. El `pId` no se regenera: los `vId` de
 			// las etiquetas impresas cuelgan de él, así que su prefijo de categoría
 			// queda como histórico
+			// Solo se valida el nombre si cambia: el catálogo trae nombres
+			// duplicados de antes de esta validación, y comprobarlos en cada
+			// guardado impedía editarles la descripción o la categoría
 			beforeUpdate: async product => {
 				product.name = product.name.trim();
 				product.normalizeDescription();
-				await product.validateProductName();
+
+				if (product.changed('name')) {
+					await product.validateProductName();
+				}
+			},
+			/**
+			 * Un producto no se puede borrar definitivamente mientras le quede
+			 * alguna presentación, ni siquiera marcada como borrada: esa fila lo
+			 * referencia. Las presentaciones borradas no se descuentan, de ahí el
+			 * conteo directo en vez de `ProductVariantModel.count`, que ahora las
+			 * esconde
+			 */
+			beforeDestroy: async (product, options) => {
+				if (!options.force) return;
+
+				const [variants] = await sequelize.query<{ total: string }>(
+					'SELECT COUNT(*) AS total FROM product_variant WHERE "productId" = :productId',
+					{
+						replacements: { productId: product.id },
+						type: QueryTypes.SELECT,
+						transaction: options.transaction,
+					},
+				);
+
+				if (Number(variants.total) > 0) {
+					throw new Error(
+						'No se puede borrar definitivamente el producto, porque todavía tiene presentaciones',
+					);
+				}
 			},
 		},
 	},

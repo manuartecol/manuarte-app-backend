@@ -17,7 +17,20 @@ export class ProductCategoryService {
 		try {
 			const categories = await this.productCategoryModel.findAll({
 				attributes: {
-					include: [[sequelize.col('productCategoryGroup.name'), 'groupName']],
+					include: [
+						[sequelize.col('productCategoryGroup.name'), 'groupName'],
+						// Para que el aviso de borrado diga cuántos productos tiene en vez
+						// de dejar al usuario confirmar y recibir un error
+						[
+							sequelize.literal(`(
+								SELECT COUNT(*)::int
+								FROM product p
+								WHERE p."productCategoryId" = "ProductCategoryModel".id
+									AND p."deletedDate" IS NULL
+							)`),
+							'productsCount',
+						],
+					],
 				},
 				include: [
 					{
@@ -110,19 +123,30 @@ export class ProductCategoryService {
 				})
 			: null;
 
+		// El conteo va también aquí: si faltara, la tabla se quedaría sin él tras
+		// crear o editar y el aviso de borrado diría que la categoría está vacía
+		const productsCount = await this.productModel.count({
+			where: { productCategoryId: productCategory.getDataValue('id') },
+		});
+
 		return {
 			...productCategory.dataValues,
 			groupName: group?.getDataValue('name') ?? null,
+			productsCount,
 		};
 	};
 
 	delete = async (id: string) => {
+		const transaction = await sequelize.transaction();
 		try {
 			const productsCount = await this.productModel.count({
 				where: { productCategoryId: id },
+				transaction,
 			});
 
 			if (productsCount > 0) {
+				await transaction.rollback();
+
 				return {
 					success: false,
 					message:
@@ -130,15 +154,62 @@ export class ProductCategoryService {
 				};
 			}
 
-			await this.productCategoryModel.destroy({
-				where: { id },
+			const productCategoryToDelete = await this.productCategoryModel.findByPk(
+				id,
+				{ transaction },
+			);
+
+			if (!productCategoryToDelete) {
+				await transaction.rollback();
+
+				return {
+					success: false,
+					message: 'No se encontró la categoría que intentas eliminar',
+				};
+			}
+
+			// Los productos borrados siguen referenciando su categoría, así que
+			// mientras quede alguna fila la categoría solo se marca como borrada
+			const remainingProducts = await this.productModel.count({
+				where: { productCategoryId: id },
+				paranoid: false,
+				transaction,
 			});
+
+			await productCategoryToDelete.destroy({
+				force: remainingProducts === 0,
+				transaction,
+			});
+
+			/**
+			 * Se vuelve a contar después de borrar, no antes: un producto creado
+			 * entre el primer conteo y el borrado seguiría vivo apuntando a una
+			 * categoría marcada como borrada. Contar aquí sí lo ve, porque la
+			 * inserción ya está confirmada, y entonces se deshace todo
+			 */
+			const productsAfter = await this.productModel.count({
+				where: { productCategoryId: id },
+				transaction,
+			});
+
+			if (productsAfter > 0) {
+				await transaction.rollback();
+
+				return {
+					success: false,
+					message:
+						'No se puede eliminar la categoría, porque tiene productos asociados',
+				};
+			}
+
+			await transaction.commit();
 
 			return {
 				success: true,
 				message: 'La categoría de producto fue eliminada con éxito',
 			};
 		} catch (error) {
+			await transaction.rollback();
 			console.error('ServiceError eliminando categoría de producto: ', error);
 			throw error;
 		}
