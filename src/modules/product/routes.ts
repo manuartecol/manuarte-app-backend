@@ -16,6 +16,11 @@ router.get(
 	authorize(ProductPermissions.PRODUCT_READ),
 	productController.getAll,
 );
+router.get(
+	'/deletion-preview',
+	authorize(ProductPermissions.PRODUCT_DELETE),
+	productController.deletionPreview,
+);
 router.post(
 	'/',
 	authorize(ProductPermissions.PRODUCT_CREATE),

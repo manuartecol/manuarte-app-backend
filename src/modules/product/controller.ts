@@ -88,23 +88,43 @@ export class ProductController {
 		}
 	};
 
+	deletionPreview: Handler = async (req, res, next) => {
+		try {
+			const productId = (req.query.productId as string) || '';
+			const productVariantId = (req.query.productVariantId as string) || '';
+
+			const preview = await this.productService.getDeletionPreview(
+				productId,
+				productVariantId,
+			);
+
+			res.status(200).json(preview);
+		} catch (error) {
+			next(error);
+		}
+	};
+
 	delete: Handler = async (req, res, next) => {
 		try {
 			const productId = (req.query.productId as string) || '';
 			const productVariantId = (req.query.productVariantId as string) || '';
 
-			const result = await this.productService.delete(
+			const { productDeleted, mode } = await this.productService.delete(
 				productId,
 				productVariantId,
 			);
 
-			const productDeleted = result.productDeleted === 1;
+			const subject = productDeleted
+				? 'Producto y su presentación eliminados con éxito'
+				: 'Presentación del producto eliminada con éxito';
 
 			res.status(200).json({
 				productDeleted,
-				message: productDeleted
-					? 'Producto y su presentación eliminados con éxito'
-					: 'Presentación del producto eliminada con éxito',
+				mode,
+				message:
+					mode === 'logical'
+						? `${subject}. Se conserva su historial de facturas, cotizaciones y movimientos`
+						: subject,
 			});
 		} catch (error) {
 			next(error);
