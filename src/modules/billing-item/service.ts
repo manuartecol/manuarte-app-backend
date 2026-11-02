@@ -13,8 +13,21 @@ import { ProductCategoryModel } from '../product-category/model';
 import { ProductCategoryGroupModel } from '../product-category-group/model';
 import { StockOperation } from '../stock-item/types';
 
-const FLETE = 'e0490768-3cdb-4abe-9a3d-c87cda126f45';
-const DESCUENTO = '07d7284f-547e-4bbd-a4bb-2cf94b0c2e1a';
+/**
+ * El flete y el descuento se cobraban como si fueran productos; hoy son
+ * columnas de `billing`. Sus filas siguen en el catálogo y quedan fuera de todo
+ * reporte de producto: el flete arrastra 540 facturas históricas, la última del
+ * 22 de febrero de 2025, y el descuento no llegó a usarse ni una vez. El
+ * descuento de una factura ya entra en estas cifras por `billing.discount`, no
+ * por una línea de producto.
+ *
+ * Van en una sola lista porque estaban repartidos por seis consultas y la mitad
+ * excluía solo el flete, así que cada cifra salía con un criterio distinto
+ */
+const LEGACY_NON_PRODUCT_VARIANTS = [
+	'e0490768-3cdb-4abe-9a3d-c87cda126f45', // FLETE
+	'07d7284f-547e-4bbd-a4bb-2cf94b0c2e1a', // DESCUENTO
+];
 
 export class BillingItemService {
 	private billingItemModel;
@@ -115,14 +128,16 @@ export class BillingItemService {
 						as: 'billingItems',
 						attributes: [],
 						required: true,
-						include: [
-							{
-								model: ProductVariantModel,
-								as: 'productVariant',
-								attributes: [],
-								where: { deletedDate: null },
-							},
-						],
+						/**
+						 * Antes el flete quedaba fuera por un filtro de `deletedDate`
+						 * sobre la presentación, y funcionaba de rebote: es la única
+						 * marcada como borrada. En cuanto se borrara una presentación de
+						 * verdad, ese filtro le habría quitado sus ventas a meses ya
+						 * cerrados
+						 */
+						where: {
+							productVariantId: { [Op.notIn]: LEGACY_NON_PRODUCT_VARIANTS },
+						},
 					},
 				],
 				group: [
@@ -227,7 +242,7 @@ export class BillingItemService {
 			const result = await this.billingItemModel.findAll({
 				where: {
 					currency,
-					productVariantId: { [Op.notIn]: [FLETE, DESCUENTO] },
+					productVariantId: { [Op.notIn]: LEGACY_NON_PRODUCT_VARIANTS },
 				},
 				attributes: [
 					[
@@ -255,16 +270,23 @@ export class BillingItemService {
 						},
 					},
 					{
+						/**
+						 * `paranoid: false` en los dos: la presentación solo entra para
+						 * poner el nombre. Sin esto, borrar una presentación la sacaría
+						 * del top de un mes ya cerrado, y lo mismo al borrar su producto
+						 */
 						model: ProductVariantModel,
 						as: 'productVariant',
 						required: true,
 						attributes: [],
+						paranoid: false,
 						include: [
 							{
 								model: ProductModel,
 								as: 'product',
 								required: true,
 								attributes: [],
+								paranoid: false,
 							},
 						],
 					},
@@ -354,7 +376,11 @@ export class BillingItemService {
 		endDate: Date,
 	) => {
 		const result = await this.billingItemModel.findOne({
-			where: { currency },
+			// Mismo caso que `getMonthlySales`: excluía el flete por su `deletedDate`
+			where: {
+				currency,
+				productVariantId: { [Op.notIn]: LEGACY_NON_PRODUCT_VARIANTS },
+			},
 			attributes: [
 				[
 					sequelize.fn('SUM', sequelize.col('BillingItemModel.quantity')),
@@ -403,12 +429,6 @@ export class BillingItemService {
 						status: BillingStatus.PAID,
 					},
 				},
-				{
-					model: ProductVariantModel,
-					as: 'productVariant',
-					attributes: [],
-					where: { deletedDate: null },
-				},
 			],
 			raw: true,
 		});
@@ -424,7 +444,7 @@ export class BillingItemService {
 		const result = await this.billingItemModel.findAll({
 			where: {
 				currency,
-				productVariantId: { [Op.ne]: FLETE },
+				productVariantId: { [Op.notIn]: LEGACY_NON_PRODUCT_VARIANTS },
 			},
 			attributes: [
 				[
@@ -533,7 +553,7 @@ export class BillingItemService {
 		const result = await this.billingItemModel.findAll({
 			where: {
 				currency,
-				productVariantId: { [Op.ne]: FLETE },
+				productVariantId: { [Op.notIn]: LEGACY_NON_PRODUCT_VARIANTS },
 			},
 			attributes: [
 				[
@@ -710,13 +730,18 @@ export class BillingItemService {
 					COALESCE(cp."priceDis", 0) AS "priceDis",
 					COALESCE(s."totalRevenue", 0) AS "totalRevenue"
 				FROM product_variant pv
-				INNER JOIN product p ON p.id = pv."productId" AND p."deletedDate" IS NULL
-				INNER JOIN product_category pc ON pc.id = p."productCategoryId" AND pc."deletedDate" IS NULL
+				INNER JOIN product p ON p.id = pv."productId"
+				INNER JOIN product_category pc ON pc.id = p."productCategoryId"
 				LEFT JOIN product_category_group pcg ON pcg.id = pc."productCategoryGroupId" AND pcg."deletedDate" IS NULL
 				LEFT JOIN sales s ON s."productVariantId" = pv.id
 				LEFT JOIN catalog_prices cp ON cp."productVariantId" = pv.id
-				WHERE pv."deletedDate" IS NULL
-					AND pv.id NOT IN (:flete, :descuento)
+				-- Una presentación borrada aparece solo si vendió en el periodo, y su
+				-- producto y categoría ya no la excluyen: así el reporte no pierde
+				-- ventas al borrar, y las borradas que nunca vendieron no lo ensucian
+				WHERE (pv."deletedDate" IS NULL OR s."productVariantId" IS NOT NULL)
+					-- Con ALL y no con NOT IN: si la lista quedara vacía esto deja de
+					-- filtrar, mientras que NOT IN () sería un error de sintaxis
+					AND pv.id <> ALL(ARRAY[:legacyVariants]::uuid[])
 				ORDER BY "totalQuantity" DESC, pv.name ASC
 			`,
 			{
@@ -725,8 +750,7 @@ export class BillingItemService {
 					startDate,
 					endDate,
 					status: BillingStatus.PAID,
-					flete: FLETE,
-					descuento: DESCUENTO,
+					legacyVariants: LEGACY_NON_PRODUCT_VARIANTS,
 				},
 				type: QueryTypes.SELECT,
 			},

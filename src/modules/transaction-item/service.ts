@@ -39,14 +39,22 @@ export class TransactionItemService {
 				],
 				include: [
 					{
+						/**
+						 * `paranoid: false` en los dos: `transaction_item` no guarda el
+						 * nombre, lo toma de aquí. Sin esto, una presentación borrada
+						 * dejaba la línea del movimiento con el nombre en blanco y sin
+						 * item de stock, porque el LEFT JOIN no encontraba la fila
+						 */
 						model: ProductVariantModel,
 						as: 'productVariants',
 						attributes: [],
+						paranoid: false,
 						include: [
 							{
 								model: ProductModel,
 								as: 'product',
 								attributes: [],
+								paranoid: false,
 							},
 							{
 								// `required: false` porque el 3% de los ítems históricos ya no
