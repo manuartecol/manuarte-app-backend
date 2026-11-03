@@ -12,11 +12,8 @@ export class UserController {
 		try {
 			const users = await this.userService.getAll();
 
-			if (users.length > 0) {
-				res.status(200).json(users);
-			} else {
-				res.sendStatus(204);
-			}
+			// La lista vacía viaja como arreglo vacío, no como 204 sin cuerpo
+			res.status(200).json(users);
 		} catch (error) {
 			next(error);
 		}

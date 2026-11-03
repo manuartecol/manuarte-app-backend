@@ -34,11 +34,14 @@ export class ProductVariantController {
 				filters,
 			);
 
-			if (result.productVariants.length > 0) {
-				res.status(200).json(result);
-			} else {
-				res.sendStatus(204);
-			}
+			/**
+			 * Siempre 200 con el cuerpo completo, también con la lista vacía. Con el
+			 * 204 que había antes, axios resolvía con el cuerpo vacío y el panel
+			 * guardaba `undefined` donde esperaba el arreglo de presentaciones: la
+			 * tabla se veía igual, pero la siguiente creación de un producto
+			 * reventaba al expandirlo. Una página sin resultados es un resultado
+			 */
+			res.status(200).json(result);
 		} catch (error) {
 			next(error);
 		}

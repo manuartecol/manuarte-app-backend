@@ -29,11 +29,13 @@ export class CustomerController {
 				isoCode,
 			);
 
-			if (result.customers.length > 0) {
-				res.status(200).json(result);
-			} else {
-				res.sendStatus(204);
-			}
+			/**
+			 * Siempre 200 con el cuerpo completo, también con la lista vacía. Con el
+			 * 204 que había antes, axios resolvía con el cuerpo vacío y el panel
+			 * guardaba `undefined` donde esperaba el arreglo: la tabla se veía igual,
+			 * pero la siguiente escritura sobre esa lista reventaba al expandirla
+			 */
+			res.status(200).json(result);
 		} catch (error) {
 			next(error);
 		}
@@ -150,11 +152,8 @@ export class CustomerController {
 				isoCode,
 			);
 
-			if (result.topCustomers.length > 0) {
-				res.status(200).json(result);
-			} else {
-				res.sendStatus(204);
-			}
+			// Mismo criterio que en `getAll`: la lista vacía viaja con su cuerpo
+			res.status(200).json(result);
 		} catch (error) {
 			next(error);
 		}

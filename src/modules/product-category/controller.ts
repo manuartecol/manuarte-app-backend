@@ -32,11 +32,8 @@ export class ProductCategoryController {
 		try {
 			const categories = await this.productCategoryService.getAll();
 
-			if (categories && categories.length > 0) {
-				res.status(200).json(categories);
-			} else {
-				res.sendStatus(204);
-			}
+			// Mismo criterio: la lista vacía viaja como arreglo vacío, no como 204
+			res.status(200).json(categories ?? []);
 		} catch (error) {
 			next(error);
 		}
