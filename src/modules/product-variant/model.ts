@@ -41,7 +41,7 @@ export class ProductVariantModel extends Model {
 
 				if (isNaN(nextNumericId)) {
 					throw new Error(
-						`Formato de vId inválido en la última variante: ${maxItem.vId}`,
+						`Formato de vId inválido en la última presentación: ${maxItem.vId}`,
 					);
 				}
 
@@ -52,7 +52,7 @@ export class ProductVariantModel extends Model {
 		} catch (error) {
 			console.error('Error generando vId:', error);
 			throw new Error(
-				'No se pudo generar un nuevo vId para la variante del producto',
+				'No se pudo generar un nuevo vId para la presentación del producto',
 			);
 		}
 	}

@@ -13,11 +13,8 @@ export class ProductController {
 		try {
 			const products = await this.productService.getAll();
 
-			if (products.length > 0) {
-				res.status(200).json(products);
-			} else {
-				res.sendStatus(204);
-			}
+			// Mismo criterio: la lista vacía viaja como arreglo vacío, no como 204
+			res.status(200).json(products);
 		} catch (error) {
 			next(error);
 		}
@@ -83,6 +80,28 @@ export class ProductController {
 				newProductVariant,
 				message: 'Presentación del producto creada con éxito',
 			});
+		} catch (error) {
+			next(error);
+		}
+	};
+
+	getAllWithVariants: Handler = async (req, res, next) => {
+		try {
+			const page = Number(req.query.page) || 1;
+			const pageSize = Number(req.query.pageSize) || 30;
+
+			const result = await this.productService.getAllWithVariants(
+				page,
+				pageSize,
+				{
+					pId: req.query.pId as string,
+					name: req.query.productName as string,
+					description: req.query.productDescription as string,
+					productCategoryName: req.query.productCategoryName as string,
+				},
+			);
+
+			res.status(200).json(result);
 		} catch (error) {
 			next(error);
 		}

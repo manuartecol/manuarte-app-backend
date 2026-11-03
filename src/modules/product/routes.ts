@@ -17,6 +17,11 @@ router.get(
 	productController.getAll,
 );
 router.get(
+	'/with-variants',
+	authorize(ProductPermissions.PRODUCT_READ),
+	productController.getAllWithVariants,
+);
+router.get(
 	'/deletion-preview',
 	authorize(ProductPermissions.PRODUCT_DELETE),
 	productController.deletionPreview,

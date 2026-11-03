@@ -23,13 +23,45 @@ export interface CreateProductDto {
 export interface UpdateProductDto {
 	id: string;
 	productData: Partial<ProductAttr>;
-	productVariantData: {
+	/**
+	 * Opcionales: editar el producto y editar una presentación son dos acciones
+	 * distintas desde que el modal está separado. Antes llegaban siempre juntas y
+	 * el nombre del producto viajaba como nombre de la presentación
+	 */
+	productVariantData?: {
 		id: string;
 		name: string;
 		active: boolean;
 	};
-	stockIds: string[];
+	stockIds?: string[];
 	requestedBy: string;
+}
+
+export interface ProductFilters {
+	pId?: string;
+	name?: string;
+	description?: string;
+	productCategoryName?: string;
+}
+
+export interface ProductWithVariants {
+	id: string;
+	pId: string;
+	name: string;
+	description: string | null;
+	productCategoryId: string;
+	productCategoryName: string;
+	variantsCount: number;
+	productVariants: {
+		id: string;
+		vId: string;
+		name: string;
+		active: boolean;
+		productId: string;
+		// Las bodegas donde está activa, y en cuántas existe en total
+		stockIds: string[];
+		stocksCount: number;
+	}[];
 }
 
 export interface AddProductVariantDto {

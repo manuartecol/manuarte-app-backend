@@ -1,3 +1,4 @@
+import { QueryTypes } from 'sequelize';
 import { ProductModel } from './model';
 import { ProductCategoryModel } from '../product-category/model';
 import { ProductVariantService } from '../product-variant/service';
@@ -5,6 +6,8 @@ import { ProductVariantModel } from '../product-variant/model';
 import {
 	AddProductVariantDto,
 	CreateProductDto,
+	ProductFilters,
+	ProductWithVariants,
 	UpdateProductDto,
 } from './types';
 import { StockItemService } from '../stock-item/service';
@@ -34,6 +37,124 @@ export class ProductService {
 			return products;
 		} catch (error) {
 			console.error('ServiceError obteniendo productos: ', error);
+			throw error;
+		}
+	};
+
+	/**
+	 * El producto con sus presentaciones anidadas, paginando por producto y no
+	 * por presentación. Va en SQL y no en un include de Sequelize porque con
+	 * `limit` sobre un `hasMany` hay que elegir entre paginar mal o traer el
+	 * catálogo entero, y porque cada presentación necesita su array de bodegas,
+	 * que es una subconsulta propia
+	 */
+	getAllWithVariants = async (
+		page: number = 1,
+		pageSize: number = 30,
+		filters: ProductFilters = {},
+	) => {
+		try {
+			const conditions: string[] = ['p."deletedDate" IS NULL'];
+			const replacements: Record<string, unknown> = {};
+
+			if (filters.pId) {
+				conditions.push('p."pId" ILIKE :pId');
+				replacements.pId = `%${filters.pId}%`;
+			}
+			if (filters.name) {
+				conditions.push('p.name ILIKE :name');
+				replacements.name = `%${filters.name}%`;
+			}
+			if (filters.description) {
+				conditions.push('p.description ILIKE :description');
+				replacements.description = `%${filters.description}%`;
+			}
+			if (filters.productCategoryName) {
+				conditions.push('pc.name ILIKE :productCategoryName');
+				replacements.productCategoryName = `%${filters.productCategoryName}%`;
+			}
+
+			const where = conditions.join('\n\t\t\t\t\t\tAND ');
+
+			const [{ total }] = await sequelize.query<{ total: string }>(
+				`
+					SELECT COUNT(*) AS total
+					FROM product p
+					INNER JOIN product_category pc ON pc.id = p."productCategoryId"
+					WHERE ${where}
+				`,
+				{ replacements, type: QueryTypes.SELECT },
+			);
+
+			const products = await sequelize.query<ProductWithVariants>(
+				`
+					SELECT
+						p.id,
+						p."pId",
+						p.name,
+						p.description,
+						p."productCategoryId",
+						pc.name AS "productCategoryName",
+						COALESCE(v.total, 0) AS "variantsCount",
+						COALESCE(v.variants, '[]'::json) AS "productVariants"
+					FROM product p
+					INNER JOIN product_category pc ON pc.id = p."productCategoryId"
+					LEFT JOIN LATERAL (
+						SELECT COUNT(*) AS total, json_agg(x ORDER BY x.name ASC) AS variants
+						FROM (
+							SELECT
+								pv.id,
+								pv."vId",
+								pv.name,
+								pv.active,
+								pv."productId",
+								COALESCE((
+									SELECT array_agg(DISTINCT si."stockId")
+									FROM stock_item_product_variant sipv
+									INNER JOIN stock_item si ON si.id = sipv."stockItemId"
+									WHERE sipv."productVariantId" = pv.id
+										AND si.active = true
+								), '{}') AS "stockIds",
+								(
+									SELECT COUNT(DISTINCT si."stockId")
+									FROM stock_item_product_variant sipv
+									INNER JOIN stock_item si ON si.id = sipv."stockItemId"
+									WHERE sipv."productVariantId" = pv.id
+								) AS "stocksCount"
+							FROM product_variant pv
+							WHERE pv."productId" = p.id
+								AND pv."deletedDate" IS NULL
+						) x
+					) v ON true
+					WHERE ${where}
+					ORDER BY p.name ASC
+					LIMIT :limit OFFSET :offset
+				`,
+				{
+					replacements: {
+						...replacements,
+						limit: pageSize,
+						offset: (page - 1) * pageSize,
+					},
+					type: QueryTypes.SELECT,
+				},
+			);
+
+			return {
+				products: products.map(product => ({
+					...product,
+					variantsCount: Number(product.variantsCount),
+				})),
+				total: Number(total),
+				page,
+				pageSize,
+				totalPages: Math.ceil(Number(total) / pageSize),
+			};
+		} catch (error) {
+			console.error(
+				'ServiceError obteniendo productos con sus presentaciones: ',
+				error,
+			);
 			throw error;
 		}
 	};
@@ -125,16 +246,19 @@ export class ProductService {
 				{ transaction },
 			);
 
-			const updatedProductVariant = await this.productVariantService.update(
-				{
-					id: productVariantData.id,
-					name: productVariantData.name,
-					active: productVariantData.active,
-					stockIds,
-					requestedBy,
-				},
-				transaction,
-			);
+			// Solo si llega: editar el producto no toca ninguna presentación
+			const updatedProductVariant = productVariantData
+				? await this.productVariantService.update(
+						{
+							id: productVariantData.id,
+							name: productVariantData.name,
+							active: productVariantData.active,
+							stockIds,
+							requestedBy,
+						},
+						transaction,
+					)
+				: undefined;
 
 			await transaction.commit();
 
