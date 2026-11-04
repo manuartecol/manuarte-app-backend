@@ -20,6 +20,7 @@
     npm run migrate:env -- production
     npm run migrate:env -- staging status    solo ver qué hay pendiente
     npm run migrate:env -- staging migrate:undo
+    npm run migrate:env -- staging seed 20261103123000-insert-variant-catalog.js
 #>
 [CmdletBinding()]
 param(
@@ -28,8 +29,12 @@ param(
 	[string]$Environment,
 
 	[Parameter(Position = 1)]
-	[ValidateSet('migrate', 'migrate:undo', 'seed:all', 'status')]
-	[string]$Command = 'migrate'
+	[ValidateSet('migrate', 'migrate:undo', 'seed', 'seed:all', 'status')]
+	[string]$Command = 'migrate',
+
+	# Solo para 'seed': el archivo de seeders/ que se va a correr
+	[Parameter(Position = 2)]
+	[string]$Seeder
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,7 +99,7 @@ $exitCode = 1
 # un migrate normal, o sea que se teclea por costumbre. Se bloquea aquí: si
 # alguna vez hace falta de verdad, se prepara a mano, con un dump reciente
 # hecho y verificado antes.
-if ($Environment -eq 'production' -and $Command -in @('migrate:undo', 'seed:all')) {
+if ($Environment -eq 'production' -and $Command -eq 'migrate:undo') {
 	Write-Host ''
 	Write-Host "  '$Command' is blocked against production." -ForegroundColor Red
 	Write-Host '  43 of 62 migrations drop columns or tables on their down step.' -ForegroundColor Red
@@ -103,9 +108,53 @@ if ($Environment -eq 'production' -and $Command -in @('migrate:undo', 'seed:all'
 	exit 1
 }
 
+# `seed:all` solo tiene sentido sobre una base vacía. config/config.js no define
+# `seederStorage`, así que sequelize-cli usa 'none': los seeders NO se registran
+# en ninguna tabla y `db:seed:all` vuelve a correr los 27 desde el primero. En
+# una base ya sembrada eso revienta en el seeder de permisos, porque
+# permission.name es UNIQUE, y deja a medias lo que hubiera corrido antes.
+# Peor: `city` no tiene ninguna restricción única, así que un orden distinto
+# duplicaría todas las ciudades en silencio. Contra un servidor se siembra de
+# uno en uno, con `seed`.
+if ($target.Remote -and $Command -eq 'seed:all') {
+	Write-Host ''
+	Write-Host "  'seed:all' is blocked against $Environment." -ForegroundColor Red
+	Write-Host '  Seeders are not tracked (no seederStorage), so it re-runs all 27' -ForegroundColor Red
+	Write-Host '  from the first one. Run a single seeder instead:' -ForegroundColor Red
+	Write-Host "    npm run migrate:env -- $Environment seed <file.js>" -ForegroundColor Yellow
+	Write-Host ''
+	exit 1
+}
+
+if ($Command -eq 'seed') {
+	if (-not $Seeder) {
+		Write-Host ''
+		Write-Host '  Which seeder? Pass the file name from seeders/:' -ForegroundColor Red
+		Write-Host "    npm run migrate:env -- $Environment seed <file.js>" -ForegroundColor Yellow
+		Write-Host ''
+		exit 1
+	}
+
+	# Se comprueba antes de pedir la contraseña: un nombre mal escrito hace que
+	# sequelize-cli termine en 0 sin insertar nada, y eso se lee como éxito.
+	if (-not (Test-Path (Join-Path 'seeders' $Seeder))) {
+		Write-Host ''
+		Write-Host "  seeders/$Seeder does not exist." -ForegroundColor Red
+		Write-Host ''
+		exit 1
+	}
+}
+
+# Qué se va a ejecutar de verdad, ya resuelto, para imprimirlo y para correrlo
+$runArgs = switch ($Command) {
+	'status' { $null }
+	'seed' { @('run', 'seed', '--', $Seeder) }
+	default { @('run', $Command) }
+}
+
 Write-Host ''
 Write-Host "  target  : $($target.Label)" -ForegroundColor Cyan
-Write-Host "  command : $(if ($Command -eq 'status') { 'status only' } else { "npm run $Command" })" -ForegroundColor Cyan
+Write-Host "  command : $(if ($Command -eq 'status') { 'status only' } else { "npm $($runArgs -join ' ')" })" -ForegroundColor Cyan
 
 # ── local: no se inyecta nada, dotenv lee .env tal cual ──────────────────────
 if (-not $target.Remote) {
@@ -114,7 +163,7 @@ if (-not $target.Remote) {
 	node scripts/db-target.js
 	if ($LASTEXITCODE -ne 0) { exit 1 }
 	Write-Host ''
-	if ($Command -eq 'status') { npx sequelize-cli db:migrate:status } else { npm run $Command }
+	if ($Command -eq 'status') { npx sequelize-cli db:migrate:status } else { npm @runArgs }
 	exit $LASTEXITCODE
 }
 
@@ -160,10 +209,10 @@ try {
 
 	if ($exitCode -eq 0 -and $Command -ne 'status') {
 		Write-Host ''
-		$answer = Read-Host "Type '$($target.Keyword)' to run 'npm run $Command' against $($target.Label)"
+		$answer = Read-Host "Type '$($target.Keyword)' to run 'npm $($runArgs -join ' ')' against $($target.Label)"
 		if ($answer -eq $target.Keyword) {
 			Write-Host ''
-			npm run $Command
+			npm @runArgs
 			$exitCode = $LASTEXITCODE
 		}
 		else {

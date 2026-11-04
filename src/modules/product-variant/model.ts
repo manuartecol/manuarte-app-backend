@@ -12,6 +12,12 @@ export class ProductVariantModel extends Model {
 	public vId!: string;
 	public createdBy!: string;
 	public updatedBy!: string;
+	public quantityValue!: string | null;
+	public unitId!: string | null;
+	public containerId!: string | null;
+	public isCapacity!: boolean;
+	public quantityBase!: string | null;
+	public variantKey!: string | null;
 
 	async generateVId(transaction: Transaction) {
 		try {
@@ -101,6 +107,47 @@ ProductVariantModel.init(
 			type: DataTypes.INTEGER,
 			allowNull: false,
 			defaultValue: 0,
+		},
+		/**
+		 * Los ejes estructurados, todos opcionales e independientes. Las columnas
+		 * DECIMAL llegan como string desde `pg` y se dejan así a propósito: un
+		 * getter que las convirtiera no se aplicaría en las consultas `raw`, y la
+		 * tabla de productos usa SQL crudo. La conversión se hace en el servicio,
+		 * en un solo sitio
+		 */
+		quantityValue: {
+			type: DataTypes.DECIMAL(12, 3),
+			allowNull: true,
+		},
+		unitId: {
+			type: DataTypes.UUID,
+			allowNull: true,
+			references: {
+				model: 'measurement_unit',
+				key: 'id',
+			},
+		},
+		containerId: {
+			type: DataTypes.UUID,
+			allowNull: true,
+			references: {
+				model: 'container',
+				key: 'id',
+			},
+		},
+		isCapacity: {
+			type: DataTypes.BOOLEAN,
+			allowNull: false,
+			defaultValue: false,
+		},
+		// Derivadas de las anteriores: las calcula `helpers/composition`
+		quantityBase: {
+			type: DataTypes.DECIMAL(18, 6),
+			allowNull: true,
+		},
+		variantKey: {
+			type: DataTypes.TEXT,
+			allowNull: true,
 		},
 		productId: {
 			type: DataTypes.UUID,
