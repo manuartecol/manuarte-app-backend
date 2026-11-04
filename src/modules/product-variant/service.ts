@@ -5,11 +5,29 @@ import { ProductModel } from '../product/model';
 import { StockItemModel } from '../stock-item/model';
 import { StockItemService } from '../stock-item/service';
 import { ProductVariantModel } from './model';
+import { MeasurementUnitModel } from '../measurement-unit/model';
+import { ContainerModel } from '../container/model';
+import { AttributeTypeModel } from '../attribute-type/model';
+import { ProductVariantAttributeModel } from '../product-variant-attribute/model';
+import {
+	composeVariantName,
+	computeQuantityBase,
+	computeVariantKey,
+} from './helpers/composition';
+import { describeDeletionBlock } from './helpers/deletion-block';
+import { getPendingTransfersByProductVariant } from '../transaction/helpers/pending-transfers';
 import {
 	CreateProductVariantDto,
 	ProductVariantDeletionPlan,
 	ProductVariantFilters,
 	UpdateProductVariantDto,
+	VariantAttributeInput,
+	VariantAttributeType,
+	VariantAxes,
+	VariantAxesDto,
+	VariantCatalog,
+	VariantContainer,
+	VariantUnit,
 } from './types';
 import { Op, QueryTypes, Transaction } from 'sequelize';
 
@@ -109,14 +127,42 @@ export class ProductVariantService {
 								},
 							],
 						},
+						/**
+						 * Unidad y envase van como include porque son `belongsTo` y no
+						 * multiplican filas. Los atributos son `hasMany` y sí: con `limit`
+						 * en la misma consulta, una presentación con dos atributos se
+						 * llevaría dos huecos de la página. Se piden aparte, abajo
+						 */
+						{ model: MeasurementUnitModel, as: 'unit', required: false },
+						{ model: ContainerModel, as: 'container', required: false },
 					],
-					order: [['productName', 'ASC']],
+					/**
+					 * `quantityBase` antes del nombre es lo que pone "250 ml" delante de
+					 * "1 lt", donde el alfabético pone "1 kilo" antes de "100 grs".
+					 * Postgres manda los NULL al final en ASC, así que las que todavía no
+					 * están estructuradas quedan detrás de las que sí, dentro de su
+					 * producto, y el orden mejora a medida que avance el backfill
+					 */
+					order: [
+						['productName', 'ASC'],
+						['quantityBase', 'ASC'],
+						['name', 'ASC'],
+					],
 					limit: pageSize,
 					offset,
 				});
 
+			const attributesByVariant = await this.getAttributesByVariant(
+				productVariants.map(productVariant => productVariant.id),
+			);
+
 			return {
-				productVariants,
+				productVariants: productVariants.map(productVariant =>
+					this.withNumericAxes(
+						productVariant,
+						attributesByVariant.get(productVariant.id) ?? [],
+					),
+				),
 				total,
 				page,
 				pageSize,
@@ -131,13 +177,264 @@ export class ProductVariantService {
 		}
 	};
 
-	create = async (
-		{ name, productId, requestedBy }: CreateProductVariantDto,
+	/**
+	 * Los atributos de varias presentaciones en una sola consulta, agrupados por
+	 * presentación. Van aparte de la consulta paginada a propósito: ver el
+	 * comentario del include en `getAll`
+	 */
+	private getAttributesByVariant = async (productVariantIds: string[]) => {
+		const grouped = new Map<
+			string,
+			{ attributeTypeId: string; code: string; label: string; value: string }[]
+		>();
+
+		if (productVariantIds.length === 0) return grouped;
+
+		const rows = await ProductVariantAttributeModel.findAll({
+			where: { productVariantId: productVariantIds },
+			include: [
+				{
+					model: AttributeTypeModel,
+					as: 'attributeType',
+					required: true,
+					attributes: [],
+				},
+			],
+			attributes: [
+				'productVariantId',
+				'attributeTypeId',
+				'value',
+				[sequelize.col('attributeType.code'), 'code'],
+				[sequelize.col('attributeType.label'), 'label'],
+			],
+			order: [[sequelize.col('attributeType.sortOrder'), 'ASC']],
+			raw: true,
+		});
+
+		for (const row of rows as unknown as {
+			productVariantId: string;
+			attributeTypeId: string;
+			value: string;
+			code: string;
+			label: string;
+		}[]) {
+			const current = grouped.get(row.productVariantId) ?? [];
+			current.push({
+				attributeTypeId: row.attributeTypeId,
+				code: row.code,
+				label: row.label,
+				value: row.value,
+			});
+			grouped.set(row.productVariantId, current);
+		}
+
+		return grouped;
+	};
+
+	/**
+	 * `pg` devuelve DECIMAL como string, para no perder precisión. El panel los
+	 * quiere como números, así que la conversión se hace aquí, en el único sitio
+	 * por donde salen, en vez de en cada componente que los lea
+	 */
+	private withNumericAxes = (
+		productVariant: ProductVariantModel,
+		attributes: {
+			attributeTypeId: string;
+			code: string;
+			label: string;
+			value: string;
+		}[],
+	) => {
+		const plain = productVariant.toJSON() as Record<string, unknown>;
+
+		return {
+			...plain,
+			quantityValue:
+				plain.quantityValue === null || plain.quantityValue === undefined
+					? null
+					: Number(plain.quantityValue),
+			quantityBase:
+				plain.quantityBase === null || plain.quantityBase === undefined
+					? null
+					: Number(plain.quantityBase),
+			attributes,
+		};
+	};
+
+	/**
+	 * Convierte los identificadores que manda el formulario en las filas de
+	 * catálogo que necesita la composición, y rechaza lo que no cuadra antes de
+	 * escribir nada. Se resuelve contra la base y no se confía en el cuerpo de la
+	 * petición: un `unitId` inventado daría un nombre a medias y una firma que no
+	 * corresponde a ninguna unidad real
+	 */
+	private resolveAxes = async (
+		axes: VariantAxesDto,
+		transaction?: Transaction,
+	): Promise<VariantAxes> => {
+		const unit = axes.unitId
+			? await MeasurementUnitModel.findByPk(axes.unitId, {
+					transaction,
+					raw: true,
+				})
+			: null;
+		if (axes.unitId && !unit) {
+			throw new Error('La unidad de medida seleccionada no existe');
+		}
+
+		const container = axes.containerId
+			? await ContainerModel.findByPk(axes.containerId, {
+					transaction,
+					raw: true,
+				})
+			: null;
+		if (axes.containerId && !container) {
+			throw new Error('El envase seleccionado no existe');
+		}
+
+		// Un atributo sin valor no es un atributo: se descarta en vez de guardar
+		// una fila vacía que luego aparecería en el nombre como un separador suelto
+		const incoming = (axes.attributes ?? []).filter(attribute =>
+			attribute?.value?.trim(),
+		);
+
+		const repeated = incoming.filter(
+			(attribute, index) =>
+				incoming.findIndex(
+					other => other.attributeTypeId === attribute.attributeTypeId,
+				) !== index,
+		);
+		if (repeated.length > 0) {
+			throw new Error(
+				'Cada atributo puede tener un solo valor en la misma presentación',
+			);
+		}
+
+		let attributes: VariantAttributeInput[] = [];
+		if (incoming.length > 0) {
+			const types = await AttributeTypeModel.findAll({
+				where: { id: incoming.map(attribute => attribute.attributeTypeId) },
+				transaction,
+				raw: true,
+			});
+
+			attributes = incoming.map(attribute => {
+				const type = types.find(
+					candidate => candidate.id === attribute.attributeTypeId,
+				);
+				if (!type) {
+					throw new Error('Uno de los atributos seleccionados no existe');
+				}
+
+				return {
+					type: type as unknown as VariantAttributeType,
+					value: attribute.value.trim(),
+				};
+			});
+		}
+
+		const quantityValue =
+			axes.quantityValue === null || axes.quantityValue === undefined
+				? null
+				: Number(axes.quantityValue);
+
+		if (quantityValue !== null) {
+			if (!Number.isFinite(quantityValue) || quantityValue <= 0) {
+				throw new Error('La cantidad de la presentación debe ser mayor que 0');
+			}
+			if (!unit) {
+				throw new Error('Indica la unidad de medida de la cantidad');
+			}
+		}
+
+		return {
+			quantityValue,
+			unit: unit as unknown as VariantUnit | null,
+			isCapacity: Boolean(axes.isCapacity),
+			container: container as unknown as VariantContainer | null,
+			attributes,
+		};
+	};
+
+	/**
+	 * Las seis columnas que se escriben en `product_variant`, más el nombre. El
+	 * nombre es derivado cuando hay ejes: que lo calcule el mismo sitio que la
+	 * firma es lo que impide que un nombre diga una cosa y la unicidad otra
+	 */
+	private buildVariantFields = (axes: VariantAxes) => ({
+		name: composeVariantName(axes),
+		quantityValue: axes.quantityValue ?? null,
+		unitId: axes.unit?.id ?? null,
+		containerId: axes.container?.id ?? null,
+		isCapacity: Boolean(axes.isCapacity),
+		quantityBase: computeQuantityBase(axes),
+		variantKey: computeVariantKey(axes),
+	});
+
+	/**
+	 * Se borran y se vuelven a insertar en la misma transacción: son de 0 a 3
+	 * filas, y un diff incremental solo añadiría formas de dejarlas a medias
+	 */
+	private saveAttributes = async (
+		productVariantId: string,
+		axes: VariantAxes,
 		transaction: Transaction,
 	) => {
+		await ProductVariantAttributeModel.destroy({
+			where: { productVariantId },
+			transaction,
+		});
+
+		const rows = (axes.attributes ?? []).map(attribute => ({
+			productVariantId,
+			attributeTypeId: attribute.type.id,
+			value: attribute.value,
+		}));
+
+		if (rows.length > 0) {
+			await ProductVariantAttributeModel.bulkCreate(rows, { transaction });
+		}
+	};
+
+	/**
+	 * El índice `uq_product_variant_product_variant_key` salta con un error de
+	 * Postgres ilegible para el usuario. El mensaje explica los dos casos que de
+	 * verdad lo provocan, porque ninguno se ve a simple vista en la tabla: una
+	 * presentación equivalente escrita con otra unidad, o una inactiva
+	 */
+	private rethrowAsDuplicateAxes = (error: unknown, name: string) => {
+		const constraint = (error as { parent?: { constraint?: string } })?.parent
+			?.constraint;
+
+		if (constraint === 'uq_product_variant_product_variant_key') {
+			throw new Error(
+				`Ya existe una presentación de este producto equivalente a "${name}". Puede estar escrita con otra unidad (0.5 kg y 500 g son la misma) o estar inactiva`,
+			);
+		}
+	};
+
+	create = async (
+		{ name, productId, axes, requestedBy }: CreateProductVariantDto,
+		transaction: Transaction,
+	) => {
+		const resolvedAxes = axes
+			? await this.resolveAxes(axes, transaction)
+			: null;
+		const fields = resolvedAxes
+			? this.buildVariantFields(resolvedAxes)
+			: undefined;
+		const variantName = fields?.name ?? name?.trim();
+
+		if (!variantName) {
+			throw new Error(
+				'La presentación necesita un nombre o sus datos de medida',
+			);
+		}
+
 		try {
 			const newProductVariant = this.productVariantModel.build({
-				name,
+				...fields,
+				name: variantName,
 				productId,
 				createdBy: requestedBy,
 				updatedBy: requestedBy,
@@ -146,21 +443,31 @@ export class ProductVariantService {
 			await newProductVariant.generateVId(transaction);
 			await newProductVariant.save({ transaction });
 
+			if (resolvedAxes) {
+				await this.saveAttributes(
+					newProductVariant.id,
+					resolvedAxes,
+					transaction,
+				);
+			}
+
 			return newProductVariant.dataValues;
 		} catch (error) {
+			this.rethrowAsDuplicateAxes(error, variantName);
 			console.error('ServiceError creando presentación de producto: ', error);
 			throw error;
 		}
 	};
 
 	update = async (
-		{ id, name, active, stockIds, requestedBy }: UpdateProductVariantDto,
+		{ id, name, active, stockIds, axes, requestedBy }: UpdateProductVariantDto,
 		transaction?: Transaction,
 	) => {
 		// Si no llega de `ProductService.update`, abre la suya: `setActiveStocks`
 		// actualiza varias bodegas y un fallo a mitad dejaba unas sí y otras no
 		const ownsTransaction = !transaction;
 		const t = transaction ?? (await sequelize.transaction());
+		let variantName = name?.trim();
 		try {
 			const productVariantToUpdate = await this.productVariantModel.findByPk(
 				id,
@@ -172,14 +479,30 @@ export class ProductVariantService {
 				);
 			}
 
+			const resolvedAxes = axes ? await this.resolveAxes(axes, t) : null;
+			const fields = resolvedAxes
+				? this.buildVariantFields(resolvedAxes)
+				: undefined;
+			variantName = fields?.name ?? variantName;
+
+			/**
+			 * El nombre solo se toca si hay algo con lo que tocarlo. Sin esto, una
+			 * edición que solo cambia las bodegas o el estado llegaría con `name`
+			 * vacío y lo borraría, y la columna es NOT NULL
+			 */
 			await productVariantToUpdate.update(
 				{
-					name,
+					...fields,
+					...(variantName ? { name: variantName } : {}),
 					active,
 					updatedBy: requestedBy,
 				},
 				{ transaction: t },
 			);
+
+			if (resolvedAxes) {
+				await this.saveAttributes(id, resolvedAxes, t);
+			}
 
 			if (stockIds) {
 				await this.stockItemService.setActiveStocks(
@@ -194,6 +517,7 @@ export class ProductVariantService {
 			return productVariantToUpdate.dataValues;
 		} catch (error) {
 			if (ownsTransaction) await t.rollback();
+			this.rethrowAsDuplicateAxes(error, variantName ?? '');
 			console.error(
 				'ServiceError actualizando presentación de producto: ',
 				error,
@@ -293,25 +617,43 @@ export class ProductVariantService {
 				},
 			);
 
+			/**
+			 * Las unidades de una transferencia sin aceptar no están en ninguna
+			 * bodega: salieron del origen y todavía no entraron al destino, así que
+			 * `stocksWithUnits` las da por cero y el borrado parecía inofensivo.
+			 * Borrarla y aceptar después deja las unidades sobre una presentación
+			 * que ya no existe para el panel, invisibles y sin forma de sacarlas
+			 */
+			const pendingTransfers = await getPendingTransfersByProductVariant(
+				productVariantId,
+				transaction,
+			);
+
 			const historyRows =
 				Number(history.billingRows) +
 				Number(history.quoteRows) +
 				Number(history.transactionRows);
 
-			const mode =
-				stocksWithUnits.length > 0
-					? 'blocked'
-					: historyRows > 0
-						? 'logical'
-						: 'physical';
+			const blockedMessage = describeDeletionBlock({
+				pendingTransfers,
+				stocksWithUnits,
+			});
+
+			const mode = blockedMessage
+				? 'blocked'
+				: historyRows > 0
+					? 'logical'
+					: 'physical';
 
 			return {
 				mode,
+				blockedMessage,
 				historyRows,
 				billingItems: Number(history.billingItems),
 				quoteItems: Number(history.quoteItems),
 				transactionItems: Number(history.transactionItems),
 				stocksWithUnits,
+				pendingTransfers,
 			};
 		} catch (error) {
 			console.error(
@@ -364,18 +706,8 @@ export class ProductVariantService {
 
 			const plan = await this.getDeletionPlan(productVariantId, t);
 
-			if (plan.mode === 'blocked') {
-				const detail = plan.stocksWithUnits
-					.map(stock => `${stock.name} (${stock.quantity})`)
-					.join(', ');
-
-				/**
-				 * No se ofrece desactivarla: `setActiveStocks` rechaza desactivar un
-				 * item con unidades, así que el único camino real es sacarlas
-				 */
-				throw new Error(
-					`No se puede eliminar la presentación, porque tiene unidades en stock: ${detail}. Sácalas con un movimiento de salida y vuelve a intentarlo`,
-				);
+			if (plan.blockedMessage) {
+				throw new Error(plan.blockedMessage);
 			}
 
 			// Sin documentos detrás, sus filas de bodega no guardan historial: se
@@ -399,6 +731,58 @@ export class ProductVariantService {
 				'ServiceError eliminando presentación del producto: ',
 				error,
 			);
+			throw error;
+		}
+	};
+
+	/**
+	 * Las tres listas fijas que el formulario necesita para sus selects. Van en
+	 * una sola respuesta y no en tres rutas porque el formulario las pide juntas
+	 * siempre, y porque no hay administración de unidades ni de envases: el
+	 * cliente no la quiere, así que las listas se mantienen por seeder y solo se
+	 * leen desde aquí.
+	 *
+	 * Solo las activas: una unidad que deje de ofrecerse se apaga, y las
+	 * presentaciones que ya la referencian siguen resolviendo su nombre, porque
+	 * eso lo hace el include de la fila y no esta lista
+	 */
+	getCatalog = async (): Promise<VariantCatalog> => {
+		try {
+			const [units, containers, attributeTypes] = await Promise.all([
+				MeasurementUnitModel.findAll({
+					where: { active: true },
+					attributes: [
+						'id',
+						'code',
+						'label',
+						'name',
+						'dimension',
+						'factorToBase',
+					],
+					order: [['sortOrder', 'ASC']],
+					raw: true,
+				}),
+				ContainerModel.findAll({
+					where: { active: true },
+					attributes: ['id', 'code', 'label'],
+					order: [['sortOrder', 'ASC']],
+					raw: true,
+				}),
+				AttributeTypeModel.findAll({
+					where: { active: true },
+					attributes: ['id', 'code', 'label', 'valueTemplate', 'sortOrder'],
+					order: [['sortOrder', 'ASC']],
+					raw: true,
+				}),
+			]);
+
+			return {
+				units: units as unknown as VariantUnit[],
+				containers: containers as unknown as VariantContainer[],
+				attributeTypes: attributeTypes as unknown as VariantAttributeType[],
+			};
+		} catch (error) {
+			console.error('Error obteniendo el catálogo de presentaciones', error);
 			throw error;
 		}
 	};

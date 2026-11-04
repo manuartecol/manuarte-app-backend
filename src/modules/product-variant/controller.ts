@@ -47,6 +47,16 @@ export class ProductVariantController {
 		}
 	};
 
+	getCatalog: Handler = async (_req, res, next) => {
+		try {
+			const catalog = await this.productVariantService.getCatalog();
+
+			res.status(200).json(catalog);
+		} catch (error) {
+			next(error);
+		}
+	};
+
 	searchByNameOrCode: Handler = async (req, res, next) => {
 		try {
 			const { stockId } = req.params;
@@ -92,7 +102,7 @@ export class ProductVariantController {
 	update: Handler = async (req, res, next) => {
 		try {
 			const { id } = req.params;
-			const { name, active, stockIds } = req.body;
+			const { name, active, stockIds, axes } = req.body;
 			const requestedBy = (req as CustomRequest).requestedBy;
 
 			await this.productVariantService.update({
@@ -100,6 +110,7 @@ export class ProductVariantController {
 				name,
 				active,
 				stockIds,
+				axes,
 				requestedBy,
 			});
 

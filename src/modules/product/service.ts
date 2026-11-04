@@ -100,7 +100,10 @@ export class ProductService {
 					FROM product p
 					INNER JOIN product_category pc ON pc.id = p."productCategoryId"
 					LEFT JOIN LATERAL (
-						SELECT COUNT(*) AS total, json_agg(x ORDER BY x.name ASC) AS variants
+						SELECT COUNT(*) AS total,
+								json_agg(
+									x ORDER BY x."quantityBase" ASC NULLS LAST, x.name ASC
+								) AS variants
 						FROM (
 							SELECT
 								pv.id,
@@ -108,6 +111,32 @@ export class ProductService {
 								pv.name,
 								pv.active,
 								pv."productId",
+								pv."quantityValue"::float8 AS "quantityValue",
+								pv."unitId",
+								pv."containerId",
+								pv."isCapacity",
+								pv."quantityBase"::float8 AS "quantityBase",
+								mu.code AS "unitCode",
+								mu.label AS "unitLabel",
+								c.label AS "containerLabel",
+								/**
+								 * Los atributos salen agregados aquí y no en una consulta
+								 * aparte: esta ya es SQL cruda y la tabla hija cuelga de la
+								 * presentación, no de la página, así que no afecta al LIMIT
+								 */
+								COALESCE((
+									SELECT json_agg(
+										json_build_object(
+											'attributeTypeId', at.id,
+											'code', at.code,
+											'label', at.label,
+											'value', pva.value
+										) ORDER BY at."sortOrder"
+									)
+									FROM product_variant_attribute pva
+									INNER JOIN attribute_type at ON at.id = pva."attributeTypeId"
+									WHERE pva."productVariantId" = pv.id
+								), '[]'::json) AS attributes,
 								COALESCE((
 									SELECT array_agg(DISTINCT si."stockId")
 									FROM stock_item_product_variant sipv
@@ -122,6 +151,8 @@ export class ProductService {
 									WHERE sipv."productVariantId" = pv.id
 								) AS "stocksCount"
 							FROM product_variant pv
+							LEFT JOIN measurement_unit mu ON mu.id = pv."unitId"
+							LEFT JOIN container c ON c.id = pv."containerId"
 							WHERE pv."productId" = p.id
 								AND pv."deletedDate" IS NULL
 						) x
@@ -179,11 +210,12 @@ export class ProductService {
 			const newProductVariants = [];
 			if (productVariants?.length > 0) {
 				for (const pv of productVariants) {
-					const { name, ...stockItemData } = pv;
+					const { name, axes, ...stockItemData } = pv;
 
 					const newProductVariant = await this.productVariantService.create(
 						{
 							name,
+							axes,
 							productId: newProduct.id,
 							requestedBy,
 						},
@@ -253,6 +285,7 @@ export class ProductService {
 							id: productVariantData.id,
 							name: productVariantData.name,
 							active: productVariantData.active,
+							axes: productVariantData.axes,
 							stockIds,
 							requestedBy,
 						},
@@ -286,11 +319,12 @@ export class ProductService {
 	}: AddProductVariantDto) => {
 		const transaction = await sequelize.transaction();
 		try {
-			const { name, ...pvRest } = productVariant;
+			const { name, axes, ...pvRest } = productVariant;
 
 			const newProductVariant = await this.productVariantService.create(
 				{
 					name,
+					axes,
 					productId,
 					requestedBy,
 				},

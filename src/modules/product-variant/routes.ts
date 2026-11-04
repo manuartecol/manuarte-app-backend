@@ -19,6 +19,11 @@ router.get(
 	productVariantController.getAll,
 );
 router.get(
+	'/catalog',
+	authorize(ProductPermissions.PRODUCT_READ),
+	productVariantController.getCatalog,
+);
+router.get(
 	'/search/:stockId',
 	authorize(ProductPermissions.PRODUCT_SEARCH),
 	productVariantController.searchByNameOrCode,
