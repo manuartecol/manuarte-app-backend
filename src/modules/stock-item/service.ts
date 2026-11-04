@@ -3,6 +3,7 @@ import {
 	FindAndCountOptions,
 	fn,
 	Op,
+	QueryTypes,
 	Transaction,
 	where,
 } from 'sequelize';
@@ -34,6 +35,11 @@ import { ProductCategoryModel } from '../product-category/model';
 import { ProductCategoryGroupModel } from '../product-category-group/model';
 import { endOfDay, parseISO, startOfDay } from 'date-fns';
 import { StockItemPriceService } from '../stock-item-price/service';
+import {
+	describePendingTransfers,
+	getLockedDestinationStockIds,
+	getPendingTransfersByProductVariant,
+} from '../transaction/helpers/pending-transfers';
 
 export class StockItemService {
 	private stockItemModel;
@@ -310,17 +316,27 @@ export class StockItemService {
 					'maxQty',
 					'minQty',
 					'stockId',
+					// `active` y el borrado de la presentación los usa
+					// `TransactionItemService` para no escribir unidades donde nadie
+					// las vería
+					'active',
 					[sequelize.col('productVariants.product.name'), 'productName'],
 					[sequelize.col('productVariants.id'), 'productVariantId'],
 					[sequelize.col('productVariants.name'), 'productVariantName'],
+					[
+						sequelize.col('productVariants.deletedDate'),
+						'productVariantDeletedDate',
+					],
 				],
 				include: [
 					{
 						/**
-						 * `paranoid: false` en los dos: esta ruta la usa la edición de un
-						 * movimiento ya existente. Sin esto, un movimiento viejo que
-						 * contenga una presentación borrada no se podría editar, porque
-						 * el `required: true` descartaría su item de stock
+						 * `paranoid: false` en los dos para que la fila se encuentre aunque
+						 * la presentación esté borrada. Moverle stock lo rechaza
+						 * `TransactionItemService.assertWritableStockItem`, y necesita la
+						 * fila para decir qué pasa; con `required: true` el item de stock se
+						 * descartaría y el error sería 'No fue posible encontrar el item de
+						 * stock', que manda a buscar donde no es
 						 */
 						model: ProductVariantModel,
 						as: 'productVariants',
@@ -1158,6 +1174,92 @@ export class StockItemService {
 	};
 
 	/**
+	 * Comprueba que las presentaciones de un movimiento están disponibles en una
+	 * bodega concreta: que tienen item de stock ahí y que está activo.
+	 *
+	 * La usa la creación de una transferencia para mirar el **destino**. Los
+	 * items de una transferencia llevan el `stockItemId` del origen, así que sin
+	 * esto nadie mira la bodega a la que va: se podía crear una transferencia
+	 * hacia una bodega donde la presentación está desactivada, y al aceptarla
+	 * `TransactionItemService` la rechaza. La transferencia quedaba atascada, con
+	 * las unidades ya fuera del origen y sin poder entrar a ningún sitio. El
+	 * panel ya lo validaba, pero una validación que solo vive en el formulario no
+	 * cubre ni la API ni la carrera con una desactivación simultánea.
+	 *
+	 * Las presentaciones borradas se dejan pasar a propósito: las rechaza
+	 * `assertWritableStockItem` con un mensaje que dice lo que de verdad pasa, y
+	 * aquí saldrían como "no existe en la bodega", que despista
+	 */
+	assertVariantsAvailableInStock = async (
+		stockId: string,
+		productVariantIds: string[],
+		transaction?: Transaction,
+	) => {
+		try {
+			if (productVariantIds.length === 0) return;
+
+			const rows = await sequelize.query<{
+				productName: string;
+				productVariantName: string;
+				active: boolean | null;
+			}>(
+				`
+					SELECT
+						p.name AS "productName",
+						pv.name AS "productVariantName",
+						d.active
+					FROM product_variant pv
+					INNER JOIN product p ON p.id = pv."productId"
+					LEFT JOIN LATERAL (
+						SELECT si.active
+						FROM stock_item_product_variant sipv
+						INNER JOIN stock_item si ON si.id = sipv."stockItemId"
+						WHERE sipv."productVariantId" = pv.id AND si."stockId" = :stockId
+						LIMIT 1
+					) d ON true
+					WHERE pv.id IN (:productVariantIds)
+						AND pv."deletedDate" IS NULL
+						AND (d.active IS NULL OR d.active = false)
+					ORDER BY p.name ASC, pv.name ASC
+				`,
+				{
+					replacements: { stockId, productVariantIds },
+					type: QueryTypes.SELECT,
+					transaction,
+				},
+			);
+
+			if (rows.length === 0) return;
+
+			const stock = await StockModel.findByPk(stockId, {
+				attributes: ['name'],
+				transaction,
+			});
+
+			// Una carga masiva puede traer 171 items: la lista completa sería un
+			// muro. Con los primeros cinco y la cuenta del resto ya se sabe qué
+			// mirar, y el formulario los marca uno por uno antes de enviar
+			const shown = rows
+				.slice(0, 5)
+				.map(
+					row =>
+						`${row.productName} ${row.productVariantName} (${
+							row.active === null ? 'no existe ahí' : 'desactivada'
+						})`,
+				)
+				.join(', ');
+			const rest = rows.length - Math.min(rows.length, 5);
+
+			throw new Error(
+				`No se puede crear el movimiento, porque estas presentaciones no están disponibles en ${stock?.getDataValue('name') ?? 'la bodega de destino'}: ${shown}${rest > 0 ? ` y ${rest} más` : ''}. Actívalas en esa bodega y vuelve a intentarlo`,
+			);
+		} catch (error) {
+			console.error('Error checking variants availability in stock');
+			throw error;
+		}
+	};
+
+	/**
 	 * Quita de las bodegas una presentación que se borra definitivamente. Solo
 	 * borra el `stock_item` que queda sin ninguna presentación: uno compartido
 	 * seguiría sirviendo a otra. Los precios se van con él, por el
@@ -1265,6 +1367,15 @@ export class StockItemService {
 				);
 			}
 
+			/**
+			 * Una transferencia sin aceptar bloquea su bodega de destino, aunque el
+			 * item esté en cero: al aceptarla las unidades entran ahí, y un item
+			 * desactivado no sale en ningún listado, así que quedarían en el aire
+			 */
+			const lockedByTransfer = getLockedDestinationStockIds(
+				await getPendingTransfersByProductVariant(productVariantId, transaction),
+			);
+
 			// Actualizar cada stock item según si está en la lista o no. En serie y
 			// validando antes de escribir: con `Promise.all`, un item que no se podía
 			// desactivar rechazaba la promesa con las demás escrituras aún en vuelo
@@ -1274,6 +1385,22 @@ export class StockItemService {
 				if (!shouldBeActive && Number(item.quantity) > 0 && item.active) {
 					throw new Error(
 						`No se puede desactivar el item en ${item.getDataValue('stock').name}, ya que tiene ${item.quantity} unidades en el stock.`,
+					);
+				}
+
+				const pendingTransfers = lockedByTransfer.get(item.stockId);
+
+				if (!shouldBeActive && pendingTransfers?.length && item.active) {
+					const several = pendingTransfers.length > 1;
+
+					throw new Error(
+						`No se puede desactivar el item en ${item.getDataValue('stock').name}, porque ${
+							several
+								? 'tiene transferencias sin aceptar'
+								: 'tiene una transferencia sin aceptar'
+						}: ${describePendingTransfers(pendingTransfers)}. ${
+							several ? 'Acéptalas' : 'Acéptala'
+						} y vuelve a intentarlo.`,
 					);
 				}
 			}

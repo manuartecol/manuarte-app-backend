@@ -110,6 +110,35 @@ export class TransactionItemService {
 		}
 	};
 
+	/**
+	 * El último filtro antes de escribir una cantidad. Las dos comprobaciones de
+	 * arriba (el plan de borrado y `setActiveStocks`) impiden llegar aquí, pero
+	 * son previas: entre que el usuario abre el formulario de un movimiento y lo
+	 * confirma, otro puede haber borrado la presentación o desactivado la bodega.
+	 * Sin esto, las unidades se escriben en una fila que ningún listado muestra,
+	 * y no hay error que lo delate
+	 */
+	private assertWritableStockItem = (stockItem: StockItemModel) => {
+		const {
+			productName,
+			productVariantName,
+			productVariantDeletedDate,
+			active,
+		} = stockItem.dataValues ?? {};
+
+		if (productVariantDeletedDate) {
+			throw new Error(
+				`La presentación ${productName} ${productVariantName} está eliminada, así que no se le pueden registrar movimientos`,
+			);
+		}
+
+		if (active === false) {
+			throw new Error(
+				`La presentación ${productName} ${productVariantName} está desactivada en esta bodega, así que no se le pueden registrar movimientos. Actívala y vuelve a intentarlo`,
+			);
+		}
+	};
+
 	create = async (
 		{
 			transactionItemData,
@@ -130,6 +159,8 @@ export class TransactionItemService {
 			if (!stockItemToUpdate) {
 				throw new Error('No fue posible encontrar el item de stock');
 			}
+
+			this.assertWritableStockItem(stockItemToUpdate);
 
 			if (
 				!isEnter &&
@@ -197,6 +228,8 @@ export class TransactionItemService {
 			if (!stockItemToUpdate) {
 				throw new Error('No fue posible encontrar item de stock');
 			}
+
+			this.assertWritableStockItem(stockItemToUpdate);
 
 			const transactionItemToUpdate = await this.transactionItemModel.findByPk(
 				id,

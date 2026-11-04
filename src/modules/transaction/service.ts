@@ -1,6 +1,8 @@
 import { Transaction } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { StockModel } from '../stock/model';
+import { StockItemModel } from '../stock-item/model';
+import { StockItemService } from '../stock-item/service';
 import { TransactionItemModel } from '../transaction-item/model';
 import { TransactionItemService } from '../transaction-item/service';
 import { TransactionModel } from './model';
@@ -17,12 +19,14 @@ import { endOfDay, parseISO, startOfDay } from 'date-fns';
 export class TransactionService {
 	private transactionModel;
 	private transactionItemService;
+	private stockItemService;
 
 	constructor(transactionModel: typeof TransactionModel) {
 		this.transactionModel = transactionModel;
 		this.transactionItemService = new TransactionItemService(
 			TransactionItemModel,
 		);
+		this.stockItemService = new StockItemService(StockItemModel);
 	}
 
 	getAll = async (
@@ -218,6 +222,38 @@ export class TransactionService {
 				);
 			}
 
+			/**
+			 * Si esto acepta una transferencia, se comprueba antes de escribir nada
+			 * que siga pendiente. `clientRequestId` solo frena el reenvío idéntico
+			 * de la misma petición: dos pestañas, o un listado cargado antes de que
+			 * otro la aceptara, mandan dos peticiones distintas, y la segunda volvía
+			 * a sumar las unidades al destino y a dejar la transferencia en SUCCESS
+			 */
+			if (transactionData?.transferId) {
+				await this.assertTransferIsPending(
+					transactionData.transferId,
+					sqlTransaction,
+				);
+			}
+
+			/**
+			 * Los items de una transferencia llevan el `stockItemId` del origen, así
+			 * que nada miraba la bodega de destino. Se comprueba aquí, antes de
+			 * egresar del origen: crear una transferencia hacia una bodega donde la
+			 * presentación está desactivada la deja imposible de aceptar, con las
+			 * unidades fuera del origen y sin ningún sitio al que entrar
+			 */
+			if (
+				transactionData?.type === TransactionType.TRANSFER &&
+				transactionData?.toId
+			) {
+				await this.stockItemService.assertVariantsAvailableInStock(
+					transactionData.toId,
+					productVariantIds,
+					sqlTransaction,
+				);
+			}
+
 			const newTransaction = await this.transactionModel.create(
 				{
 					...transactionDataRest,
@@ -262,6 +298,35 @@ export class TransactionService {
 		}
 	};
 
+	/**
+	 * Una transferencia solo se puede aceptar una vez. La comprobación va aquí y
+	 * no solo en `updateTransfer` para que falle antes de tocar el stock: dentro
+	 * de `create` el rollback deshace las unidades igual, pero el usuario vería
+	 * un error de escritura en vez de saber que ya estaba aceptada
+	 */
+	private assertTransferIsPending = async (
+		transferId: string,
+		sqlTransaction: Transaction,
+	) => {
+		const transfer = await this.transactionModel.findByPk(transferId, {
+			transaction: sqlTransaction,
+		});
+
+		if (!transfer) {
+			throw new Error('Transferencia no encontrada');
+		}
+
+		if (transfer.dataValues.type !== TransactionType.TRANSFER) {
+			throw new Error('El movimiento indicado no es una transferencia');
+		}
+
+		if (transfer.dataValues.state !== TransactionState.PROGRESS) {
+			throw new Error(
+				'Esta transferencia ya fue aceptada. Actualiza la lista para ver las que siguen pendientes',
+			);
+		}
+	};
+
 	updateTransfer = async (
 		transactionData: UpdateTransactionDto,
 		id: string,
@@ -275,6 +340,19 @@ export class TransactionService {
 			});
 			if (!transactionToUpdate) {
 				throw new Error('Transferencia no encontrada');
+			}
+
+			/**
+			 * La misma guarda que en `create`, por si llaman a `PUT /transfer/:id`
+			 * directamente: marcar SUCCESS una transferencia que ya lo está no
+			 * tendría efecto aquí, pero deja la puerta abierta a que el llamador
+			 * crea que acaba de aceptarla
+			 */
+			if (
+				transactionData?.state === TransactionState.SUCCESS &&
+				transactionToUpdate.dataValues.state !== TransactionState.PROGRESS
+			) {
+				throw new Error('Esta transferencia ya fue aceptada');
 			}
 
 			await transactionToUpdate.update(
