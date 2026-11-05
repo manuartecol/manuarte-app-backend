@@ -6,6 +6,7 @@ export class MeasurementUnitModel extends Model {
 	public id!: string;
 	public code!: string;
 	public label!: string;
+	public labelPlural!: string | null;
 	public name!: string;
 	public dimension!: 'mass' | 'volume' | 'count' | 'length';
 	public factorToBase!: string;
@@ -29,6 +30,15 @@ MeasurementUnitModel.init(
 		label: {
 			type: DataTypes.STRING(24),
 			allowNull: false,
+		},
+		/**
+		 * Solo las unidades que son palabras lo tienen: "docenas", "galones",
+		 * "unidades". Las abreviaturas van en null y la composición cae a `label`,
+		 * porque "3 g" es correcto y "3 gs" no
+		 */
+		labelPlural: {
+			type: DataTypes.STRING(32),
+			allowNull: true,
 		},
 		name: {
 			type: DataTypes.STRING(48),

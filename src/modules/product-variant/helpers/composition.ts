@@ -1,4 +1,4 @@
-import { VariantAxes, VariantAttributeInput } from '../types';
+import { VariantAxes, VariantAttributeInput, VariantUnit } from '../types';
 
 /**
  * Composición de una presentación a partir de sus ejes. Son funciones puras y
@@ -61,8 +61,16 @@ const composeMeasure = (axes: VariantAxes): string | null => {
 		return capitalize(unit.label);
 	}
 
-	return `${formatQuantity(quantityValue)} ${unit.label}`;
+	return `${formatQuantity(quantityValue)} ${unitLabelFor(unit, quantityValue)}`;
 };
+
+/**
+ * El plural solo cuando la unidad es una palabra y la cantidad no es 1:
+ * "3 docenas", "2 galones", pero "1 docena" y "500 g", porque las abreviaturas
+ * no pluralizan y van con `labelPlural` en null
+ */
+const unitLabelFor = (unit: VariantUnit, quantityValue: number): string =>
+	quantityValue !== 1 && unit.labelPlural ? unit.labelPlural : unit.label;
 
 export const composeVariantName = (axes: VariantAxes): string => {
 	const measure = composeMeasure(axes);
@@ -75,8 +83,17 @@ export const composeVariantName = (axes: VariantAxes): string => {
 			: container.label
 		: measure;
 
+	/**
+	 * El valor va capitalizado: se teclea "rojo" y el nombre decía
+	 * "100 g · rojo", mientras la unidad de conteo sí se capitaliza. El mismo
+	 * nombre mezclaba los dos criterios. La firma no cambia, que compara en
+	 * minúsculas, así que esto no afecta a lo ya guardado
+	 */
 	const attributes = sortAttributes(axes.attributes ?? []).map(attribute =>
-		attribute.type.valueTemplate.replace('{value}', attribute.value.trim()),
+		attribute.type.valueTemplate.replace(
+			'{value}',
+			capitalize(attribute.value.trim()),
+		),
 	);
 
 	const parts = [head, ...attributes].filter((part): part is string =>

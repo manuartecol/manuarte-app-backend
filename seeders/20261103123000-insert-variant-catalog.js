@@ -21,34 +21,48 @@ module.exports = {
 	async up(queryInterface, Sequelize) {
 		const now = new Date();
 
+		// `labelPlural` solo en las que son palabras: con las abreviaturas el plural
+		// no existe ("3 g", no "3 gs"), y la composición cae a `label` cuando es
+		// null. Sin esto el nombre compuesto saldría "3 docena" y "2 galón"
 		const units = [
-			// code, label, name, dimension, factorToBase, sortOrder
-			['unidad', 'unidad', 'Unidad', 'count', 1, 10],
-			['docena', 'docena', 'Docena', 'count', 12, 20],
-			['g', 'g', 'Gramo', 'mass', 1, 30],
-			['kg', 'kg', 'Kilogramo', 'mass', 1000, 40],
-			['ml', 'ml', 'Mililitro', 'volume', 1, 50],
-			['lt', 'lt', 'Litro', 'volume', 1000, 60],
+			// code, label, labelPlural, name, dimension, factorToBase, sortOrder
+			['unidad', 'unidad', 'unidades', 'Unidad', 'count', 1, 10],
+			['docena', 'docena', 'docenas', 'Docena', 'count', 12, 20],
+			['g', 'g', null, 'Gramo', 'mass', 1, 30],
+			['kg', 'kg', null, 'Kilogramo', 'mass', 1000, 40],
+			['ml', 'ml', null, 'Mililitro', 'volume', 1, 50],
+			['lt', 'lt', null, 'Litro', 'volume', 1000, 60],
 			// Galón estadounidense, que es el que se usa en Colombia y Ecuador
-			['gal', 'galón', 'Galón', 'volume', 3785.411784, 70],
-			['mm', 'mm', 'Milímetro', 'length', 1, 80],
-			['m', 'm', 'Metro', 'length', 1000, 90],
+			['gal', 'galón', 'galones', 'Galón', 'volume', 3785.411784, 70],
+			['mm', 'mm', null, 'Milímetro', 'length', 1, 80],
+			['m', 'm', null, 'Metro', 'length', 1000, 90],
 		];
 
 		await queryInterface.bulkInsert(
 			'measurement_unit',
-			units.map(([code, label, name, dimension, factorToBase, sortOrder]) => ({
-				id: Sequelize.literal('uuid_generate_v4()'),
-				code,
-				label,
-				name,
-				dimension,
-				factorToBase,
-				sortOrder,
-				active: true,
-				createdDate: now,
-				updatedDate: now,
-			})),
+			units.map(
+				([
+					code,
+					label,
+					labelPlural,
+					name,
+					dimension,
+					factorToBase,
+					sortOrder,
+				]) => ({
+					id: Sequelize.literal('uuid_generate_v4()'),
+					code,
+					label,
+					labelPlural,
+					name,
+					dimension,
+					factorToBase,
+					sortOrder,
+					active: true,
+					createdDate: now,
+					updatedDate: now,
+				}),
+			),
 		);
 
 		const containers = [
