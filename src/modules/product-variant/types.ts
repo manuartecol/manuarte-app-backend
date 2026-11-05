@@ -74,6 +74,8 @@ export interface VariantUnit {
 	id: string;
 	code: string;
 	label: string;
+	// Solo las unidades que son palabras; null en las abreviaturas
+	labelPlural?: string | null;
 	name: string;
 	dimension: MeasurementDimension;
 	// DECIMAL: `pg` lo devuelve como string, y la composición lo convierte
@@ -114,12 +116,16 @@ export interface VariantAxes {
 /**
  * Lo que llega del formulario: identificadores, no filas. El servicio los
  * resuelve contra el catálogo antes de componer, y así un id inventado se
- * rechaza en vez de producir un nombre a medias
+ * rechaza en vez de producir un nombre a medias.
+ *
+ * Sin `isCapacity`: no se pregunta, se deduce del grupo de la categoría del
+ * producto. Entra en la firma, así que si lo decidiera el formulario dos
+ * presentaciones del mismo producto podrían quedar con el flag distinto y el
+ * UNIQUE no las vería como la misma
  */
 export interface VariantAxesDto {
 	quantityValue?: number | null;
 	unitId?: string | null;
-	isCapacity?: boolean;
 	containerId?: string | null;
 	attributes?: { attributeTypeId: string; value: string }[];
 }

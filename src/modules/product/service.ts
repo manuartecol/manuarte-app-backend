@@ -30,7 +30,12 @@ export class ProductService {
 	getAll = async () => {
 		try {
 			const products = await this.productModel.findAll({
-				attributes: ['id', 'name'],
+				// `productCategoryId` para el formulario de agregar presentación: de
+				// la categoría depende si el campo de medida se llama Cantidad o
+				// Capacidad, y eligiendo el producto en el select no había forma de
+				// saberlo, así que el mismo producto decía una cosa u otra según por
+				// dónde se hubiera abierto el modal
+				attributes: ['id', 'name', 'productCategoryId'],
 				order: [['name', 'ASC']],
 			});
 

@@ -31,6 +31,12 @@ import {
 } from './types';
 import { Op, QueryTypes, Transaction } from 'sequelize';
 
+/**
+ * El grupo de categorías cuyos productos se miden por capacidad del envase. Va
+ * por nombre de grupo y no por id porque los id son distintos en cada entorno
+ */
+const CAPACITY_CATEGORY_GROUP = 'ENVASES';
+
 export class ProductVariantService {
 	private productVariantModel;
 	private productModel;
@@ -182,7 +188,10 @@ export class ProductVariantService {
 	 * presentación. Van aparte de la consulta paginada a propósito: ver el
 	 * comentario del include en `getAll`
 	 */
-	private getAttributesByVariant = async (productVariantIds: string[]) => {
+	private getAttributesByVariant = async (
+		productVariantIds: string[],
+		transaction?: Transaction,
+	) => {
 		const grouped = new Map<
 			string,
 			{ attributeTypeId: string; code: string; label: string; value: string }[]
@@ -192,6 +201,7 @@ export class ProductVariantService {
 
 		const rows = await ProductVariantAttributeModel.findAll({
 			where: { productVariantId: productVariantIds },
+			transaction,
 			include: [
 				{
 					model: AttributeTypeModel,
@@ -236,6 +246,47 @@ export class ProductVariantService {
 	 * quiere como números, así que la conversión se hace aquí, en el único sitio
 	 * por donde salen, en vez de en cada componente que los lea
 	 */
+	/**
+	 * Una presentación con sus ejes resueltos, con la misma forma que devuelven
+	 * las tablas. La usan las respuestas de crear y editar.
+	 *
+	 * Antes devolvían `dataValues` a secas, y el panel construía con eso la fila
+	 * de la tabla: las columnas llegaban, pero los atributos viven en la tabla
+	 * hija y no. El resultado era que al editar una presentación recién creada el
+	 * modal abría sin su envase ni sus atributos, aunque estuvieran guardados.
+	 *
+	 * Vuelve a consultar en vez de componer con los ejes que ya tiene en memoria,
+	 * para que la forma salga del mismo sitio que la de `getAll` y no puedan
+	 * separarse
+	 */
+	getOnePublic = async (
+		productVariantId: string,
+		transaction?: Transaction,
+	) => {
+		const productVariant = await this.productVariantModel.findByPk(
+			productVariantId,
+			{
+				include: [
+					{ model: MeasurementUnitModel, as: 'unit', required: false },
+					{ model: ContainerModel, as: 'container', required: false },
+				],
+				transaction,
+			},
+		);
+
+		if (!productVariant) return null;
+
+		const attributesByVariant = await this.getAttributesByVariant(
+			[productVariantId],
+			transaction,
+		);
+
+		return this.withNumericAxes(
+			productVariant,
+			attributesByVariant.get(productVariantId) ?? [],
+		);
+	};
+
 	private withNumericAxes = (
 		productVariant: ProductVariantModel,
 		attributes: {
@@ -270,6 +321,7 @@ export class ProductVariantService {
 	 */
 	private resolveAxes = async (
 		axes: VariantAxesDto,
+		productId: string,
 		transaction?: Transaction,
 	): Promise<VariantAxes> => {
 		const unit = axes.unitId
@@ -350,10 +402,44 @@ export class ProductVariantService {
 		return {
 			quantityValue,
 			unit: unit as unknown as VariantUnit | null,
-			isCapacity: Boolean(axes.isCapacity),
+			isCapacity: await this.isCapacityProduct(productId, transaction),
 			container: container as unknown as VariantContainer | null,
 			attributes,
 		};
+	};
+
+	/**
+	 * Si el número de la presentación es capacidad del envase y no cantidad de
+	 * producto: una Jarra de Aluminio de 250 ml contiene 250 ml, no está hecha de
+	 * 250 ml de aluminio. Entra en la firma, así que decide unicidad, y por eso
+	 * sale de la base y no del formulario: dos presentaciones del mismo producto
+	 * con el flag distinto serían dos filas que el UNIQUE no reconoce como la
+	 * misma, y nadie lo vería en la tabla.
+	 *
+	 * Se deduce del grupo y no de la categoría: las tres categorías de envases
+	 * (vidrio, plásticos, yeso) cuelgan del grupo ENVASES, y una cuarta que se
+	 * cree mañana heredaría el comportamiento sin tocar código
+	 */
+	private isCapacityProduct = async (
+		productId: string,
+		transaction?: Transaction,
+	): Promise<boolean> => {
+		const [row] = await sequelize.query<{ groupName: string | null }>(
+			`
+				SELECT pcg.name AS "groupName"
+				FROM product p
+				INNER JOIN product_category pc ON pc.id = p."productCategoryId"
+				LEFT JOIN product_category_group pcg ON pcg.id = pc."productCategoryGroupId"
+				WHERE p.id = :productId
+			`,
+			{
+				replacements: { productId },
+				type: QueryTypes.SELECT,
+				transaction,
+			},
+		);
+
+		return row?.groupName === CAPACITY_CATEGORY_GROUP;
 	};
 
 	/**
@@ -418,7 +504,7 @@ export class ProductVariantService {
 		transaction: Transaction,
 	) => {
 		const resolvedAxes = axes
-			? await this.resolveAxes(axes, transaction)
+			? await this.resolveAxes(axes, productId, transaction)
 			: null;
 		const fields = resolvedAxes
 			? this.buildVariantFields(resolvedAxes)
@@ -451,7 +537,14 @@ export class ProductVariantService {
 				);
 			}
 
-			return newProductVariant.dataValues;
+			/**
+			 * Con los ejes resueltos, no `dataValues` a secas: el panel arma con esto
+			 * la fila de la tabla, y los atributos viven en la tabla hija
+			 */
+			return (
+				(await this.getOnePublic(newProductVariant.id, transaction)) ??
+				newProductVariant.dataValues
+			);
 		} catch (error) {
 			this.rethrowAsDuplicateAxes(error, variantName);
 			console.error('ServiceError creando presentación de producto: ', error);
@@ -479,7 +572,13 @@ export class ProductVariantService {
 				);
 			}
 
-			const resolvedAxes = axes ? await this.resolveAxes(axes, t) : null;
+			const resolvedAxes = axes
+				? await this.resolveAxes(
+						axes,
+						productVariantToUpdate.getDataValue('productId'),
+						t,
+					)
+				: null;
 			const fields = resolvedAxes
 				? this.buildVariantFields(resolvedAxes)
 				: undefined;
@@ -512,9 +611,16 @@ export class ProductVariantService {
 				);
 			}
 
+			/**
+			 * Se lee antes del commit y con la misma transacción, para devolver lo
+			 * que acaba de quedar escrito. Con los ejes resueltos, porque el panel
+			 * refresca con esto la fila de la tabla
+			 */
+			const updated = await this.getOnePublic(id, t);
+
 			if (ownsTransaction) await t.commit();
 
-			return productVariantToUpdate.dataValues;
+			return updated ?? productVariantToUpdate.dataValues;
 		} catch (error) {
 			if (ownsTransaction) await t.rollback();
 			this.rethrowAsDuplicateAxes(error, variantName ?? '');
@@ -755,6 +861,7 @@ export class ProductVariantService {
 						'id',
 						'code',
 						'label',
+						'labelPlural',
 						'name',
 						'dimension',
 						'factorToBase',

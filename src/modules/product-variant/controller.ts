@@ -105,7 +105,7 @@ export class ProductVariantController {
 			const { name, active, stockIds, axes } = req.body;
 			const requestedBy = (req as CustomRequest).requestedBy;
 
-			await this.productVariantService.update({
+			const productVariant = await this.productVariantService.update({
 				id,
 				name,
 				active,
@@ -114,7 +114,13 @@ export class ProductVariantController {
 				requestedBy,
 			});
 
+			/**
+			 * Devuelve la presentación, no solo el mensaje: el panel refrescaba la
+			 * fila con lo que había enviado, y al editar por ejes no envía `name`,
+			 * así que la fila se quedaba sin nombre hasta la siguiente consulta
+			 */
 			res.status(200).json({
+				productVariant,
 				message: 'Presentación del producto actualizada con éxito',
 			});
 		} catch (error) {
