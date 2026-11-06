@@ -96,7 +96,3 @@ TransactionItemModel.belongsTo(ProductVariantModel, {
 	as: 'productVariants',
 });
 
-ProductVariantModel.belongsTo(TransactionItemModel, {
-	foreignKey: 'productVariantId',
-	as: 'transactionItems',
-});

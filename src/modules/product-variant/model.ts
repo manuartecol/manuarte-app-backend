@@ -103,11 +103,6 @@ ProductVariantModel.init(
 			type: DataTypes.STRING,
 			allowNull: false,
 		},
-		quantity: {
-			type: DataTypes.INTEGER,
-			allowNull: false,
-			defaultValue: 0,
-		},
 		/**
 		 * Los ejes estructurados, todos opcionales e independientes. Las columnas
 		 * DECIMAL llegan como string desde `pg` y se dejan así a propósito: un
