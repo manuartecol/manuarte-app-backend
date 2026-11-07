@@ -6,6 +6,7 @@ import { PersonModel } from '../person/model';
 import { CustomerModel } from './model';
 import { CountryCount, CreateCustomerDto, UpdateCustomerDto } from './types';
 import { Op } from 'sequelize';
+import { normalizeSearch } from '../product-variant/helpers/search';
 import { BillingModel } from '../billing/model';
 import { BillingStatus, Payment } from '../billing/types';
 import { QuoteModel } from '../quote/model';
@@ -747,7 +748,11 @@ export class CustomerService {
 				where: {
 					[Op.or]: [
 						{ dni: { [Op.iLike]: `%${search}%` } },
-						{ fullName: { [Op.iLike]: `%${search}%` } },
+						where(
+							fn('unaccent', fn('lower', col('fullName'))),
+							Op.iLike,
+							`%${normalizeSearch(search)}%`,
+						),
 					],
 				},
 				attributes: [

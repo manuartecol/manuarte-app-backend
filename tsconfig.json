@@ -107,6 +107,7 @@
   ],
   "exclude": [
     "node_modules",
+    "scripts",
     "PDFDoc",
     "whatsapp-frontend"
   ]

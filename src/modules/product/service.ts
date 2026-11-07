@@ -1,4 +1,5 @@
 import { QueryTypes } from 'sequelize';
+import { normalizeSearch } from '../product-variant/helpers/search';
 import { ProductModel } from './model';
 import { ProductCategoryModel } from '../product-category/model';
 import { ProductVariantService } from '../product-variant/service';
@@ -67,16 +68,16 @@ export class ProductService {
 				replacements.pId = `%${filters.pId}%`;
 			}
 			if (filters.name) {
-				conditions.push('p.name ILIKE :name');
-				replacements.name = `%${filters.name}%`;
+				conditions.push('unaccent(lower(p.name)) LIKE :name');
+				replacements.name = `%${normalizeSearch(filters.name)}%`;
 			}
 			if (filters.description) {
-				conditions.push('p.description ILIKE :description');
-				replacements.description = `%${filters.description}%`;
+				conditions.push('unaccent(lower(p.description)) LIKE :description');
+				replacements.description = `%${normalizeSearch(filters.description)}%`;
 			}
 			if (filters.productCategoryName) {
-				conditions.push('pc.name ILIKE :productCategoryName');
-				replacements.productCategoryName = `%${filters.productCategoryName}%`;
+				conditions.push('unaccent(lower(pc.name)) LIKE :productCategoryName');
+				replacements.productCategoryName = `%${normalizeSearch(filters.productCategoryName)}%`;
 			}
 
 			const where = conditions.join('\n\t\t\t\t\t\tAND ');

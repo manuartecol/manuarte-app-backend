@@ -15,6 +15,7 @@ import {
 	computeVariantKey,
 } from './helpers/composition';
 import { describeDeletionBlock } from './helpers/deletion-block';
+import { containsText } from './helpers/search';
 import { getPendingTransfersByProductVariant } from '../transaction/helpers/pending-transfers';
 import {
 	CreateProductVariantDto,
@@ -36,6 +37,7 @@ import { Op, QueryTypes, Transaction } from 'sequelize';
  * por nombre de grupo y no por id porque los id son distintos en cada entorno
  */
 const CAPACITY_CATEGORY_GROUP = 'ENVASES';
+const VARIANT_FULL_NAME = `concat("product"."name", ' ', "ProductVariantModel"."name")`;
 
 export class ProductVariantService {
 	private productVariantModel;
@@ -63,24 +65,32 @@ export class ProductVariantService {
 				productVariantWhere.vId = { [Op.iLike]: `%${filters.vId}%` };
 			}
 			if (filters.variantName) {
-				productVariantWhere.name = { [Op.iLike]: `%${filters.variantName}%` };
+				productVariantWhere.name = containsText(
+					'"ProductVariantModel"."name"',
+					filters.variantName,
+				);
 			}
 
 			const productWhere: Record<string, unknown> = { deletedDate: null };
 			if (filters.productName) {
-				productWhere.name = { [Op.iLike]: `%${filters.productName}%` };
+				productWhere.name = containsText(
+					'"product"."name"',
+					filters.productName,
+				);
 			}
 			if (filters.productDescription) {
-				productWhere.description = {
-					[Op.iLike]: `%${filters.productDescription}%`,
-				};
+				productWhere.description = containsText(
+					'"product"."description"',
+					filters.productDescription,
+				);
 			}
 
 			const productCategoryWhere: Record<string, unknown> = {};
 			if (filters.productCategoryName) {
-				productCategoryWhere.name = {
-					[Op.iLike]: `%${filters.productCategoryName}%`,
-				};
+				productCategoryWhere.name = containsText(
+					'"product->productCategory"."name"',
+					filters.productCategoryName,
+				);
 			}
 
 			const { rows: productVariants, count: total } =
@@ -1057,12 +1067,7 @@ export class ProductVariantService {
 					where: {
 						[Op.or]: [
 							{ vId: { [Op.iLike]: `%${search}%` } },
-							sequelize.where(
-								sequelize.literal(
-									`concat("product"."name", ' ', "ProductVariantModel"."name")`,
-								),
-								{ [Op.iLike]: `%${search}%` },
-							),
+							containsText(VARIANT_FULL_NAME, search),
 						],
 					},
 					attributes: [
@@ -1149,7 +1154,7 @@ export class ProductVariantService {
 							sequelize.literal(
 								`CASE
 									WHEN lower("ProductVariantModel"."vId") = lower(:search) THEN 0
-									WHEN concat("product"."name", ' ', "ProductVariantModel"."name") ILIKE (:search || '%') THEN 1
+									WHEN unaccent(lower(concat("product"."name", ' ', "ProductVariantModel"."name"))) LIKE (unaccent(lower(:search)) || '%') THEN 1
 									ELSE 2
 								END`,
 							),
@@ -1182,12 +1187,7 @@ export class ProductVariantService {
 				where: {
 					[Op.or]: [
 						{ vId: { [Op.iLike]: `%${search}%` } },
-						sequelize.where(
-							sequelize.literal(
-								`concat("product"."name", ' ', "ProductVariantModel"."name")`,
-							),
-							{ [Op.iLike]: `%${search}%` },
-						),
+						containsText(VARIANT_FULL_NAME, search),
 					],
 					id: {
 						[Op.notIn]: sequelize.literal(`(
