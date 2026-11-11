@@ -3,6 +3,7 @@ import { sequelize } from '../../config/database';
 import { ProductCategoryModel } from '../product-category/model';
 import { ProductVariantModel } from '../product-variant/model';
 import { Op } from 'sequelize';
+import { formatProductName } from './helpers/format-name';
 
 export class ProductModel extends Model {
 	public id!: string;
@@ -163,7 +164,7 @@ ProductModel.init(
 		],
 		hooks: {
 			beforeCreate: async product => {
-				product.name = product.name.trim();
+				product.name = formatProductName(product.name);
 				product.normalizeDescription();
 				await product.validateProductName();
 			},
@@ -173,8 +174,12 @@ ProductModel.init(
 			// Solo se valida el nombre si cambia: el catálogo trae nombres
 			// duplicados de antes de esta validación, y comprobarlos en cada
 			// guardado impedía editarles la descripción o la categoría
+			// El formato solo al renombrar: aplicarlo en cada guardado cambiaría el
+			// nombre de un producto al editarle la descripción
 			beforeUpdate: async product => {
-				product.name = product.name.trim();
+				if (product.changed('name')) {
+					product.name = formatProductName(product.name);
+				}
 				product.normalizeDescription();
 
 				if (product.changed('name')) {

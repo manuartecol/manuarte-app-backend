@@ -1,6 +1,7 @@
 import { DataTypes, Model, QueryTypes } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { Op } from 'sequelize';
+import { formatCategoryName } from '../product/helpers/format-name';
 
 export class ProductCategoryModel extends Model {
 	public id!: string;
@@ -41,8 +42,13 @@ export class ProductCategoryModel extends Model {
 	}
 
 	async validateProductCategoryName() {
+		// Sin distinguir mayúsculas: antes todas estaban en mayúsculas y bastaba
+		// con comparar el texto tal cual
 		const existingProduct = await ProductCategoryModel.findOne({
-			where: { name: this.name },
+			where: sequelize.where(
+				sequelize.fn('LOWER', sequelize.col('name')),
+				this.name.toLowerCase(),
+			),
 		});
 
 		if (existingProduct && existingProduct.id !== this.id) {
@@ -121,12 +127,14 @@ ProductCategoryModel.init(
 			},
 		],
 		hooks: {
+			// Mismo formato que los productos, con la barra siempre entre espacios:
+			// "CERAS / PARAFINAS /ADITIVOS" queda "Ceras / Parafinas / Aditivos"
 			beforeCreate: async productCategory => {
-				productCategory.name = productCategory.name.toUpperCase().trim();
+				productCategory.name = formatCategoryName(productCategory.name);
 				await productCategory.validateProductCategoryName();
 			},
 			beforeUpdate: async productCategory => {
-				productCategory.name = productCategory.name.toUpperCase().trim();
+				productCategory.name = formatCategoryName(productCategory.name);
 				await productCategory.validateProductCategoryName();
 			},
 			// Mismo criterio que en producto: los productos borrados siguen
