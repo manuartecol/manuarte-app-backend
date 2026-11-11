@@ -24,6 +24,11 @@ router.get(
 	productVariantController.getCatalog,
 );
 router.get(
+	'/suggestions',
+	authorize(ProductPermissions.PRODUCT_READ),
+	productVariantController.getSuggestions,
+);
+router.get(
 	'/search/:stockId',
 	authorize(ProductPermissions.PRODUCT_SEARCH),
 	productVariantController.searchByNameOrCode,

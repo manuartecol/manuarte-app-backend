@@ -27,6 +27,7 @@ import {
 	VariantAxes,
 	VariantAxesDto,
 	VariantCatalog,
+	VariantSuggestion,
 	VariantContainer,
 	VariantUnit,
 } from './types';
@@ -449,7 +450,7 @@ export class ProductVariantService {
 			},
 		);
 
-		return row?.groupName === CAPACITY_CATEGORY_GROUP;
+		return row?.groupName?.toUpperCase() === CAPACITY_CATEGORY_GROUP;
 	};
 
 	/**
@@ -862,6 +863,63 @@ export class ProductVariantService {
 	 * presentaciones que ya la referencian siguen resolviendo su nombre, porque
 	 * eso lo hace el include de la fila y no esta lista
 	 */
+	/**
+	 * Las medidas más usadas en una categoría, para ofrecerlas al crear un
+	 * producto: cantidad, unidad y envase, sin atributos, porque el color o la
+	 * talla son de cada producto. Cuenta productos y no presentaciones, para que
+	 * un producto con muchas presentaciones iguales no pese más que los demás
+	 */
+	getSuggestions = async (
+		productCategoryId: string,
+		limit = 6,
+	): Promise<VariantSuggestion[]> => {
+		try {
+			const rows = await sequelize.query<{
+				quantityValue: string | null;
+				unitId: string | null;
+				containerId: string | null;
+				products: string;
+			}>(
+				`SELECT v."quantityValue", v."unitId", v."containerId",
+					COUNT(DISTINCT v."productId") AS products
+				FROM product_variant v
+				JOIN product p ON p.id = v."productId"
+				WHERE p."productCategoryId" = :productCategoryId
+					AND p."deletedDate" IS NULL
+					AND v."deletedDate" IS NULL
+					AND (v."unitId" IS NOT NULL OR v."containerId" IS NOT NULL)
+				GROUP BY v."quantityValue", v."unitId", v."containerId"
+				ORDER BY products DESC, MIN(v."quantityBase") ASC NULLS LAST
+				LIMIT :limit`,
+				{
+					replacements: { productCategoryId, limit },
+					type: QueryTypes.SELECT,
+				},
+			);
+
+			const { units, containers } = await this.getCatalog();
+
+			return rows.map(row => {
+				const unit = units.find(u => u.id === row.unitId) ?? null;
+				const container =
+					containers.find(c => c.id === row.containerId) ?? null;
+				const quantityValue =
+					row.quantityValue === null ? null : Number(row.quantityValue);
+
+				return {
+					quantityValue,
+					unitId: row.unitId,
+					containerId: row.containerId,
+					name: composeVariantName({ quantityValue, unit, container }),
+					products: Number(row.products),
+				};
+			});
+		} catch (error) {
+			console.error('Error getting variant suggestions');
+			throw error;
+		}
+	};
+
 	getCatalog = async (): Promise<VariantCatalog> => {
 		try {
 			const [units, containers, attributeTypes] = await Promise.all([

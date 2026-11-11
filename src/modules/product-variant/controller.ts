@@ -47,6 +47,23 @@ export class ProductVariantController {
 		}
 	};
 
+	getSuggestions: Handler = async (req, res, next) => {
+		try {
+			const productCategoryId = (req.query.productCategoryId as string) || '';
+			if (!productCategoryId) {
+				res.status(400).json({ message: 'La categoría es requerida' });
+				return;
+			}
+
+			const suggestions =
+				await this.productVariantService.getSuggestions(productCategoryId);
+
+			res.status(200).json(suggestions);
+		} catch (error) {
+			next(error);
+		}
+	};
+
 	getCatalog: Handler = async (_req, res, next) => {
 		try {
 			const catalog = await this.productVariantService.getCatalog();

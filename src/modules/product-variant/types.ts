@@ -130,6 +130,15 @@ export interface VariantAxesDto {
 	attributes?: { attributeTypeId: string; value: string }[];
 }
 
+export interface VariantSuggestion {
+	quantityValue: number | null;
+	unitId: string | null;
+	containerId: string | null;
+	name: string;
+	// Cuántos productos de la categoría la usan
+	products: number;
+}
+
 export interface VariantCatalog {
 	units: VariantUnit[];
 	containers: VariantContainer[];
