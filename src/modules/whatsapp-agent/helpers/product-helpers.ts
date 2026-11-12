@@ -168,6 +168,91 @@ export function detectRequestedWeightGrams(text: string): number | null {
 }
 
 /**
+ * Convierte el nombre de una variante a mililitros cuando es posible.
+ * Ej: "20 ml" → 20, "20 cc" → 20, "1 lt" → 1000, "Medio Litro" → 500
+ */
+export function parseVariantVolumeMl(variantName: string): number | null {
+	const normalized = normalizeText(variantName);
+	if (/\bmedio\s*litro\b/.test(normalized)) return 500;
+	const literMatch = normalized.match(/(\d+(?:[.,]\d+)?)\s*(?:litros?|lts?|l)\b/);
+	if (literMatch) return parseFloat(literMatch[1].replace(',', '.')) * 1000;
+	if (/^\s*litros?\s*$/.test(normalized)) return 1000;
+	const mlMatch = normalized.match(
+		/(\d+(?:[.,]\d+)?)\s*(?:ml|mililitros?|cc)\b/,
+	);
+	if (mlMatch) return parseFloat(mlMatch[1].replace(',', '.'));
+	return null;
+}
+
+/**
+ * Cantidad pedida o de una presentación en su dimensión: gramos para peso,
+ * mililitros para volumen. Solo se comparan medidas de la misma dimensión: 500 ml
+ * no se resuelve contra una presentación de 500 g
+ */
+export type Measure = { dimension: 'mass' | 'volume'; base: number };
+
+/** Abreviatura con la que se nombra la base de cada dimensión en los mensajes */
+export const MEASURE_BASE_LABEL: Record<Measure['dimension'], string> = {
+	mass: 'g',
+	volume: 'ml',
+};
+
+/**
+ * Unidad para hablarle al cliente de una cantidad: el peso siempre en kg; el
+ * volumen en litros desde 1 litro y en ml por debajo
+ */
+export function measureLabelUnit(measure: Measure): 'kg' | 'litros' | 'ml' {
+	if (measure.dimension === 'mass') return 'kg';
+	return measure.base >= 1000 ? 'litros' : 'ml';
+}
+
+/** "2 kg", "1.5 litros", "500 ml" */
+export function formatMeasureAmount(
+	measure: Measure,
+	unit: ReturnType<typeof measureLabelUnit> = measureLabelUnit(measure),
+): string {
+	const value = unit === 'ml' ? measure.base : measure.base / 1000;
+	return `${value % 1 === 0 ? value : value.toFixed(1)} ${unit}`;
+}
+
+export function parseVariantMeasure(variantName: string): Measure | null {
+	const grams = parseVariantWeightGrams(variantName);
+	if (grams !== null) return { dimension: 'mass', base: grams };
+	const ml = parseVariantVolumeMl(variantName);
+	if (ml !== null) return { dimension: 'volume', base: ml };
+	return null;
+}
+
+/** La medida de la presentación en la dimensión pedida, o null si es de otra */
+export function variantAmountIn(
+	variantName: string,
+	dimension: Measure['dimension'],
+): number | null {
+	const measure = parseVariantMeasure(variantName);
+	return measure?.dimension === dimension ? measure.base : null;
+}
+
+/**
+ * Detecta si el texto del cliente especifica una cantidad por peso o por
+ * volumen ("2 kilos", "500 ml", "1 litro", "20 cc").
+ */
+export function detectRequestedMeasure(text: string): Measure | null {
+	const grams = detectRequestedWeightGrams(text);
+	if (grams !== null) return { dimension: 'mass', base: grams };
+	const volumeMatch = text.match(
+		/\b(\d+(?:[.,]\d+)?)\s*(litros?|lts?|l|mililitros?|ml|cc)\b/i,
+	);
+	if (volumeMatch) {
+		const val = parseFloat(volumeMatch[1].replace(',', '.'));
+		const unit = volumeMatch[2].toLowerCase();
+		const isLiter = unit.startsWith('l');
+		return { dimension: 'volume', base: isLiter ? val * 1000 : val };
+	}
+	if (/\bmedio\s*litro\b/i.test(text)) return { dimension: 'volume', base: 500 };
+	return null;
+}
+
+/**
  * Umbral (en gramos) a partir del cual un peso pedido SIN presentación explícita
  * deja de asumirse: el cliente podría querer kilos sueltos o un bloque/caja, así
  * que se le pregunta. Por debajo del umbral se resuelve directo a kilos sueltos.
@@ -281,27 +366,46 @@ export function resolveVariantByWeight(
 	variants: ProductListEntry['variants'],
 	requestedGrams: number,
 ): { variant: ProductListEntry['variants'][0]; units: number } | null {
-	const weighted = variants
-		.map(v => ({ variant: v, grams: parseVariantWeightGrams(v.name) }))
-		.filter(
-			(vw): vw is { variant: ProductListEntry['variants'][0]; grams: number } =>
-				vw.grams !== null && vw.grams > 0,
-		);
-	if (weighted.length === 0) return null;
+	return resolveVariantByMeasure(variants, {
+		dimension: 'mass',
+		base: requestedGrams,
+	});
+}
 
-	const exactMatches = weighted.filter(vw => requestedGrams % vw.grams === 0);
-	const candidates = exactMatches.length > 0 ? exactMatches : weighted;
+/**
+ * Lo mismo que `resolveVariantByWeight` para peso o volumen: solo considera las
+ * presentaciones de la misma dimensión que lo pedido
+ */
+export function resolveVariantByMeasure(
+	variants: ProductListEntry['variants'],
+	requested: Measure,
+): { variant: ProductListEntry['variants'][0]; units: number } | null {
+	const measured = variants
+		.map(v => ({
+			variant: v,
+			amount: variantAmountIn(v.name, requested.dimension),
+		}))
+		.filter(
+			(vm): vm is { variant: ProductListEntry['variants'][0]; amount: number } =>
+				vm.amount !== null && vm.amount > 0,
+		);
+	if (measured.length === 0) return null;
+
+	const exactMatches = measured.filter(
+		vm => requested.base % vm.amount === 0,
+	);
+	const candidates = exactMatches.length > 0 ? exactMatches : measured;
 
 	// Menor cantidad de unidades = presentación más práctica para la cantidad pedida
 	const best = candidates.reduce((a, b) => {
-		const unitsA = Math.ceil(requestedGrams / a.grams);
-		const unitsB = Math.ceil(requestedGrams / b.grams);
+		const unitsA = Math.ceil(requested.base / a.amount);
+		const unitsB = Math.ceil(requested.base / b.amount);
 		return unitsB < unitsA ? b : a;
 	});
 
 	return {
 		variant: best.variant,
-		units: Math.ceil(requestedGrams / best.grams),
+		units: Math.ceil(requested.base / best.amount),
 	};
 }
 

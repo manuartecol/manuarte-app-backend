@@ -228,8 +228,8 @@ ACCIONES Y SU SIGNIFICADO EXACTO (son las ÚNICAS válidas: set, increase, decre
 CAMPOS DE CADA CHANGE:
 - "cartIndex": OBLIGATORIO para set/increase/decrease/remove. Es el NÚMERO del ítem en [carrito actual]. Nunca lo incluyas en "new".
 - "product": SIEMPRE inclúyelo. Para ítems del carrito usa el nombre EXACTO como aparece en [carrito actual] (respaldo por si el índice falla). Para "new" usa el nombre de la lista activa o como lo dijo el cliente.
-- "quantity": cantidad en UNIDADES. NUNCA lo uses si el cliente habló en peso (usa weightText).
-- "weightText": cuando el cliente expresa la CANTIDAD en peso ("1 kilo", "500 gramos", "2 kg"), cópialo EXACTO como lo dijo, SIN convertir. El sistema lo convierte a unidades según la presentación del ítem. No incluyas quantity en ese caso.
+- "quantity": cantidad en UNIDADES. NUNCA lo uses si el cliente habló en peso o volumen (usa weightText).
+- "weightText": cuando el cliente expresa la CANTIDAD en peso o volumen ("1 kilo", "500 gramos", "2 kg", "1 litro", "500 ml", "20 cc"), cópialo EXACTO como lo dijo, SIN convertir. El sistema lo convierte a unidades según la presentación del ítem. No incluyas quantity en ese caso.
 - "variant": SOLO cuando el cliente pide OTRA PRESENTACIÓN del producto ("la de 500g", "mejor el kilo"). No es una cantidad.
 
 DISTINCIÓN CRÍTICA "set" vs "increase":
@@ -343,22 +343,23 @@ PRINCIPIOS CLAVE:
 - RAZONA usando: mensaje actual + carrito + historial + último mensaje del bot
 - Si el cliente se refiere a un producto en carrito, entiende que es edit_cart (no search_product)
 - Si es una corrección ("No son N, son M"), es una actualización de cantidad, no eliminación+adición
-- Cantidades en peso ("5 kilos") NUNCA van en quantity: en edit_cart van en weightText; en search/select van en variantHint
+- Cantidades en peso o volumen ("5 kilos", "2 litros") NUNCA van en quantity: en edit_cart van en weightText; en search/select van en variantHint
 - NO inventes información que no está en el contexto
 
 CAMPOS (incluir SOLO cuando apliquen):
 - "selectionIndexes": array 1-based. Solo select_product.
 - "quantity": unidades. NO inventes un 1 cuando el cliente solo PREGUNTA ("¿tienes cortador?", "¿hay rosado?"). PERO cuando el cliente da una ORDEN DE AGREGAR con un verbo de pedido (dame, ponme, agrégame, añademe, quiero, necesito, regálame, mándame) e indica "un/una/uno" o un número, SÍ pon la cantidad ("un/una/uno" = quantity 1). Ej: "dame un cortador" → quantity 1; "ponme dos rosados" → quantity 2. Así el producto se agrega directo sin volver a preguntar la cantidad. Para peso/tamaño usa variantHint, no quantity.
 - "quantities": array paralelo a selectionIndexes cuando cada producto lleva cantidad distinta.
-- "variantHint": tamaño/presentación EXACTO como lo dice el cliente ("5 kilos", "20 ml", "500 gramos", "bloque", "caja de 10 kilos", "de a kilo"). NUNCA conviertas las unidades ni traduzcas un peso a una forma. SIEMPRE texto libre. Solo para select_product/search_product (en edit_cart usa los campos del change).
+- "variantHint": tamaño/presentación EXACTO como lo dice el cliente ("5 kilos", "20 ml", "1 litro", "500 gramos", "bloque", "caja de 10 kilos", "de a kilo"). NUNCA conviertas las unidades ni traduzcas un peso a una forma. SIEMPRE texto libre. Solo para select_product/search_product (en edit_cart usa los campos del change).
 - "searchQuery": para search_product y general_question. Nombre del producto SIN frases de uso ("para hacer X"), pero CONSERVA "para velas"/"para jabones" si forman parte del nombre.
 - "productList": array {productHint, quantity, variantHint?} para multi_product_add o request_quote.
 - "needsClarification": true cuando falta información crítica.
 - "recommendFromList": true (solo con general_question) cuando el cliente pide que le recomiendes/sugieras cuál elegir entre los productos ya mostrados.
 - "faqTopic": "store_location" (solo con general_question) cuando el cliente pregunta por la ubicación/dirección física de la tienda. Robusto a verbos de pedido y typos.
 
-PESO SIEMPRE EN variantHint (para search_product/select_product):
+PESO O VOLUMEN SIEMPRE EN variantHint (para search_product/select_product):
 "5 kilos de cera de palma" → searchQuery:"cera de palma", variantHint:"5 kilos" — NO quantity:5
+"2 litros de glicerina" → searchQuery:"glicerina", variantHint:"2 litros" — NO quantity:2
 "son solo 5 kilos" (corrección con "Cera de Palma" ya en carrito) → edit_cart con changes: [{action:"set", cartIndex:N, product:"Cera de Palma", weightText:"5 kilos"}]
 
 EJEMPLOS:

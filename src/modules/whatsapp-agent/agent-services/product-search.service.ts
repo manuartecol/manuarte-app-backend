@@ -16,6 +16,8 @@ import { CartItem, ProductListEntry, UserSession } from '../types';
 import {
 	detectRequestedWeightGrams,
 	resolveVariantByWeight,
+	detectRequestedMeasure,
+	resolveVariantByMeasure,
 	resolveVariant,
 	allHintWordsMatch,
 	classifyPresentationPreference,
@@ -186,12 +188,13 @@ export class ProductSearchService {
 		if (candidates.length === 0) return null;
 
 		if (variantHint) {
-			// Peso ("2 kilos") → variante cuyo peso calce y unidades necesarias
-			const grams = detectRequestedWeightGrams(variantHint);
-			if (grams !== null) {
-				const byWeight = resolveVariantByWeight(
+			// Peso o volumen ("2 kilos", "1 litro") → variante cuya medida calce y
+			// unidades necesarias
+			const measure = detectRequestedMeasure(variantHint);
+			if (measure !== null) {
+				const byWeight = resolveVariantByMeasure(
 					candidates.map(c => c.variant),
-					grams,
+					measure,
 				);
 				if (byWeight) {
 					const pair = candidates.find(c => c.variant === byWeight.variant);
@@ -507,6 +510,19 @@ export class ProductSearchService {
 					//    Esto cubre el caso en que el producto se vende por kilo (variante "KILO")
 					//    y el cliente pide "4 kilos": son 4 unidades, no 1. resolveVariant no
 					//    puede inferir el multiplicador (devuelve la variante única tal cual).
+					// El volumen ("2 litros", "500 ml") se resuelve igual, sin la política
+					// de kilos sueltos frente a bloque, que es solo de peso
+					const requestedMeasure = detectRequestedMeasure(item.variantHint);
+					if (requestedMeasure?.dimension === 'volume') {
+						const byVolume = resolveVariantByMeasure(
+							product.variants,
+							requestedMeasure,
+						);
+						if (byVolume) {
+							addResolved(product, byVolume.variant, byVolume.units);
+							continue;
+						}
+					}
 					const requestedGrams = detectRequestedWeightGrams(item.variantHint);
 					if (requestedGrams !== null) {
 						// Presentación dual (KILO + bloque/caja): respeta la preferencia

@@ -36,7 +36,13 @@ import {
 	resolveVariant,
 	parseVariantWeightGrams,
 	detectRequestedWeightGrams,
-	resolveVariantByWeight,
+	detectRequestedMeasure,
+	parseVariantMeasure,
+	variantAmountIn,
+	resolveVariantByMeasure,
+	measureLabelUnit,
+	formatMeasureAmount,
+	MEASURE_BASE_LABEL,
 	buildOutOfStockResolutionMessage,
 	scoreNameMatch,
 	allHintWordsMatch,
@@ -479,13 +485,13 @@ export class IntentHandlerService {
 			session.selectedProduct = selectedItems[0].name;
 			session.selectedVariantName = resolvedVariant?.name;
 
-			const requestedGramsInSelection =
-				detectRequestedWeightGrams(normalizedText);
+			const requestedMeasureInSelection =
+				detectRequestedMeasure(normalizedText);
 
 			// Cross-list weight resolution: when a weight is requested and a single product
 			// is selected, search all related products in the list for the optimal variant.
 			// Example: "dame 4 kilos de la white" → prefer WHITE KILO x4 over WHITE 10 KILOS x1.
-			if (requestedGramsInSelection !== null && selectedItems.length === 1) {
+			if (requestedMeasureInSelection !== null && selectedItems.length === 1) {
 				const selectedKeywords = normalizeText(selectedItems[0].name)
 					.split(/\s+/)
 					.filter(w => w.length > 2);
@@ -499,7 +505,10 @@ export class IntentHandlerService {
 					const pNorm = normalizeText(listProduct.name);
 					if (selectedKeywords.some(kw => pNorm.includes(kw))) {
 						for (const v of listProduct.variants) {
-							const g = parseVariantWeightGrams(v.name);
+							const g = variantAmountIn(
+								v.name,
+								requestedMeasureInSelection.dimension,
+							);
 							if (g !== null && g > 0) {
 								candidatePool.push({
 									variant: v,
@@ -512,12 +521,12 @@ export class IntentHandlerService {
 				}
 				if (candidatePool.length > 0) {
 					const exact = candidatePool.filter(
-						c => requestedGramsInSelection % c.grams === 0,
+						c => requestedMeasureInSelection.base % c.grams === 0,
 					);
 					const pool = exact.length > 0 ? exact : candidatePool;
 					const best = pool.reduce((a, b) => {
-						const uA = Math.ceil(requestedGramsInSelection / a.grams);
-						const uB = Math.ceil(requestedGramsInSelection / b.grams);
+						const uA = Math.ceil(requestedMeasureInSelection.base / a.grams);
+						const uB = Math.ceil(requestedMeasureInSelection.base / b.grams);
 						return uB < uA ? b : a;
 					});
 					// Only redirect when a genuinely better product or variant was found
@@ -525,7 +534,9 @@ export class IntentHandlerService {
 						best.product.name !== selectedItems[0].name ||
 						best.variant.name !== resolvedVariant?.name
 					) {
-						const units = Math.ceil(requestedGramsInSelection / best.grams);
+						const units = Math.ceil(
+							requestedMeasureInSelection.base / best.grams,
+						);
 						const cappedUnits = Math.min(units, best.variant.totalQty);
 						const stockExceeded = cappedUnits < units;
 						if (!stockExceeded) {
@@ -573,12 +584,16 @@ export class IntentHandlerService {
 					itemVariant ? [itemVariant] : item.variants
 				).reduce((sum, v) => sum + v.totalQty, 0);
 
-				const variantGramsForItem = itemVariant
-					? parseVariantWeightGrams(itemVariant.name)
-					: null;
+				const variantGramsForItem =
+					itemVariant && requestedMeasureInSelection
+						? variantAmountIn(
+								itemVariant.name,
+								requestedMeasureInSelection.dimension,
+							)
+						: null;
 				const weightBasedQty =
-					requestedGramsInSelection !== null && variantGramsForItem !== null
-						? Math.ceil(requestedGramsInSelection / variantGramsForItem)
+					requestedMeasureInSelection !== null && variantGramsForItem !== null
+						? Math.ceil(requestedMeasureInSelection.base / variantGramsForItem)
 						: undefined;
 
 				const itemQty =
@@ -700,15 +715,15 @@ export class IntentHandlerService {
 		// Usar el producto con mayor score (primero en la lista, ya ordenada por relevancia+stock).
 		// Cuando hay varios resultados para la misma búsqueda (ej: "cera de palma" devuelve
 		// "Cera de Palma / de Vaso" y "Cera de palma para Moldes - APF"), se toma el primero.
-		const requestedGramsFromText = detectRequestedWeightGrams(normalizedText);
-		const requestedGramsFromHint = aiVariantHint
-			? detectRequestedWeightGrams(aiVariantHint)
+		const requestedMeasureFromText = detectRequestedMeasure(normalizedText);
+		const requestedMeasureFromHint = aiVariantHint
+			? detectRequestedMeasure(aiVariantHint)
 			: null;
-		const requestedGramsForAutoAdd =
-			requestedGramsFromText ?? requestedGramsFromHint;
+		const requestedMeasureForAutoAdd =
+			requestedMeasureFromText ?? requestedMeasureFromHint;
 
 		if (
-			(aiQuantity !== undefined || requestedGramsForAutoAdd !== null) &&
+			(aiQuantity !== undefined || requestedMeasureForAutoAdd !== null) &&
 			result.products.length >= 1 &&
 			result.productFound
 		) {
@@ -718,7 +733,7 @@ export class IntentHandlerService {
 			// tuviera esa presentación, saltamos al que sí. Evita agregar la variante
 			// equivocada de un producto que no tiene lo pedido.
 			let product = result.products[0];
-			if (aiVariantHint && requestedGramsForAutoAdd === null) {
+			if (aiVariantHint && requestedMeasureForAutoAdd === null) {
 				const hintNorm = normalizeText(aiVariantHint);
 				const satisfiesHint = (p: ProductListEntry) =>
 					p.variants.some(v => {
@@ -733,9 +748,13 @@ export class IntentHandlerService {
 					if (better) product = better;
 				}
 			}
-			const requestedGrams = requestedGramsForAutoAdd;
+			const requestedMeasure = requestedMeasureForAutoAdd;
 
-			if (requestedGrams !== null) {
+			if (requestedMeasure !== null) {
+				// Kilos sueltos frente a bloque o caja es solo de peso. En volumen no hay
+				// presentación a granel: 0 g deja fuera esa política
+				const isMass = requestedMeasure.dimension === 'mass';
+				const requestedGrams = isMass ? requestedMeasure.base : 0;
 				// Presentación dual (por KILO + bloque/caja): si el cliente no especifica
 				// forma y el peso es ambiguo (≥ umbral), preguntar en vez de asumir.
 				const pref = classifyPresentationPreference(
@@ -761,8 +780,9 @@ export class IntentHandlerService {
 				// Presentación a granel pedida (peso ≥ umbral o palabra "bloque/caja")
 				// pero sin stock aquí: si existe en catálogo, informar y ofrecer kilos.
 				const wantsBulk =
-					pref === 'bulk' ||
-					requestedGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS;
+					isMass &&
+					(pref === 'bulk' ||
+						requestedGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS);
 				const inStockBulk = product.variants.some(
 					v => (parseVariantWeightGrams(v.name) ?? 0) > 1000,
 				);
@@ -809,7 +829,7 @@ export class IntentHandlerService {
 				const resolved =
 					wp.mode === 'resolved'
 						? { variant: wp.variant, units: wp.units }
-						: resolveVariantByWeight(product.variants, requestedGrams);
+						: resolveVariantByMeasure(product.variants, requestedMeasure);
 				if (resolved) {
 					const cappedUnits = Math.min(
 						resolved.units,
@@ -832,25 +852,25 @@ export class IntentHandlerService {
 						autoAddedQty = cappedUnits;
 						autoAddedVariant = resolved.variant;
 						if (stockExceeded) {
-							const variantGrams = parseVariantWeightGrams(
+							const variantAmount = variantAmountIn(
 								resolved.variant.name,
+								requestedMeasure.dimension,
 							);
-							const requestedKg = requestedGrams / 1000;
-							const availableGrams =
-								variantGrams !== null ? cappedUnits * variantGrams : null;
-							const availableKg =
-								availableGrams !== null ? availableGrams / 1000 : null;
+							const unitLabel = measureLabelUnit(requestedMeasure);
 							const availableLabel =
-								availableKg !== null
-									? `${availableKg % 1 === 0 ? availableKg : availableKg.toFixed(1)} kg (${cappedUnits} unidades de ${resolved.variant.name})`
+								variantAmount !== null
+									? `${formatMeasureAmount({ ...requestedMeasure, base: cappedUnits * variantAmount }, unitLabel)} (${cappedUnits} unidades de ${resolved.variant.name})`
 									: `${cappedUnits} unidades de ${resolved.variant.name}`;
-							const requestedLabel = `${requestedKg % 1 === 0 ? requestedKg : requestedKg.toFixed(1)} kg`;
-							autoAddedStockExceededNote = `El cliente pidió ${requestedLabel} pero solo hay ${availableLabel} disponible(s). NO confirmes el pedido ni calcules total. Informa brevemente la cantidad disponible en kg y pregunta si quiere esa cantidad. Varía la frase: "Solo tenemos X kg, ¿las quiere?" u otra variación natural. NUNCA uses frases como "te lo llevo", "te la llevo" ni similares.`;
+							const requestedLabel = formatMeasureAmount(
+								requestedMeasure,
+								unitLabel,
+							);
+							autoAddedStockExceededNote = `El cliente pidió ${requestedLabel} pero solo hay ${availableLabel} disponible(s). NO confirmes el pedido ni calcules total. Informa brevemente la cantidad disponible en ${unitLabel} y pregunta si quiere esa cantidad. Varía la frase: "Solo tenemos X ${unitLabel}, ¿las quiere?" u otra variación natural. NUNCA uses frases como "te lo llevo", "te la llevo" ni similares.`;
 							session.pendingStockConfirmQty = cappedUnits;
 						}
 					}
 					console.log(
-						`[WhatsApp Agent] Auto-added to cart from search (weight): ${product.name} – ${resolved.variant.name} x${cappedUnits} (${requestedGrams}g → ${resolved.units} units, capped: ${cappedUnits})`,
+						`[WhatsApp Agent] Auto-added to cart from search (${requestedMeasure.dimension}): ${product.name} – ${resolved.variant.name} x${cappedUnits} (${requestedMeasure.base}${MEASURE_BASE_LABEL[requestedMeasure.dimension]} → ${resolved.units} units, capped: ${cappedUnits})`,
 					);
 				}
 			} else if (product.variants.length === 1 && aiQuantity !== undefined) {
@@ -1891,14 +1911,14 @@ export class IntentHandlerService {
 			session.lastCountryInfo?.currency ?? countryInfo?.currency ?? 'USD';
 		// Si el cliente expresa un peso (en variantHint o en el texto), resolver la
 		// variante por peso y usar las unidades calculadas como cantidad.
-		const requestedGramsFollowup =
-			detectRequestedWeightGrams(aiVariantHint ?? '') ??
-			detectRequestedWeightGrams(normalizedText);
+		const requestedMeasureFollowup =
+			detectRequestedMeasure(aiVariantHint ?? '') ??
+			detectRequestedMeasure(normalizedText);
 		const weightResolvedFollowup =
-			selectedProductEntry && requestedGramsFollowup !== null
-				? resolveVariantByWeight(
+			selectedProductEntry && requestedMeasureFollowup !== null
+				? resolveVariantByMeasure(
 						selectedProductEntry.variants,
-						requestedGramsFollowup,
+						requestedMeasureFollowup,
 					)
 				: null;
 
@@ -2925,13 +2945,13 @@ export class IntentHandlerService {
 			return;
 		}
 
-		// Variante pedida: primero por peso equivalente, luego por nombre
-		const wantedGrams = parseVariantWeightGrams(change.variant);
+		// Variante pedida: primero por peso o volumen equivalente, luego por nombre
+		const wanted = parseVariantMeasure(change.variant);
 		const wantedNorm = normalizeText(change.variant);
 		const resolved =
-			(wantedGrams !== null
+			(wanted !== null
 				? product.variants.find(
-						v => parseVariantWeightGrams(v.name) === wantedGrams,
+						v => variantAmountIn(v.name, wanted.dimension) === wanted.base,
 					)
 				: undefined) ??
 			product.variants.find(v => {
@@ -3064,43 +3084,50 @@ export class IntentHandlerService {
 		return bestScore >= 0.5 ? best : undefined;
 	};
 
-	/** true si la presentación pedida corresponde a la variante actual del ítem (por peso equivalente o por nombre). */
+	/** true si la presentación pedida corresponde a la variante actual del ítem (por peso o volumen equivalente, o por nombre). */
 	private variantMatchesItem = (
 		variantHint: string,
 		item: CartItem,
 	): boolean => {
 		const itemVariant = item.variantName ?? '';
-		const hintGrams = parseVariantWeightGrams(variantHint);
-		const itemGrams = parseVariantWeightGrams(itemVariant);
-		if (hintGrams !== null && itemGrams !== null)
-			return hintGrams === itemGrams;
+		const hintMeasure = parseVariantMeasure(variantHint);
+		const itemMeasure = parseVariantMeasure(itemVariant);
+		if (hintMeasure !== null && itemMeasure !== null)
+			return (
+				hintMeasure.dimension === itemMeasure.dimension &&
+				hintMeasure.base === itemMeasure.base
+			);
 		const hintNorm = normalizeText(variantHint);
 		const itemNorm = normalizeText(itemVariant);
 		if (!itemNorm) return false;
 		return itemNorm.includes(hintNorm) || hintNorm.includes(itemNorm);
 	};
 
-	/** Convierte una cantidad expresada en peso a unidades según la presentación del ítem. */
+	/** Convierte una cantidad expresada en peso o volumen a unidades según la presentación del ítem. */
 	private weightToUnits = (
 		weightText: string,
 		item: CartItem,
 	): { units?: number; error?: string } => {
-		const requestedGrams = detectRequestedWeightGrams(weightText);
-		if (requestedGrams === null || requestedGrams <= 0) {
-			return { error: `no se entendió el peso "${weightText}"` };
+		const requested = detectRequestedMeasure(weightText);
+		if (requested === null || requested.base <= 0) {
+			return { error: `no se entendió la cantidad "${weightText}"` };
 		}
-		const itemGrams = parseVariantWeightGrams(item.variantName ?? '');
-		if (itemGrams === null || itemGrams <= 0) {
+		const itemAmount = variantAmountIn(
+			item.variantName ?? '',
+			requested.dimension,
+		);
+		if (itemAmount === null || itemAmount <= 0) {
+			const soldBy = requested.dimension === 'mass' ? 'peso' : 'volumen';
 			return {
-				error: `la presentación de ${cartItemLabel(item)} no se vende por peso; pide la cantidad en unidades`,
+				error: `la presentación de ${cartItemLabel(item)} no se vende por ${soldBy}; pide la cantidad en unidades`,
 			};
 		}
-		if (requestedGrams % itemGrams !== 0) {
+		if (requested.base % itemAmount !== 0) {
 			return {
-				error: `${weightText} no es múltiplo de la presentación de ${cartItemLabel(item)} (${itemGrams} g por unidad); propone la cantidad en unidades o la presentación que sí calce`,
+				error: `${weightText} no es múltiplo de la presentación de ${cartItemLabel(item)} (${itemAmount} ${MEASURE_BASE_LABEL[requested.dimension]} por unidad); propone la cantidad en unidades o la presentación que sí calce`,
 			};
 		}
-		return { units: requestedGrams / itemGrams };
+		return { units: requested.base / itemAmount };
 	};
 
 	/**
