@@ -3,7 +3,7 @@ import { sequelize } from '../../config/database';
 import { ProductCategoryModel } from '../product-category/model';
 import { ProductVariantModel } from '../product-variant/model';
 import { Op } from 'sequelize';
-import { formatProductName } from './helpers/format-name';
+import { formatTypedName } from './helpers/format-name';
 
 export class ProductModel extends Model {
 	public id!: string;
@@ -164,7 +164,7 @@ ProductModel.init(
 		],
 		hooks: {
 			beforeCreate: async product => {
-				product.name = formatProductName(product.name);
+				product.name = formatTypedName(product.name);
 				product.normalizeDescription();
 				await product.validateProductName();
 			},
@@ -178,7 +178,7 @@ ProductModel.init(
 			// nombre de un producto al editarle la descripción
 			beforeUpdate: async product => {
 				if (product.changed('name')) {
-					product.name = formatProductName(product.name);
+					product.name = formatTypedName(product.name);
 				}
 				product.normalizeDescription();
 

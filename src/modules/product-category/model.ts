@@ -1,7 +1,10 @@
 import { DataTypes, Model, QueryTypes } from 'sequelize';
 import { sequelize } from '../../config/database';
 import { Op } from 'sequelize';
-import { formatCategoryName } from '../product/helpers/format-name';
+import {
+	formatCategoryName,
+	formatTypedName,
+} from '../product/helpers/format-name';
 
 export class ProductCategoryModel extends Model {
 	public id!: string;
@@ -130,11 +133,17 @@ ProductCategoryModel.init(
 			// Mismo formato que los productos, con la barra siempre entre espacios:
 			// "CERAS / PARAFINAS /ADITIVOS" queda "Ceras / Parafinas / Aditivos"
 			beforeCreate: async productCategory => {
-				productCategory.name = formatCategoryName(productCategory.name);
+				productCategory.name = formatTypedName(
+					productCategory.name,
+					formatCategoryName,
+				);
 				await productCategory.validateProductCategoryName();
 			},
 			beforeUpdate: async productCategory => {
-				productCategory.name = formatCategoryName(productCategory.name);
+				productCategory.name = formatTypedName(
+					productCategory.name,
+					formatCategoryName,
+				);
 				await productCategory.validateProductCategoryName();
 			},
 			// Mismo criterio que en producto: los productos borrados siguen

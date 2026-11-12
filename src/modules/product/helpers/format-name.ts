@@ -49,7 +49,15 @@ const ACRONYMS = new Set([
 	'USP',
 ]);
 
-export const formatProductName = (name: string): string => {
+/**
+ * `keepUppercase`: además de la lista, respeta como sigla cualquier palabra de
+ * dos o más letras escrita toda en mayúsculas. Solo tiene sentido cuando el
+ * nombre no viene entero en mayúsculas
+ */
+export const formatProductName = (
+	name: string,
+	keepUppercase = false,
+): string => {
 	const clean = name
 		.trim()
 		.replace(/\s+/g, ' ')
@@ -61,16 +69,20 @@ export const formatProductName = (name: string): string => {
 		const first = isFirst;
 		isFirst = false;
 
-		if (/\d/.test(word) || ACRONYMS.has(word.toUpperCase())) {
-			return /\d/.test(word) ? word : word.toUpperCase();
+		if (/\d/.test(word)) return word;
+		if (ACRONYMS.has(word.toUpperCase())) return word.toUpperCase();
+		// Conectores y unidades nunca son siglas: "x 1 KG" queda "x 1 kg"
+		if (!first && LOWERCASE_WORDS.has(word.toLowerCase())) {
+			return word.toLowerCase();
+		}
+		if (keepUppercase && word.length > 1 && !/\p{Ll}/u.test(word)) {
+			return word;
 		}
 
 		// Mezcla interna de mayúsculas a propósito, como "GlydantPlus"
 		if (/\p{Ll}\p{Lu}/u.test(word)) return word;
 
 		const lower = word.toLowerCase();
-		if (!first && LOWERCASE_WORDS.has(lower)) return lower;
-
 		return lower.charAt(0).toUpperCase() + lower.slice(1);
 	});
 
@@ -85,5 +97,21 @@ export const formatProductName = (name: string): string => {
 
 // Las categorías, con la barra siempre entre espacios: "MECHAS/PABILOS" queda
 // "Mechas / Pabilos"
-export const formatCategoryName = (name: string): string =>
-	formatProductName(name.replace(/\s*\/\s*/g, ' / '));
+export const formatCategoryName = (
+	name: string,
+	keepUppercase = false,
+): string =>
+	formatProductName(name.replace(/\s*\/\s*/g, ' / '), keepUppercase);
+
+/**
+ * Para lo que se escribe en el panel. Siempre formatea (inicial mayúscula,
+ * conectores en minúscula), pero si el nombre mezcla mayúsculas y minúsculas,
+ * las palabras escritas enteras en mayúsculas se respetan como siglas aunque la
+ * lista no las conozca: "Base easy soap XYZ con miel" queda
+ * "Base Easy Soap XYZ con Miel". Un nombre todo en mayúsculas no permite
+ * distinguirlas y solo protege las de la lista
+ */
+export const formatTypedName = (
+	name: string,
+	format: (name: string, keepUppercase?: boolean) => string = formatProductName,
+): string => format(name, /\p{Ll}/u.test(name) && /\p{Lu}/u.test(name));
