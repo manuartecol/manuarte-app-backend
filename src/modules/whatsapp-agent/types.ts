@@ -17,6 +17,28 @@ export interface ProductListEntry {
 	}>;
 }
 
+/**
+ * Lo pedido coincide con varios productos, o con un producto de varias
+ * presentaciones sin decir cuál: en vez de elegir por el cliente se le muestran
+ * las opciones. Cada opción es un producto con una sola presentación, para que
+ * elegir por número deje resuelto el producto y la presentación a la vez
+ */
+/** Peso o volumen pedido, en gramos o mililitros */
+export interface RequestedMeasure {
+	dimension: 'mass' | 'volume';
+	base: number;
+}
+
+export interface ProductChoice {
+	hint: string;
+	quantity: number;
+	/** Peso o volumen pedido ("4 kilos"): al elegir, las unidades salen de la presentación elegida */
+	measure?: RequestedMeasure;
+	/** Por qué se pregunta, para el modelo (p. ej. no hay presentación de medio litro) */
+	reason?: string;
+	options: ProductListEntry[];
+}
+
 export interface CartItem {
 	productId: string;
 	productVariantId?: string;
@@ -76,6 +98,8 @@ export interface CartChangeResult {
 		requestedGrams: number;
 		kiloVariant: ProductListEntry['variants'][0];
 	};
+	/** Varios productos o presentaciones posibles al agregar: el handler pregunta cuál */
+	productChoice?: ProductChoice;
 	/** El cliente pidió MÁS de lo disponible: NO se aplicó el cambio; el handler
 	 * informa cuánto hay y pregunta si quiere esa cantidad (un "sí" la agrega). */
 	stockShortage?: {
@@ -247,6 +271,12 @@ export interface UserSession {
 	lastQuoteSerial?: string;
 	/** Cantidad capeada al stock cuando fue insuficiente; el siguiente "Sí" la confirma */
 	pendingStockConfirmQty?: number;
+	/** Cantidad pedida antes de mostrar opciones: se aplica cuando el cliente elige una de ellas */
+	pendingChoiceQty?: {
+		quantity: number;
+		measure?: RequestedMeasure;
+		variantIds: string[];
+	} | null;
 	/** Elección de presentación pendiente (kilos sueltos vs bloque/caja) a resolver en el siguiente turno */
 	pendingPresentationChoice?: PendingPresentationChoice | null;
 	/** true si el número NUNCA ha interactuado con el bot según los logs (se evalúa una vez por sesión) */

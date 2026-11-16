@@ -42,6 +42,13 @@ import {
 	stripCallingCode,
 } from './helpers/intent-detection';
 import { getSession, saveSession } from './session.store';
+import {
+	detectRequestedMeasure,
+	leadingQuantity,
+	allHintWordsMatch,
+	isPresentationQuestion,
+	statesQuantityBesidesSelection,
+} from './helpers/product-helpers';
 import { AiStateService } from './agent-services/ai-state.service';
 import { isAiAllowed, normalizePhone } from './helpers/phone-access';
 import { getLineByPhoneNumberId, logRegisteredLines, WhatsAppLine } from './lines';
@@ -973,6 +980,7 @@ export class WhatsAppAgentService {
 		let aiRecommendFromList: boolean | undefined;
 		let aiFaqTopic: string | undefined;
 		let aiSecondaryIntent: NLUIntent | undefined;
+		let asksPresentation = false;
 
 		try {
 			const activeProductsList = hasActiveList
@@ -1013,6 +1021,10 @@ export class WhatsAppAgentService {
 			aiReasoning = primaryIntent.reasoning;
 			aiChanges = primaryIntent.changes;
 			aiSecondaryIntent = nluResult.secondary ?? undefined;
+			asksPresentation = isPresentationQuestion(
+				text,
+				primaryIntent.asksPresentation,
+			);
 
 			// unknown + producto seleccionado → seguir la conversación del producto.
 			// unknown + sin contexto → saludo genérico.
@@ -1036,6 +1048,74 @@ export class WhatsAppAgentService {
 				aiSelectionIndexes = [1];
 			}
 
+			// Se le ofreció una sola opción ("Tengo el alcohol de 1 lt, ¿le sirve?") y
+			// responde "sí": es esa opción. El NLU lo tomaba como intención de compra
+			// sin productos y preguntaba qué quería
+			// o lo vuelve a pedir como producto nuevo ("dale" → new del mismo producto),
+			// lo que repetía la oferta en bucle
+			const offered = session.lastProductList?.[0];
+			const reAsksOffered =
+				!!offered &&
+				(intent === 'edit_cart' || intent === 'multi_product_add') &&
+				(aiChanges?.length ?? 0) > 0 &&
+				aiChanges!.every(
+					c =>
+						c.action === 'new' &&
+						!!c.product &&
+						allHintWordsMatch(c.product, offered.name),
+				);
+			// "¿Y no tienes la de 10 kg?" tras la oferta no la acepta: pregunta por otra
+			if (
+				session.pendingChoiceQty &&
+				!asksPresentation &&
+				(session.lastProductList?.length ?? 0) === 1 &&
+				(reAsksOffered ||
+					(['affirmation', 'purchase_intent', 'product_followup', 'greeting'].includes(
+						intent,
+					) &&
+						!(aiProductList?.length ?? 0)))
+			) {
+				intent = 'select_product';
+				aiSelectionIndexes = [1];
+			}
+
+			// "Factúrame X" es un pedido, no una cotización. El NLU lo confunde aunque
+			// el prompt lo diga, y por cotización el cliente terminaba en otro flujo
+			if (
+				intent === 'request_quote' &&
+				/\b(factur|vendeme|despachame)/.test(normalizedText) &&
+				!/\bcotiz/.test(normalizedText)
+			) {
+				intent = (aiProductList?.length ?? 0) > 0 ? 'multi_product_add' : 'search_product';
+				aiQuantity ??= aiProductList?.[0]?.quantity;
+			}
+
+			// Solo cantidad + producto, sin pregunta ("un bloque de soya apf",
+			// "2 mechas"): es un pedido. Sin cantidad el NLU lo tomaba como consulta y
+			// solo mostraba el producto. Un peso o volumen ("500 gramos") no cuenta
+			if (
+				intent === 'search_product' &&
+				aiQuantity === undefined &&
+				!text.includes('?') &&
+				detectRequestedMeasure(normalizedText) === null
+			) {
+				const leadingQty = leadingQuantity(normalizedText);
+				if (leadingQty !== null) aiQuantity = leadingQty;
+			}
+
+			// "Bueno, la 1" tras pedir "dos ceras": el NLU a veces toma el número de la
+			// opción como cantidad y pisaba las dos. Si el mensaje no trae otra
+			// cantidad, manda la que pidió antes de ver las opciones
+			if (
+				intent === 'select_product' &&
+				session.pendingChoiceQty &&
+				(aiQuantity !== undefined || aiQuantities !== undefined) &&
+				!statesQuantityBesidesSelection(normalizedText, aiSelectionIndexes ?? [])
+			) {
+				aiQuantity = undefined;
+				aiQuantities = undefined;
+			}
+
 			// Búsqueda nueva → limpiar el producto seleccionado previo.
 			if (intent === 'search_product') {
 				session.selectedProduct = undefined;
@@ -1050,6 +1130,7 @@ export class WhatsAppAgentService {
 					(aiSelectionIndexes ? `, selection: [${aiSelectionIndexes}]` : '') +
 					(aiVariantHint ? `, variantHint: "${aiVariantHint}"` : '') +
 					(aiQuantity !== undefined ? `, qty: ${aiQuantity}` : '') +
+					(asksPresentation ? ', asksPresentation' : '') +
 					(aiProductList
 						? `, productList: ${JSON.stringify(aiProductList)}`
 						: '') +
@@ -1158,6 +1239,7 @@ export class WhatsAppAgentService {
 			aiNeedsClarification,
 			aiRecommendFromList,
 			aiFaqTopic,
+			asksPresentation,
 			secondaryIntent: aiSecondaryIntent,
 			isFirstEverInteraction: session.isFirstEverInteraction,
 			knownCustomerName:

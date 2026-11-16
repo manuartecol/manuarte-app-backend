@@ -12,7 +12,12 @@ import {
 	SYNONYM_REPLACEMENTS,
 } from '../utils';
 import { MAX_PRODUCT_RESULTS } from '../constants';
-import { CartItem, ProductListEntry, UserSession } from '../types';
+import {
+	CartItem,
+	ProductChoice,
+	ProductListEntry,
+	UserSession,
+} from '../types';
 import {
 	detectRequestedWeightGrams,
 	resolveVariantByWeight,
@@ -24,9 +29,29 @@ import {
 	resolveWeightedPresentation,
 	WeightedPresentationResult,
 	parseVariantWeightGrams,
+	presentationFormKeyword,
+	variantHasForm,
+	variantAmountIn,
+	formatMeasureAmount,
+	Measure,
 	PRESENTATION_AMBIGUITY_MIN_GRAMS,
 } from '../helpers/product-helpers';
 import { addToCart } from '../helpers/cart-helpers';
+
+/**
+ * Precios que el cliente deja a propósito en lo que no vende: 0 en cualquier
+ * moneda, o menos de $100 pesos (casi siempre $1). En USD $1 sí es un precio
+ * real, por eso el umbral solo aplica a COP. Lo correcto es desactivar la
+ * presentación en la bodega; esto evita que Gema la ofrezca mientras tanto
+ */
+const OFFERABLE_PRICE = {
+	[Op.and]: [
+		{ price: { [Op.gt]: 0 } },
+		{
+			[Op.or]: [{ currency: { [Op.ne]: 'COP' } }, { price: { [Op.gte]: 100 } }],
+		},
+	],
+};
 
 // Tokens de peso/medida que describen la PRESENTACIÓN (variante), no el producto.
 // Se excluyen de los términos OBLIGATORIOS de la búsqueda por nombre (ver buildProductReply).
@@ -98,8 +123,8 @@ export class ProductSearchService {
 	> => {
 		const stockItemWhere =
 			stockIds.length > 0
-				? { stockId: { [Op.in]: stockIds }, active: true }
-				: { active: true };
+				? { stockId: { [Op.in]: stockIds }, active: true, ...OFFERABLE_PRICE }
+				: { active: true, ...OFFERABLE_PRICE };
 		try {
 			const product = await ProductModel.findByPk(productId, {
 				attributes: ['id'],
@@ -179,6 +204,9 @@ export class ProductSearchService {
 		if (!list?.length || !productHint) return null;
 		const matched = list.filter(e => allHintWordsMatch(productHint, e.name));
 		if (matched.length === 0) return null;
+		// "La palma" con la de vaso y la APF en la lista: no se elige por el cliente,
+		// la búsqueda vuelve a mostrar las opciones
+		if (new Set(matched.map(e => e.productId)).size > 1) return null;
 
 		const pool = matched.flatMap(e =>
 			e.variants.map(v => ({ entry: e, variant: v })),
@@ -235,6 +263,42 @@ export class ProductSearchService {
 		};
 	};
 
+	// Una opción por presentación con existencias, hasta 8 para no saturar el mensaje.
+	// Con peso o volumen pedido solo se ofrecen las presentaciones que lo cubren
+	// exacto; si ninguna lo cubre, se muestran todas y se dice por qué
+	buildProductChoice = (
+		hint: string,
+		quantity: number,
+		products: ProductListEntry[],
+		measure?: Measure | null,
+	): ProductChoice => {
+		const all = products.flatMap(p =>
+			p.variants
+				.filter(v => v.totalQty > 0)
+				.map(v => ({ ...p, variants: [v] })),
+		);
+		const fits = measure
+			? all.filter(o => {
+					const amount = variantAmountIn(
+						o.variants[0].name,
+						measure.dimension,
+					);
+					return amount !== null && amount > 0 && measure.base % amount === 0;
+				})
+			: all;
+		const options = (fits.length > 0 ? fits : all).slice(0, 8);
+		return {
+			hint,
+			quantity,
+			measure: measure && fits.length > 0 ? measure : undefined,
+			reason:
+				measure && fits.length === 0
+					? `El cliente pidió ${formatMeasureAmount(measure)} de "${hint}" y ninguna presentación suma esa cantidad exacta. Díselo en una frase y ofrécele lo que hay.`
+					: undefined,
+			options,
+		};
+	};
+
 	/**
 	 * Procesa una lista de productos y los agrega al carrito de la sesión.
 	 * Usado en request_quote y en los handlers de awaiting_confirmation.
@@ -279,6 +343,8 @@ export class ProductSearchService {
 			requestedGrams: number;
 			kiloVariant: ProductListEntry['variants'][0];
 		}>;
+		/** Ítems con varios productos o presentaciones posibles: el caller pregunta cuál. */
+		productChoices: ProductChoice[];
 	}> => {
 		let added = 0;
 		const outOfStock: string[] = [];
@@ -298,6 +364,8 @@ export class ProductSearchService {
 			requestedGrams: number;
 			kiloVariant: ProductListEntry['variants'][0];
 		}> = [];
+		const productChoices: ProductChoice[] = [];
+		const choiceFrom = this.buildProductChoice;
 
 		const pushOutOfStock = (
 			hint: string,
@@ -400,7 +468,24 @@ export class ProductSearchService {
 					}
 					continue;
 				}
-				const product = result.products[0];
+				// "Dos ceras APF" calza con la de palma y con la de soya: no se elige por
+				// el cliente, se le pregunta. Solo cuentan los productos que tienen todas
+				// las palabras de lo pedido, no los parecidos que trae la búsqueda
+				const matching = result.products.filter(p =>
+					allHintWordsMatch(item.productHint, p.name),
+				);
+				if (matching.length > 1) {
+					productChoices.push(
+						choiceFrom(
+							item.productHint,
+							qtyRequested,
+							matching,
+							item.variantHint ? detectRequestedMeasure(item.variantHint) : null,
+						),
+					);
+					continue;
+				}
+				const product = matching[0] ?? result.products[0];
 				const qty = qtyRequested;
 
 				if (item.variantHint) {
@@ -439,8 +524,15 @@ export class ProductSearchService {
 						prefForm === 'bulk' ||
 						(hintGrams !== null &&
 							hintGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS);
-					const inStockBulk = product.variants.some(
-						v => (parseVariantWeightGrams(v.name) ?? 0) > 1000,
+					// Con una forma nombrada solo cuentan las presentaciones que la llevan en
+					// el nombre; sin ella, lo grande es cualquier presentación de más de 1 kg
+					const form = presentationFormKeyword(item.variantHint);
+					const isBulkVariant = (name: string) =>
+						form
+							? variantHasForm(name, form)
+							: (parseVariantWeightGrams(name) ?? 0) > 1000;
+					const inStockBulk = product.variants.some(v =>
+						isBulkVariant(v.name),
 					);
 					if (wantsBulk && !inStockBulk) {
 						const full = await this.getVariantsWithStock(
@@ -448,7 +540,7 @@ export class ProductSearchService {
 							stockIds,
 						);
 						const bulks = full
-							.filter(v => (parseVariantWeightGrams(v.name) ?? 0) > 1000)
+							.filter(v => isBulkVariant(v.name))
 							.sort(
 								(a, b) =>
 									(parseVariantWeightGrams(b.name) ?? 0) -
@@ -500,6 +592,14 @@ export class ProductSearchService {
 							);
 							continue;
 						}
+						// Pidió "bloque" o "caja" y ninguna presentación se llama así: no se
+						// asume cuál es, se le muestran las que hay
+						if (form && hintGrams === null) {
+							productChoices.push(
+								choiceFrom(item.productHint, qtyRequested, [product]),
+							);
+							continue;
+						}
 						// Sin presentación a granel en catálogo (producto solo por kilo):
 						// continúa con la resolución normal (agrega kilos).
 					}
@@ -533,6 +633,7 @@ export class ProductSearchService {
 							product.variants,
 							requestedGrams,
 							pref,
+							form,
 						);
 						if (wp.mode === 'ambiguous') {
 							presentationChoices.push({
@@ -555,6 +656,14 @@ export class ProductSearchService {
 							continue;
 						}
 					}
+					// Peso o volumen que ninguna presentación cubre exacto ("medio litro"
+					// con solo 1 lt): no se redondea, se le muestran las que hay
+					if (requestedMeasure !== null) {
+						productChoices.push(
+							choiceFrom(item.productHint, qty, [product], requestedMeasure),
+						);
+						continue;
+					}
 					// 2) Sin peso (ej: "20 ml", "bloque") o peso sin match: match directo de la
 					//    presentación contra el texto libre de las variantes en BD.
 					const resolved = resolveVariant(
@@ -570,14 +679,14 @@ export class ProductSearchService {
 				} else if (product.variants.length === 1) {
 					addResolved(product, product.variants[0], qty);
 				} else {
-					// Múltiples variantes sin hint → usar la disponible de menor precio.
-					// El cliente pidió cantidad sin especificar presentación.
-					const sortedByPrice = [...product.variants]
-						.filter(v => v.totalQty > 0)
-						.sort((a, b) => Number(a.price) - Number(b.price));
-					const defaultVariant = sortedByPrice[0] ?? product.variants[0];
-					if (defaultVariant) {
-						addResolved(product, defaultVariant, qty);
+					// Varias presentaciones sin decir cuál: se pregunta, igual que en la
+					// búsqueda directa. Antes se tomaba la más barata, y un precio de relleno
+					// ($1) hacía que ganara la caja de 10 kg
+					const inStock = product.variants.filter(v => v.totalQty > 0);
+					if (inStock.length === 1) {
+						addResolved(product, inStock[0], qty);
+					} else if (inStock.length > 1) {
+						productChoices.push(choiceFrom(item.productHint, qty, [product]));
 					}
 				}
 			} catch (err) {
@@ -593,6 +702,7 @@ export class ProductSearchService {
 			outOfStockDetails,
 			presentationChoices,
 			bulkUnavailable,
+			productChoices,
 		};
 	};
 
@@ -730,8 +840,12 @@ export class ProductSearchService {
 		try {
 			const stockItemWhere =
 				countryInfo && countryInfo.stockIds.length > 0
-					? { stockId: { [Op.in]: countryInfo.stockIds }, active: true }
-					: { active: true };
+					? {
+							stockId: { [Op.in]: countryInfo.stockIds },
+							active: true,
+							...OFFERABLE_PRICE,
+						}
+					: { active: true, ...OFFERABLE_PRICE };
 
 			const variantInclude = {
 				model: ProductVariantModel,

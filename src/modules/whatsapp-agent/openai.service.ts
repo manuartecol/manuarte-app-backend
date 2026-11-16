@@ -199,7 +199,7 @@ INTENCIONES VÁLIDAS:
 - show_more: el cliente pide ver más resultados, o pregunta si hay más / si eso es todo, REFIRIÉNDOSE a la lista ya mostrada y SIN nombrar un producto nuevo. Ej: "¿hay más?", "¿no tienes más?", "muéstrame más", "¿solo tienes esos?", "¿eso es todo?", "¿esos son todos?", "¿qué más tienes?".
 - show_cart: el cliente pide ver/confirmar su pedido.
 - edit_cart: el cliente modifica su pedido actual. INCLUYE "changes" con los cambios específicos.
-- request_quote: el cliente pide cotización.
+- request_quote: el cliente pide COTIZACIÓN con esa palabra o equivalente ("cotízame", "me pasa una cotización"). "Factúrame X", "véndeme X" o "despáchame X" NO son cotización: son pedidos de agregar X (multi_product_add, edit_cart "new" o search_product con quantity).
 - purchase_intent: el cliente quiere comprar AHORA (decisión tomada, acción inmediata).
 - multi_product_add: el cliente pide 2+ productos con cantidades en un mensaje.
 - objection: SOLO objeción de PRECIO/valor sobre un producto ("está caro", "muy costoso", "no tengo para tanto") o que lo pensará. NO es objection una queja del servicio ni pedir un humano.
@@ -223,11 +223,11 @@ ACCIONES Y SU SIGNIFICADO EXACTO (son las ÚNICAS válidas: set, increase, decre
 - "remove": eliminar el ítem COMPLETO del carrito. No incluyas quantity.
 - "new": el producto NO está en el carrito. quantity = cantidad a agregar. Puede estar en la lista activa o no — si no está, el sistema lo busca en la base de datos. Usa "new" cuando el cliente da la INSTRUCCIÓN de agregarlo a su pedido; usa search_product solo cuando PREGUNTA por un producto (precio, disponibilidad, información).
 
-**REGLA CRÍTICA (set/increase/decrease/remove vs new)**: set, increase, decrease y remove SOLO son válidos si el producto YA aparece en [carrito actual]. Si NO existe [carrito actual] (carrito vacío) o el producto NO está listado en él, está PROHIBIDO usar set/increase/decrease/remove y PROHIBIDO inventar un cartIndex: para agregar usa SIEMPRE action "new". Da igual el verbo que use el cliente ("dame", "necesito", "quiero", "agrega", "ponme"): si el producto no está en el carrito, es "new". En "new" el campo "product" debe ser el NOMBRE BASE del producto SIN la presentación (ej: "Cera de Palma", NO "Cera de Palma KILO"); la presentación/peso va en weightText (si es peso: "4 kilos") o variant (si es otra presentación).
+**REGLA CRÍTICA (set/increase/decrease/remove vs new)**: set, increase, decrease y remove SOLO son válidos si el producto YA aparece en [carrito actual]. Si NO existe [carrito actual] (carrito vacío) o el producto NO está listado en él, está PROHIBIDO usar set/increase/decrease/remove y PROHIBIDO inventar un cartIndex: para agregar usa SIEMPRE action "new". Da igual el verbo que use el cliente ("dame", "necesito", "quiero", "agrega", "ponme"): si el producto no está en el carrito, es "new". En "new" el campo "product" es el producto con las PALABRAS DEL CLIENTE, SIN la cantidad ni la presentación, pero CONSERVANDO todo lo que lo distingue (tipo, línea, color, aroma, uso): "2 ceras de apf" → "cera apf"; "una caja de cera de palma de vaso" → "cera de palma de vaso" con variant "caja"; "60 ml de aceite de coco" → "aceite de coco" con weightText "60 ml". NUNCA lo cambies por un nombre del catálogo que el cliente no dijo ni le quites palabras: "cera apf" NO es "Cera de Palma"; "cera de palma de vaso" NO es "Cera de Palma". El peso o volumen va en weightText ("4 kilos", "60 ml") y otra presentación en variant.
 
 CAMPOS DE CADA CHANGE:
 - "cartIndex": OBLIGATORIO para set/increase/decrease/remove. Es el NÚMERO del ítem en [carrito actual]. Nunca lo incluyas en "new".
-- "product": SIEMPRE inclúyelo. Para ítems del carrito usa el nombre EXACTO como aparece en [carrito actual] (respaldo por si el índice falla). Para "new" usa el nombre de la lista activa o como lo dijo el cliente.
+- "product": SIEMPRE inclúyelo. Para ítems del carrito usa el nombre EXACTO como aparece en [carrito actual] (respaldo por si el índice falla). Para "new" usa las palabras del cliente completas (ver REGLA CRÍTICA); si se refiere a una opción de la lista activa, el nombre de esa opción.
 - "quantity": cantidad en UNIDADES. NUNCA lo uses si el cliente habló en peso o volumen (usa weightText).
 - "weightText": cuando el cliente expresa la CANTIDAD en peso o volumen ("1 kilo", "500 gramos", "2 kg", "1 litro", "500 ml", "20 cc"), cópialo EXACTO como lo dijo, SIN convertir. El sistema lo convierte a unidades según la presentación del ítem. No incluyas quantity en ese caso.
 - "variant": SOLO cuando el cliente pide OTRA PRESENTACIÓN del producto ("la de 500g", "mejor el kilo"). No es una cantidad.
@@ -241,7 +241,7 @@ DISTINCIÓN CRÍTICA weightText vs variant:
   "mejor démelo en la presentación de 1 kilo" → otra PRESENTACIÓN → variant: "1 kilo"
 
 PRESENTACIÓN "BLOQUE / CAJA / DE A KILO" (bases de glicerina y similares que se venden por kilo Y a granel):
-- Estos productos tienen presentación por KILO (unidades sueltas) y a granel (BLOQUE de 10 kilos, CAJA). Son cosas DISTINTAS: cambian precio y unidades.
+- Estos productos tienen presentación por KILO (unidades sueltas) y a granel (bloque, caja), según cómo se llame cada presentación en el catálogo. Un bloque NO tiene un peso fijo: depende del producto. Son cosas DISTINTAS: cambian precio y unidades.
 - Cuando el cliente NOMBRA la forma, es una PRESENTACIÓN, NO un peso-cantidad. Va en variant (edit_cart) o variantHint (select/search/multi/quote), copiada tal como la dijo:
   - "un bloque", "el bloque", "en bloque", "bloque de 10 kilos" → "bloque"
   - "una caja", "la caja", "caja de 10 kilos" → "caja de 10 kilos" (conserva el peso si lo menciona)
@@ -270,9 +270,17 @@ Ejemplos de razonamiento y cambios:
   → reasoning: "Cliente quita 2 unidades, quedan 3"
   → changes: [{action: "decrease", cartIndex: 1, product: "Aceite Vegetal Coco", quantity: 2}]
 
-- Cliente dice "agrega 2 kilos de cera de palma" (no está en carrito)
-  → reasoning: "Cliente agrega cera de palma nueva, cantidad expresada en peso"
-  → changes: [{action: "new", product: "Cera de Palma", weightText: "2 kilos"}]
+- Cliente dice "agrega 2 kilos de cera de palma de vaso" (no está en carrito)
+  → reasoning: "Cliente agrega cera de palma de vaso nueva, cantidad expresada en peso"
+  → changes: [{action: "new", product: "cera de palma de vaso", weightText: "2 kilos"}]
+
+- Cliente dice "y 60 ml de aceite de coco" (no está en carrito)
+  → reasoning: "Cliente agrega aceite de coco, cantidad en volumen"
+  → changes: [{action: "new", product: "aceite de coco", weightText: "60 ml"}]
+
+- Cliente dice "facturame 2 ceras de apf" (no está en carrito)
+  → reasoning: "Cliente agrega 2 ceras APF; no dijo de cuál, el sistema muestra las opciones"
+  → changes: [{action: "new", product: "cera apf", quantity: 2}]
 
 - Cliente dice "agrégame 2 aceites de coco", carrito: "1. 5x Aceite Vegetal Ricino 20 ML / 2. 4x Aceite Vegetal Almendras 20 ML"
   → reasoning: "El aceite de COCO no está en el carrito; el de ricino y el de almendras son productos DISTINTOS → new, sin cartIndex"
@@ -286,6 +294,10 @@ Ejemplos de razonamiento y cambios:
 - Cliente dice "que sean 5 de coco", carrito: "1. 2x Aceite Vegetal Coco"
   → reasoning: "Cliente quiere 5 en total (set, no suma)"
   → changes: [{action: "set", cartIndex: 1, product: "Aceite Vegetal Coco", quantity: 5}]
+
+- Cliente dice "que sean 100 ml de coco", carrito: "1. 3x Aceite Vegetal Coco 20 ml"
+  → reasoning: "Cliente fija el total en 100 ml (volumen, el sistema convierte): un solo set, sin agregar otro ítem"
+  → changes: [{action: "set", cartIndex: 1, product: "Aceite Vegetal Coco 20 ml", weightText: "100 ml"}]
 
 - Cliente dice "Son 2 de almendras y me agregas otro de coco", carrito: "1. 3x Aceite Vegetal Almendras / 2. 1x Aceite Vegetal Coco"
   → reasoning: "'son 2' = total final 2 de almendras. 'otro de coco' = agrega 1 más al actual"
@@ -337,6 +349,7 @@ GUÍAS RÁPIDAS (el modelo razonará, estos son solo ejemplos):
 - "Me paso después si decido comprar" → farewell (no es decisión inmediata)
 - El cliente DESISTE o pospone ("vuelvo a escribir luego", "vuelvo luego", "lo pienso", "después le confirmo", "déjelo así", "mejor después") → farewell (u objection). AUNQUE el mismo mensaje mencione una cantidad o producto ("necesitaba los 20, pero vuelvo luego, gracias"), la intención DOMINANTE es despedirse/posponer: NUNCA lo tomes como un pedido ni confirmes cantidades. Un "gracias" al final de un mensaje donde el cliente se va también es cierre.
 - "quiero cotización / cotízame / me pueden cotizar" → request_quote (NUNCA purchase_intent)
+- "factúrame / facturame / véndeme / despáchame X" → es un PEDIDO de agregar X (search_product con quantity, multi_product_add o edit_cart "new"), NUNCA request_quote. Solo es purchase_intent si no nombra productos ("factúrame lo que tengo")
 - "Quiero comprar AHORA / proceder con el pago / hacer el pedido ya" → purchase_intent
 
 PRINCIPIOS CLAVE:
@@ -348,17 +361,20 @@ PRINCIPIOS CLAVE:
 
 CAMPOS (incluir SOLO cuando apliquen):
 - "selectionIndexes": array 1-based. Solo select_product.
-- "quantity": unidades. NO inventes un 1 cuando el cliente solo PREGUNTA ("¿tienes cortador?", "¿hay rosado?"). PERO cuando el cliente da una ORDEN DE AGREGAR con un verbo de pedido (dame, ponme, agrégame, añademe, quiero, necesito, regálame, mándame) e indica "un/una/uno" o un número, SÍ pon la cantidad ("un/una/uno" = quantity 1). Ej: "dame un cortador" → quantity 1; "ponme dos rosados" → quantity 2. Así el producto se agrega directo sin volver a preguntar la cantidad. Para peso/tamaño usa variantHint, no quantity.
+- "quantity": unidades. NO inventes un 1 cuando el cliente solo PREGUNTA ("¿tienes cortador?", "¿hay rosado?"). PERO cuando el cliente da una ORDEN DE AGREGAR con un verbo de pedido (dame, ponme, agrégame, añademe, quiero, necesito, regálame, mándame) e indica "un/una/uno" o un número, SÍ pon la cantidad ("un/una/uno" = quantity 1). Ej: "dame un cortador" → quantity 1; "ponme dos rosados" → quantity 2. Así el producto se agrega directo sin volver a preguntar la cantidad. Para peso/tamaño usa variantHint, no quantity. Un mensaje que es SOLO cantidad + producto, sin pregunta ("un bloque de soya apf", "2 mechas 8D", "tres colorantes rojos"), también es un pedido: pon la cantidad.
 - "quantities": array paralelo a selectionIndexes cuando cada producto lleva cantidad distinta.
 - "variantHint": tamaño/presentación EXACTO como lo dice el cliente ("5 kilos", "20 ml", "1 litro", "500 gramos", "bloque", "caja de 10 kilos", "de a kilo"). NUNCA conviertas las unidades ni traduzcas un peso a una forma. SIEMPRE texto libre. Solo para select_product/search_product (en edit_cart usa los campos del change).
-- "searchQuery": para search_product y general_question. Nombre del producto SIN frases de uso ("para hacer X"), pero CONSERVA "para velas"/"para jabones" si forman parte del nombre.
-- "productList": array {productHint, quantity, variantHint?} para multi_product_add o request_quote.
+- "searchQuery": para search_product, general_question y request_quote. Nombre del producto SIN frases de uso ("para hacer X") ni cantidad, pero CONSERVA todo lo que lo distingue ("de vaso", "apf", "de soya", color, aroma) y "para velas"/"para jabones" si forman parte del nombre. "10 kilos de cera de palma de vaso" → "cera de palma de vaso", NUNCA "cera de palma".
+- "productHint" (productList): mismas reglas que searchQuery: las palabras del cliente completas, sin cantidad ni presentación.
+- "productList": array {productHint, quantity, variantHint?} para multi_product_add o request_quote. En request_quote con productos ("cotízame cera apf", "cotízame 3 mechas") SIEMPRE llena productList (quantity 1 si no la dijo).
 - "needsClarification": true cuando falta información crítica.
 - "recommendFromList": true (solo con general_question) cuando el cliente pide que le recomiendes/sugieras cuál elegir entre los productos ya mostrados.
+- "asksPresentation": true (solo con search_product) cuando el cliente PREGUNTA si existe una presentación de un tamaño concreto, es decir, el tamaño del empaque ("¿no tienes de 10 kg?", "¿la tienes en 500 ml?", "te pregunto si tienes la que viene en 10 kilos", "¿hay caja de 10 kilos?"). El tamaño va igual en variantHint. NO cuando pregunta por una CANTIDAD del producto ("¿tienen 10 kilos de cera?" es cantidad) ni cuando ordena ("dame la de 1 kg").
 - "faqTopic": "store_location" (solo con general_question) cuando el cliente pregunta por la ubicación/dirección física de la tienda. Robusto a verbos de pedido y typos.
 
 PESO O VOLUMEN SIEMPRE EN variantHint (para search_product/select_product):
 "5 kilos de cera de palma" → searchQuery:"cera de palma", variantHint:"5 kilos" — NO quantity:5
+"dame medio litro de alcohol" → searchQuery:"alcohol", variantHint:"medio litro" — NO quantity:1
 "2 litros de glicerina" → searchQuery:"glicerina", variantHint:"2 litros" — NO quantity:2
 "son solo 5 kilos" (corrección con "Cera de Palma" ya en carrito) → edit_cart con changes: [{action:"set", cartIndex:N, product:"Cera de Palma", weightText:"5 kilos"}]
 
@@ -366,7 +382,8 @@ EJEMPLOS:
 "el 2" → {"primary":{"intent":"select_product","selectionIndexes":[2]},"secondary":null}
 "quiero 5 de la 1" → {"primary":{"intent":"select_product","selectionIndexes":[1],"quantity":5},"secondary":null}
 "tienes cera de soja apf de 5 kilos" → {"primary":{"intent":"search_product","searchQuery":"cera de soja apf"},"secondary":null}
-"1 termometro" → {"primary":{"intent":"search_product","searchQuery":"termometro"},"secondary":null}
+"1 termometro" → {"primary":{"intent":"search_product","searchQuery":"termometro","quantity":1},"secondary":null}
+"un bloque de soya apf" → {"primary":{"intent":"search_product","searchQuery":"soya apf","variantHint":"bloque","quantity":1},"secondary":null}
 "dame un cortador" → {"primary":{"intent":"search_product","searchQuery":"cortador","quantity":1},"secondary":null}
 "dame un bloque de tr" → {"primary":{"intent":"search_product","searchQuery":"tr","variantHint":"bloque","quantity":1},"secondary":null}
 "necesito un bloque de white" → {"primary":{"intent":"search_product","searchQuery":"white","variantHint":"bloque","quantity":1},"secondary":null}
@@ -414,6 +431,10 @@ EJEMPLOS CON REASONING (edit_cart) - ESTOS SON OBLIGATORIOS:
 → {"primary":{"intent":"edit_cart","reasoning":"Cliente cambia la presentación al bloque (a granel), conserva el producto","changes":[{"action":"set","cartIndex":1,"product":"BASE DE GLICERINA EASY SOAP WHITE-BLANCA","variant":"bloque"}]},"secondary":null}
 
 "quiero 10 kilos de base white" (sin carrito) → {"primary":{"intent":"search_product","searchQuery":"base white","variantHint":"10 kilos"},"secondary":null}
+
+"¿no tienes de 10 kg?" (el bot acaba de mostrar ceras APF de 1 kg, sin carrito) → {"primary":{"intent":"search_product","searchQuery":"cera apf","variantHint":"10 kg","asksPresentation":true},"secondary":null}
+
+"¿tienen 10 kilos de cera de palma?" (sin carrito) → {"primary":{"intent":"search_product","searchQuery":"cera de palma","variantHint":"10 kilos"},"secondary":null}
 
 "agrega 2 fragancias y muéstrame el pedido" (carrito con otros ítems; fragancia NO está)
 → {"primary":{"intent":"edit_cart","reasoning":"Cliente agrega 2 fragancias nuevas y quiere ver el pedido","changes":[{"action":"new","product":"Fragancia","quantity":2}]},"secondary":{"intent":"show_cart"}}
@@ -504,6 +525,7 @@ const NLU_INTENT_SCHEMA = {
 		},
 		needsClarification: { type: 'boolean' },
 		recommendFromList: { type: 'boolean' },
+		asksPresentation: { type: 'boolean' },
 		faqTopic: { type: 'string', enum: ['store_location'] },
 	},
 	required: ['intent', 'reasoning', 'changes'],
@@ -562,6 +584,8 @@ export interface OpenAIContext {
 	outOfStockProductName?: string;
 	/** Resultado real de cada cambio al carrito (para edit_cart): la respuesta debe reflejarlos */
 	editOutcomeNotes?: string[];
+	/** La lista de `products` son opciones para que el cliente elija: nada de eso se agregó todavía */
+	choiceNote?: string;
 	/** Cantidad que el cliente pidió originalmente (antes de limitar al stock) */
 	requestedQuantity?: number;
 	/** Stock disponible cuando el cliente pidió MÁS de lo que hay: NO se agrega nada,
@@ -701,6 +725,9 @@ export interface NLUIntent {
 	/** true cuando el cliente pide una recomendación/opinión sobre cuál elegir entre los
 	 * productos ya mostrados en la conversación ("¿cuál me recomienda?", "¿cuál de todos?"). */
 	recommendFromList?: boolean;
+	/** true cuando el cliente pregunta si existe una presentación de un tamaño
+	 * concreto ("¿no tienes de 10 kg?"), no cuando pide esa cantidad */
+	asksPresentation?: boolean;
 	/** Tema canónico de FAQ cuando la pregunta mapea a uno bien conocido. 'store_location'
 	 * = ubicación/dirección física de la tienda. El handler lo resuelve por título. */
 	faqTopic?: 'store_location';
@@ -1055,6 +1082,7 @@ export class OpenAIService {
 			productList: productList?.length ? productList : undefined,
 			needsClarification: raw.needsClarification === true ? true : undefined,
 			recommendFromList: raw.recommendFromList === true ? true : undefined,
+			asksPresentation: raw.asksPresentation === true ? true : undefined,
 			faqTopic: raw.faqTopic === 'store_location' ? 'store_location' : undefined,
 		};
 	};
@@ -1111,6 +1139,7 @@ export class OpenAIService {
 				'\nResultado REAL de los cambios que pidió el cliente (tu respuesta DEBE reflejar cada uno, sin inventar ni omitir ninguno):\n' +
 					ctx.editOutcomeNotes.map(n => `- ${n}`).join('\n') +
 					'\nTu respuesta NO PUEDE contradecir estos resultados: si aquí no dice que algo se agregó, NO se agregó (aunque el cliente lo haya pedido). ' +
+					'Solo hay algo SIN RESOLVER si una nota lo dice expresamente (no encontrado, no aplicado, sin stock, no disponible). Si el cliente pidió en peso o volumen y la nota trae unidades de una presentación, eso YA es lo que pidió (60 ml = 3 × 20 ml; 2 kilos = 2 × 1 kg): NO digas que falta esa presentación ni preguntes por ella. ' +
 					(ctx.isFirstInteraction
 						? 'Como es el PRIMER mensaje (ya hay saludo de apertura), NO narres el cambio aparte ("Le agregué X"): el resumen del pedido que sigue ya lo muestra. Enlaza el saludo con la frase de resumen. '
 						: 'Estos son DATOS, no frases para copiar. Redáctalos de forma natural y cercana, en primera persona, VARIANDO la forma cada vez: "Le agregué...", "Le sumé...", "Listo, van...", "Quedó añadido...", "Le quité...", "Quitamos del pedido...", "No se la pude agregar porque está sin stock". ' +
@@ -1520,7 +1549,10 @@ export class OpenAIService {
 					// Confirmación limpia: NO incluir DATO EXACTO para evitar que el AI
 					// mezcle info de disponibilidad con la confirmación
 					parts.push(
-						`\nConfirma que van ${ctx.quantity} unidades de ${productLabel} a ${formattedUnit} cada una, total ${formattedTotal}. Varía la frase inicial (usa "Listo", "Perfecto", "Dale", "Vale" u otra). Termina con UNA sola pregunta corta de cierre, VARIÁNDOLA: "¿Necesita algo más?", "¿Desea agregar algo más?", "¿Algo más?", "¿Le agrego algo más?". PROHIBIDO "¿Desea continuar con el pedido?". NO menciones disponibilidad, NO preguntes cuántas quiere, NO añadas comentarios extra. IMPORTANTE: si otra instrucción indicó un saludo de primer mensaje, ese saludo va ANTES de esta confirmación (no lo elimines).`,
+						(ctx.quantity === 1
+							? `\nConfirma que va 1 de ${productLabel} a ${formattedUnit} (habla en singular: NUNCA "1 unidades" ni "cada una"). Varía`
+							: `\nConfirma que van ${ctx.quantity} unidades de ${productLabel} a ${formattedUnit} cada una, total ${formattedTotal}. Varía`) +
+						` la frase inicial (usa "Listo", "Perfecto", "Dale", "Vale" u otra). Termina con UNA sola pregunta corta de cierre, VARIÁNDOLA: "¿Necesita algo más?", "¿Desea agregar algo más?", "¿Algo más?", "¿Le agrego algo más?". PROHIBIDO "¿Desea continuar con el pedido?". NO menciones disponibilidad, NO preguntes cuántas quiere, NO añadas comentarios extra. IMPORTANTE: si otra instrucción indicó un saludo de primer mensaje, ese saludo va ANTES de esta confirmación (no lo elimines).`,
 					);
 				} else {
 					parts.push(
@@ -1616,6 +1648,19 @@ export class OpenAIService {
 				parts.push(
 					`\nEsta es la lista de productos que tienes disponibles para mostrarle al cliente:\n${productList}`,
 				);
+				if (ctx.choiceNote) {
+					// Una sola opción no es una elección: se ofrece en una frase, sin lista
+					const singleOption =
+						ctx.products.length === 1 && ctx.products[0].variants.length === 1;
+					parts.push(
+						`\nCRÍTICO: ${singleOption ? 'esta es la ÚNICA opción y NO' : 'estas son OPCIONES para que el cliente elija; NINGUNA'} está en su pedido todavía. ${ctx.choiceNote} ` +
+							(singleOption
+								? 'Ofrécela en UNA frase de corrido (producto, presentación y precio), SIN lista ni número, y pregúntale si la quiere ("¿Le sirve?", "¿Se la agrego?"). NUNCA preguntes "cuál prefiere": no hay entre qué elegir. '
+								: 'Muestra la lista COMPLETA, numerada y en el MISMO orden, sin quitar ni agregar opciones, porque el cliente puede responder con el número. Cierra preguntando cuál prefiere, con una frase corta. ') +
+							'NO digas que agregaste o sumaste algo de esto, NO muestres resumen de pedido ni total, NO elijas por él ni recomiendes. ' +
+							'NO repitas la cantidad que pidió: ya la sabe.',
+					);
+				}
 				if (ctx.outOfStockProductName) {
 					parts.push(
 						`\nCRÍTICO: El cliente preguntó por "${ctx.outOfStockProductName}" pero NO está disponible. Aunque el mensaje del cliente contenga una cantidad, NO confirmes el pedido ni la cantidad. NO digas que sí lo tienes. Estructura del mensaje: (1) UNA frase corta y natural diciendo que no lo tienes — VARÍA la redacción cada vez (ej: "se nos agotó la...", "no la tenemos por ahora", "está agotada en este momento", "justo se nos terminó"); (2) introduce la lista de alternativas con una frase natural que, cuando el tipo sea claro, lo MENCIONE en plural (ej: "Estas son las mechas que tenemos disponibles:", "De ceras le puedo ofrecer:", "Le puedo ofrecer estas opciones:") — PROHIBIDO usar "Sí tenemos:" como introducción; (3) muestra la lista sin comentarios adicionales; (4) cierra con UNA pregunta corta variada (ej: "¿Le interesa alguna?", "¿Cuál le interesa?", "¿Le sirve alguna de estas?"). ANTI-REPETICIÓN: revisa tus mensajes anteriores del historial y NO repitas la misma frase de agotado, la misma introducción de lista ni la misma pregunta de cierre que ya usaste en esta conversación.`,
@@ -1637,7 +1682,7 @@ export class OpenAIService {
 					!(ctx.products.length === 1 && ctx.products[0].variants.length === 1)
 				) {
 					parts.push(
-						'\nIntroduce la lista con una frase MUY corta de máximo 4 palabras seguida de dos puntos, y luego la lista. Ejemplos: "Tenemos:", "Le puedo ofrecer:", "Tenemos disponible:", "Aquí van:". NO añadas explicaciones, contexto, ni texto adicional antes o después de la lista (evita frases como "que pueden interesarle para sus X", "Aquí le dejo las opciones disponibles", etc.).',
+						'\nIntroduce la lista con una frase MUY corta de máximo 4 palabras seguida de dos puntos, y luego la lista. Habla como vendedor de tienda, VARIANDO la frase: "Tenemos disponible:", "Le podemos ofrecer:", "Le puedo ofrecer:", "Contamos con:", "Tenemos estas opciones:". PROHIBIDO "Aquí van:" y "Aquí tiene:".NO añadas explicaciones, contexto, ni texto adicional antes o después de la lista (evita frases como "que pueden interesarle para sus X", "Aquí le dejo las opciones disponibles", etc.).',
 					);
 				}
 				// Nota: para un único producto con una sola variante NO se añade intro de lista
@@ -2082,7 +2127,8 @@ export class OpenAIService {
 			const hasCart = !!ctx.cart && ctx.cart.length > 0;
 			parts.push(
 				`\nEl cliente acaba de darte su nombre${firstName ? ` ("${firstName}")` : ''} y ciudad en respuesta a tu pregunta. ` +
-					`Agrádecele brevemente de forma natural${firstName ? ` usando su primer nombre (Sr./Sra.)` : ''}. ` +
+					`Agrádecele brevemente de forma natural${firstName ? ` usando su primer nombre (Sr./Sra.)` : ''}, en pocas palabras, como en una conversación real: ${firstName ? `"Gracias, ${firstName}.", "Mucho gusto, ${firstName}.", "Un gusto, ${firstName}."` : '"Gracias.", "Mucho gusto."'} o algo igual de corto, variándolo. ` +
+					'PROHIBIDO decir qué le agradeces: nada de "por compartir su nombre y ciudad", "por sus datos", "por la información" ni similares. ' +
 					'CRÍTICO: NO confirmes, agregues ni menciones cantidades, precios ni totales de ningún producto — en este turno NO se agregó nada al pedido. ' +
 					(hasCart
 						? `El cliente ya venía armando un PEDIDO. Cierra con UNA sola pregunta directa y clara de si necesita algo más, elegida entre estas variantes (sin combinarlas ni añadir "continuar con el pedido"): "¿Necesita algo más?", "¿Desea agregar algo más?", "¿Le agrego algo más?", "¿Algo más?". PROHIBIDO preguntas dobles o "¿En qué le puedo ayudar?".`

@@ -1,6 +1,10 @@
 import crypto from 'crypto';
 import { saveSession } from '../session.store';
-import { OpenAIService, OpenAIProduct } from '../openai.service';
+import {
+	OpenAIService,
+	OpenAIProduct,
+	OpenAIContext,
+} from '../openai.service';
 import { PaymentLinkService } from '../payment-link.service';
 import { ProductSearchService } from './product-search.service';
 import { FlowsService } from './flows.service';
@@ -27,6 +31,7 @@ import {
 	PendingPurchaseFlow,
 	PendingPresentationChoice,
 	PresentationOption,
+	ProductChoice,
 	UserSession,
 } from '../types';
 import { stripCallingCode, isFarewellOnly } from '../helpers/intent-detection';
@@ -35,6 +40,8 @@ import {
 	buildResumptionReply,
 	resolveVariant,
 	parseVariantWeightGrams,
+	presentationFormKeyword,
+	variantHasForm,
 	detectRequestedWeightGrams,
 	detectRequestedMeasure,
 	parseVariantMeasure,
@@ -51,6 +58,7 @@ import {
 	resolveWeightedPresentation,
 	WeightedPresentationResult,
 	PRESENTATION_AMBIGUITY_MIN_GRAMS,
+	Measure,
 } from '../helpers/product-helpers';
 import { addToCart } from '../helpers/cart-helpers';
 
@@ -279,12 +287,22 @@ export type IntentContext = {
 	/** Tema canónico de FAQ identificado por el NLU (ej. 'store_location'). El handler lo
 	 *  resuelve con un lookup determinístico por título en vez de fiarse del score semántico. */
 	aiFaqTopic?: string;
+	/** El cliente pregunta si existe una presentación de un tamaño ("¿no tienes de
+	 *  10 kg?"); no está pidiendo esa cantidad */
+	asksPresentation?: boolean;
 	/** Intención secundaria detectada en el mismo mensaje (multi-intent). El handler primario puede usarla para enriquecer la respuesta. */
 	secondaryIntent?: import('../openai.service').NLUIntent;
 	isFirstEverInteraction?: boolean;
 	knownCustomerName?: string;
 	/** true cuando el cliente es nuevo y aún no tenemos su nombre/ciudad: el cierre debe pedirlos. */
 	awaitingNameAndCity?: boolean;
+};
+
+/** Un ítem que acaba de entrar al pedido, para confirmarlo */
+type AddedEntry = {
+	product: ProductListEntry;
+	variant: ProductListEntry['variants'][0];
+	quantity: number;
 };
 
 export class IntentHandlerService {
@@ -468,9 +486,33 @@ export class IntentHandlerService {
 		);
 
 		const indexes = aiSelectionIndexes ?? [];
-		const selectedItems = indexes
-			.map(i => session.lastProductList?.[i - 1])
+		const list = session.lastProductList ?? [];
+		let selectedItems = indexes
+			.map(i => list[i - 1])
 			.filter((p): p is ProductListEntry => !!p);
+
+		// Un solo producto con sus presentaciones debajo ("1. Aceite de coco: 1 kg,
+		// 250 g, 20 ml"): el cliente cuenta las presentaciones, "la 2" es la de 250 g.
+		// Con varios productos, un número que no es de producto también se lee así.
+		// Antes respondía "Solo tengo 1 opción en la lista"
+		const flatList = list.flatMap(p =>
+			p.variants.map(v => ({ ...p, variants: [v] })),
+		);
+		const oneGroupedProduct = list.length === 1 && list[0].variants.length > 1;
+		const beyondProducts =
+			indexes.length > 0 && indexes.every(i => i > list.length);
+		if (
+			(oneGroupedProduct || beyondProducts) &&
+			flatList.length > list.length &&
+			indexes.length > 0 &&
+			indexes.every(i => i >= 1 && i <= flatList.length)
+		) {
+			// "La 1, la de 250 g": la presentación nombrada manda sobre el número
+			selectedItems =
+				aiVariantHint && oneGroupedProduct
+					? [list[0]]
+					: indexes.map(i => flatList[i - 1]);
+		}
 
 		if (selectedItems.length > 0) {
 			const currency =
@@ -555,6 +597,20 @@ export class IntentHandlerService {
 							variants: [best.variant],
 						};
 						await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
+						if (!stockExceeded) {
+							return this.confirmAddedToCart(
+								ctx,
+								[
+									{
+										product: best.product,
+										variant: best.variant,
+										quantity: cappedUnits,
+									},
+								],
+								currency,
+								secondaryCtx,
+							);
+						}
 						return this.openai
 							.generateReply({
 								userMessage: text,
@@ -572,6 +628,7 @@ export class IntentHandlerService {
 			let primaryItemQty: number | undefined;
 			let primaryRequestedQty: number | undefined;
 			let primaryCappedQty: number | undefined;
+			const addedEntries: AddedEntry[] = [];
 
 			for (let i = 0; i < selectedItems.length; i++) {
 				const item = selectedItems[i];
@@ -600,6 +657,7 @@ export class IntentHandlerService {
 					weightBasedQty ??
 					aiQuantities?.[i] ??
 					aiQuantity ??
+					this.takePendingChoiceQty(session, itemVariant) ??
 					(itemTotalQty === 1 ? 1 : undefined);
 
 				const cappedQty =
@@ -621,10 +679,27 @@ export class IntentHandlerService {
 				}
 				if (cappedQty && !stockExceededForItem) {
 					addToCart(session, item, cappedQty, currency, itemVariant);
+					if (itemVariant) {
+						addedEntries.push({
+							product: item,
+							variant: itemVariant,
+							quantity: cappedQty,
+						});
+					}
 				}
 			}
 
 			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
+
+			// Todo lo elegido entró: se confirma con el pedido completo, como al agregar
+			// directo. Antes era una frase aparte ("van 1 unidad… cada una")
+			if (
+				addedEntries.length > 0 &&
+				addedEntries.length === selectedItems.length &&
+				primaryRequestedQty === undefined
+			) {
+				return this.confirmAddedToCart(ctx, addedEntries, currency, secondaryCtx);
+			}
 			const selectedProductForReply = resolvedVariant
 				? { ...selectedItems[0], variants: [resolvedVariant] }
 				: selectedItems[0];
@@ -687,6 +762,10 @@ export class IntentHandlerService {
 			ctx.text,
 		);
 
+		// Lo que se le mostró antes de esta búsqueda, para preguntas como "¿no
+		// tienes de 10 kg?" que se refieren a eso
+		const previousList = session.lastProductList;
+		const previousSearchQuery = session.lastSearchQuery;
 		session.selectedProduct = undefined;
 		session.outOfStockRagProductName = undefined;
 		const result = await this.productSearchService.buildProductReply(
@@ -722,6 +801,24 @@ export class IntentHandlerService {
 		const requestedMeasureForAutoAdd =
 			requestedMeasureFromText ?? requestedMeasureFromHint;
 
+		// "¿No tienes de 10 kg?": pregunta si existe esa presentación. Tratarlo como
+		// pedido de 10 kg ofrecía 10 de 1 kg y nunca contestaba la pregunta
+		if (
+			ctx.asksPresentation &&
+			requestedMeasureForAutoAdd !== null &&
+			result.productFound &&
+			result.products.length >= 1
+		) {
+			const presentationReply = await this.answerPresentationQuestion(
+				ctx,
+				result.products,
+				requestedMeasureForAutoAdd,
+				currency,
+				{ list: previousList, searchQuery: previousSearchQuery },
+			);
+			if (presentationReply !== null) return presentationReply;
+		}
+
 		if (
 			(aiQuantity !== undefined || requestedMeasureForAutoAdd !== null) &&
 			result.products.length >= 1 &&
@@ -732,7 +829,52 @@ export class IntentHandlerService {
 			// TR-transparente y Triple Butter; ambos tienen bloque, pero si el primero NO
 			// tuviera esa presentación, saltamos al que sí. Evita agregar la variante
 			// equivocada de un producto que no tiene lo pedido.
-			let product = result.products[0];
+			// "Dos ceras APF" o "4 kilos de cera de palma" calzan con varios productos:
+			// se pregunta cuál en vez de tomar el primero de la búsqueda
+			const matchingProducts = aiSearchQuery
+				? result.products.filter(p => allHintWordsMatch(aiSearchQuery, p.name))
+				: [];
+			if (matchingProducts.length > 1) {
+				return this.askProductChoice(
+					session,
+					ctx,
+					this.productSearchService.buildProductChoice(
+						aiSearchQuery as string,
+						aiQuantity ?? 1,
+						matchingProducts,
+						requestedMeasureForAutoAdd,
+					),
+					currency,
+				);
+			}
+			let product = matchingProducts[0] ?? result.products[0];
+			// "Un bloque de white": si ninguna presentación se llama bloque, no se
+			// asume cuál es; se le muestran las que hay
+			const namedForm =
+				requestedMeasureForAutoAdd === null
+					? presentationFormKeyword(aiVariantHint ?? normalizedText)
+					: undefined;
+			if (
+				namedForm &&
+				!product.variants.some(v => variantHasForm(v.name, namedForm))
+			) {
+				const inStock = product.variants.filter(v => v.totalQty > 0);
+				if (inStock.length > 1) {
+					return this.askProductChoice(
+						session,
+						ctx,
+						{
+							...this.productSearchService.buildProductChoice(
+								aiSearchQuery ?? product.name,
+								aiQuantity ?? 1,
+								[product],
+							),
+							reason: `El cliente pidió "${namedForm}" y ninguna presentación de este producto se llama así. Díselo en una frase y ofrécele lo que hay.`,
+						},
+						currency,
+					);
+				}
+			}
 			if (aiVariantHint && requestedMeasureForAutoAdd === null) {
 				const hintNorm = normalizeText(aiVariantHint);
 				const satisfiesHint = (p: ProductListEntry) =>
@@ -760,10 +902,18 @@ export class IntentHandlerService {
 				const pref = classifyPresentationPreference(
 					aiVariantHint ?? normalizedText,
 				);
+				// "Bloque" o "caja" se buscan por el nombre de la presentación. Sin forma
+				// nombrada, lo grande es cualquier presentación de más de 1 kg
+				const form = presentationFormKeyword(aiVariantHint ?? normalizedText);
+				const isBulkVariant = (name: string) =>
+					form
+						? variantHasForm(name, form)
+						: (parseVariantWeightGrams(name) ?? 0) > 1000;
 				const wp = resolveWeightedPresentation(
 					product.variants,
 					requestedGrams,
 					pref,
+					form,
 				);
 				if (wp.mode === 'ambiguous') {
 					return this.askPresentationChoice(
@@ -783,9 +933,7 @@ export class IntentHandlerService {
 					isMass &&
 					(pref === 'bulk' ||
 						requestedGrams >= PRESENTATION_AMBIGUITY_MIN_GRAMS);
-				const inStockBulk = product.variants.some(
-					v => (parseVariantWeightGrams(v.name) ?? 0) > 1000,
-				);
+				const inStockBulk = product.variants.some(v => isBulkVariant(v.name));
 				const kiloVariant = product.variants.find(
 					v => parseVariantWeightGrams(v.name) === 1000,
 				);
@@ -798,7 +946,7 @@ export class IntentHandlerService {
 							stockIds,
 						);
 					const bulks = full
-						.filter(v => (parseVariantWeightGrams(v.name) ?? 0) > 1000)
+						.filter(v => isBulkVariant(v.name))
 						.sort(
 							(a, b) =>
 								(parseVariantWeightGrams(b.name) ?? 0) -
@@ -830,6 +978,21 @@ export class IntentHandlerService {
 					wp.mode === 'resolved'
 						? { variant: wp.variant, units: wp.units }
 						: resolveVariantByMeasure(product.variants, requestedMeasure);
+				// Ninguna presentación cubre lo pedido exacto ("medio litro" con solo
+				// 1 lt): no se redondea, se le muestran las que hay
+				if (!resolved && product.variants.some(v => v.totalQty > 0)) {
+					return this.askProductChoice(
+						session,
+						ctx,
+						this.productSearchService.buildProductChoice(
+							aiSearchQuery ?? product.name,
+							aiQuantity ?? 1,
+							[product],
+							requestedMeasure,
+						),
+						currency,
+					);
+				}
 				if (resolved) {
 					const cappedUnits = Math.min(
 						resolved.units,
@@ -1284,6 +1447,23 @@ export class IntentHandlerService {
 				);
 			}
 			await saveSession(ctx.botPhoneNumberId, phoneNumber, session);
+			if (
+				effectiveQtyAff &&
+				variantForStock &&
+				effectiveQtyAff <= variantForStock.totalQty
+			) {
+				return this.confirmAddedToCart(
+					ctx,
+					[
+						{
+							product: affirmationProduct,
+							variant: variantForStock,
+							quantity: effectiveQtyAff,
+						},
+					],
+					currency,
+				);
+			}
 			return this.openai
 				.generateReply({
 					userMessage: text,
@@ -1978,6 +2158,24 @@ export class IntentHandlerService {
 					currency,
 					sessionVariant,
 				);
+				const addedVariant =
+					sessionVariant ??
+					(selectedProductEntry.variants.length === 1
+						? selectedProductEntry.variants[0]
+						: undefined);
+				if (addedVariant) {
+					return this.confirmAddedToCart(
+						ctx,
+						[
+							{
+								product: selectedProductEntry,
+								variant: addedVariant,
+								quantity: cappedQtyFollowup,
+							},
+						],
+						currency,
+					);
+				}
 			}
 			return this.openai
 				.generateReply({
@@ -2248,6 +2446,18 @@ export class IntentHandlerService {
 				undefined,
 				undefined,
 				ctx.isFirstInteraction,
+			);
+		}
+
+		// Varios productos o presentaciones posibles al agregar: si fue la única
+		// instrucción, mostrar las opciones
+		const choiceResult = results.find(r => r.productChoice);
+		if (results.length === 1 && choiceResult?.productChoice) {
+			return this.askProductChoice(
+				session,
+				ctx,
+				choiceResult.productChoice,
+				currency,
 			);
 		}
 
@@ -2550,6 +2760,19 @@ export class IntentHandlerService {
 		let amount = change.quantity;
 		if (change.weightText) {
 			const conversion = this.weightToUnits(change.weightText, item);
+			// "Solo 2 kilos" sobre una caja de 10 kg: no calza con la presentación del
+			// carrito, pero puede calzar con otra del mismo producto (2 × 1 kg). Lo
+			// resuelve el cambio de presentación, que busca antes de tocar el carrito
+			if (conversion.mismatch && change.action === 'set') {
+				return {
+					change,
+					status: 'needs_search',
+					variantSwitch: true,
+					item,
+					itemLabel,
+					oldQuantity: item.quantity,
+				};
+			}
 			if (conversion.error) {
 				return {
 					change,
@@ -2848,6 +3071,14 @@ export class IntentHandlerService {
 			return;
 		}
 
+		// Varios productos o presentaciones posibles: el handler pregunta cuál
+		if (validAdded.length === 0 && outcome.productChoices.length > 0) {
+			result.productChoice = outcome.productChoices[0];
+			result.status = 'no_op';
+			result.note = `hay varias opciones de ${change.product}; pregunta cuál quiere`;
+			return;
+		}
+
 		if (validAdded.length > 0) {
 			const addedItem = validAdded[0];
 			const requested = change.quantity ?? 1;
@@ -2924,7 +3155,7 @@ export class IntentHandlerService {
 	): Promise<void> => {
 		const change = result.change;
 		const item = result.item;
-		if (!item || !change.variant) {
+		if (!item || (!change.variant && !change.weightText)) {
 			result.status = 'no_op';
 			result.note = 'no se pudo identificar la presentación pedida';
 			return;
@@ -2945,9 +3176,38 @@ export class IntentHandlerService {
 			return;
 		}
 
+		// Solo una cantidad ("solo 2 kilos"): la presentación que la cubre exacta,
+		// con la menor cantidad de unidades
+		if (!change.variant && change.weightText) {
+			const requested = detectRequestedMeasure(change.weightText);
+			const exact = requested
+				? product.variants.filter(v => {
+						const amount = variantAmountIn(v.name, requested.dimension);
+						return amount !== null && amount > 0 && requested.base % amount === 0;
+					})
+				: [];
+			const best =
+				requested && exact.length > 0
+					? resolveVariantByMeasure(exact, requested)
+					: null;
+			if (!best?.variant.price) {
+				const options = product.variants.map(v => v.name).filter(Boolean);
+				result.status = 'no_op';
+				result.note =
+					`${change.weightText} no calza con ninguna presentación de ${item.productName}` +
+					(options.length > 0
+						? `; presentaciones disponibles: ${options.join(', ')}`
+						: '');
+				return;
+			}
+			result.requestedQuantity = best.units;
+			change.variant = best.variant.name;
+		}
+		const variantText = change.variant as string;
+
 		// Variante pedida: primero por peso o volumen equivalente, luego por nombre
-		const wanted = parseVariantMeasure(change.variant);
-		const wantedNorm = normalizeText(change.variant);
+		const wanted = parseVariantMeasure(variantText);
+		const wantedNorm = normalizeText(variantText);
 		const resolved =
 			(wanted !== null
 				? product.variants.find(
@@ -2964,7 +3224,7 @@ export class IntentHandlerService {
 			const options = product.variants.map(v => v.name).filter(Boolean);
 			result.status = 'no_op';
 			result.note =
-				`no existe la presentación "${change.variant}" de ${item.productName}` +
+				`no existe la presentación "${variantText}" de ${item.productName}` +
 				(options.length > 0
 					? `; presentaciones disponibles: ${options.join(', ')}`
 					: '');
@@ -2990,7 +3250,9 @@ export class IntentHandlerService {
 		result.requestedQuantity = finalQty < targetQty ? targetQty : undefined;
 		result.availableStock =
 			finalQty < targetQty ? resolved.totalQty : undefined;
-		result.note = `cambió de presentación: antes ${cartItemLabel(item)}, ahora ${result.itemLabel}`;
+		// Sin "antes/ahora" ambiguo: el modelo leía la presentación anterior como algo
+		// que no se pudo agregar y cerraba preguntando por ella
+		result.note = `cambio de presentación APLICADO como pidió el cliente: ${cartItemLabel(item)} salió del pedido y lo reemplaza ${result.itemLabel}. No queda nada pendiente de esto`;
 		console.log(
 			`[WhatsApp Agent] Cart: variant switch ${cartItemLabel(item)} → ${finalQty}x ${result.itemLabel}`,
 		);
@@ -3015,6 +3277,11 @@ export class IntentHandlerService {
 				note = `CANTIDAD de ${ref}: ${result.oldQuantity} → ${result.newQuantity}`;
 			}
 			if (result.note) note += ` (${result.note})`;
+			// "60 ml" quedó como 3 × 20 ml: sin decirlo, el modelo no ve la relación y
+			// le decía al cliente que no había presentación de 60 ml
+			if (change.weightText && !result.removed) {
+				note += `. Es exactamente lo que pidió (${change.weightText}), ya resuelto: no hay nada pendiente`;
+			}
 			if (result.capped) {
 				note += `. STOCK INSUFICIENTE: pidió ${result.requestedQuantity ?? 'más'}, solo hay ${result.availableStock} — informa esto al cliente`;
 			}
@@ -3107,7 +3374,7 @@ export class IntentHandlerService {
 	private weightToUnits = (
 		weightText: string,
 		item: CartItem,
-	): { units?: number; error?: string } => {
+	): { units?: number; error?: string; mismatch?: boolean } => {
 		const requested = detectRequestedMeasure(weightText);
 		if (requested === null || requested.base <= 0) {
 			return { error: `no se entendió la cantidad "${weightText}"` };
@@ -3124,6 +3391,7 @@ export class IntentHandlerService {
 		}
 		if (requested.base % itemAmount !== 0) {
 			return {
+				mismatch: true,
 				error: `${weightText} no es múltiplo de la presentación de ${cartItemLabel(item)} (${itemAmount} ${MEASURE_BASE_LABEL[requested.dimension]} por unidad); propone la cantidad en unidades o la presentación que sí calce`,
 			};
 		}
@@ -3175,6 +3443,302 @@ export class IntentHandlerService {
 	});
 
 	/**
+	 * Muestra las opciones cuando lo pedido calza con varios productos o
+	 * presentaciones, y guarda la cantidad para aplicarla cuando el cliente elija.
+	 * Las opciones quedan como lista activa, así "la 2" o "la de soya" las resuelve
+	 * la selección normal. La respuesta la redacta el modelo con estos datos; el
+	 * texto fijo es solo el respaldo si la llamada falla
+	 */
+	private askProductChoice = async (
+		session: UserSession,
+		ctx: IntentContext,
+		choice: ProductChoice,
+		currency: string,
+		/** Lo que sí se agregó en este mismo mensaje, para confirmarlo antes de preguntar */
+		addedItems: CartItem[] = [],
+	): Promise<string> => {
+		session.lastProductList = choice.options;
+		session.pendingChoiceQty = {
+			quantity: choice.quantity,
+			measure: choice.measure,
+			variantIds: choice.options.map(o => o.variants[0].variantId),
+		};
+		await saveSession(ctx.botPhoneNumberId, ctx.phoneNumber, session);
+		console.log(
+			`[WhatsApp Agent] Asking product choice for "${choice.hint}" (${choice.options.length} options, qty ${choice.quantity}${choice.measure ? `, ${choice.measure.base} ${MEASURE_BASE_LABEL[choice.measure.dimension]}` : ''})`,
+		);
+
+		// Solo lo que sí entró en este mensaje: con notas de "agregado" el modelo
+		// confirma, y sin ellas no tiene nada que confirmar
+		const notes = addedItems.map(item => {
+			const name = item.variantName
+				? `${item.productName} ${item.variantName}`
+				: item.productName;
+			return `AGREGADO: ${item.quantity}x ${name}`;
+		});
+		const choiceNote =
+			(choice.reason ??
+				`Lo que pidió ("${choice.hint}") coincide con varias opciones y no dijo cuál.`) +
+			(notes.length > 0
+				? ' Primero confirma en una frase lo AGREGADO y luego muestra las opciones.'
+				: '');
+
+		const fallback = () => {
+			const lines = choice.options.map((o, i) => {
+				const v = o.variants[0];
+				const price = v.price ? ` – ${formatPrice(v.price, currency)}` : '';
+				return `${i + 1}. *${o.name}* ${v.name}${price}`;
+			});
+			const ask =
+				choice.quantity > 1
+					? `¿Cuál prefiere para las ${choice.quantity} unidades?`
+					: '¿Cuál prefiere?';
+			return `Tenemos estas opciones:\n\n${lines.join('\n')}\n\n${ask}`;
+		};
+
+		return this.openai
+			.generateReply({
+				userMessage: ctx.text,
+				products: choice.options,
+				currency,
+				editOutcomeNotes: notes.length > 0 ? notes : undefined,
+				choiceNote,
+				isFirstInteraction: ctx.isFirstInteraction,
+				knownCustomerName: ctx.knownCustomerName,
+				lastBotMessage: session.lastBotMessage,
+				conversationHistory: session.conversationHistory,
+			})
+			.catch(fallback);
+	};
+
+	/**
+	 * Responde si existe la presentación por la que pregunta el cliente ("¿no
+	 * tienes de 10 kg?"). Si la hay, se le ofrece para que la elija; si no, se le
+	 * dice y se le muestran las que sí hay. Nada se agrega al pedido. Devuelve
+	 * null cuando el flujo normal ya lo resuelve o no hay nada que ofrecer
+	 */
+	private answerPresentationQuestion = async (
+		ctx: IntentContext,
+		products: ProductListEntry[],
+		measure: Measure,
+		currency: string,
+		/** Lo que se le mostró en el turno anterior y con qué búsqueda */
+		previous: { list?: ProductListEntry[]; searchQuery?: string },
+	): Promise<string | null> => {
+		const { session, aiSearchQuery, aiVariantHint, normalizedText } = ctx;
+
+		// "¿No tienes de 10 kg?" sin nombrar producto habla de lo que se le acaba de
+		// mostrar. El NLU completa el producto desde el historial y a veces lo
+		// recorta ("cera" en vez de "cera apf") o elige uno solo de los mostrados
+		// Basta una palabra del producto en el mensaje para tomarlo como nombrado: el
+		// NLU puede completarlo ("parafina china") y no por eso viene del contexto
+		const namedInMessage =
+			!!aiSearchQuery &&
+			normalizeText(aiSearchQuery)
+				.split(/\s+/)
+				.some(w => w.length > 2 && allHintWordsMatch(w, normalizedText));
+		const fromContext =
+			!namedInMessage && (previous.list?.length ?? 0) > 0
+				? previous.list!.filter(
+						(p, i, all) => all.findIndex(o => o.productId === p.productId) === i,
+					)
+				: null;
+		const matching = aiSearchQuery
+			? products.filter(p => allHintWordsMatch(aiSearchQuery, p.name))
+			: [];
+		const candidates =
+			fromContext ?? (matching.length > 0 ? matching : [products[0]]);
+		// Del contexto, el nombre sale de lo mostrado y no del NLU, que lo recorta.
+		// La búsqueda anterior se conserva para la siguiente pregunta del mismo tipo
+		let hint: string;
+		if (fromContext) {
+			hint =
+				previous.searchQuery ??
+				(fromContext.length === 1
+					? fromContext[0].name
+					: 'los productos que se le acaban de mostrar');
+			session.lastSearchQuery = previous.searchQuery;
+		} else {
+			hint = aiSearchQuery ?? candidates[0].name;
+		}
+		const subject =
+			hint === 'los productos que se le acaban de mostrar' ? hint : `"${hint}"`;
+
+		// Todas las presentaciones de cada producto, no solo las que se mostraron
+		const stockIds =
+			ctx.countryInfo?.stockIds ?? session.lastCountryInfo?.stockIds ?? [];
+		const full: ProductListEntry[] = await Promise.all(
+			candidates.map(async p => ({
+				...p,
+				variants: await this.productSearchService.getVariantsWithStock(
+					p.productId,
+					stockIds,
+				),
+			})),
+		);
+
+		const form = presentationFormKeyword(aiVariantHint ?? normalizedText);
+		const hasSize = (name: string) =>
+			variantAmountIn(name, measure.dimension) === measure.base;
+		const sizeLabel = formatMeasureAmount(measure).replace(/^1 litros$/, '1 litro');
+
+		// Si antes pidió "dos ceras" y ahora pregunta por la de 10 kg, al elegir
+		// siguen siendo dos
+		const pending = session.pendingChoiceQty;
+		const quantity =
+			ctx.aiQuantity ?? (pending && !pending.measure ? pending.quantity : 1);
+
+		const sameSize = full.flatMap(p =>
+			p.variants
+				.filter(v => v.totalQty > 0 && v.price !== null && hasSize(v.name))
+				.map(v => ({ ...p, variants: [v] })),
+		);
+		// "Bloque de 10 kg": si ninguna de ese tamaño se llama bloque, el tamaño manda
+		const sameForm = form
+			? sameSize.filter(o => variantHasForm(o.variants[0].name, form))
+			: sameSize;
+		const available = sameForm.length > 0 ? sameForm : sameSize;
+		const label =
+			form && sameForm.length > 0 ? `${form} de ${sizeLabel}` : sizeLabel;
+
+		if (available.length > 0) {
+			console.log(
+				`[WhatsApp Agent] Presentation question: ${label} of "${hint}" → available (${available.length})`,
+			);
+			return this.askProductChoice(
+				session,
+				ctx,
+				{
+					hint,
+					quantity,
+					options: available.slice(0, 8),
+					reason: `El cliente preguntó si hay presentación de ${label} de ${subject}: SÍ la hay. Empieza respondiéndole que sí.`,
+				},
+				currency,
+			);
+		}
+
+		const inCatalog = full.some(p => p.variants.some(v => hasSize(v.name)));
+
+		// Un solo producto nombrado, bloque o caja agotado y hay kilo: el flujo de
+		// pedido ya dice que no está y ofrece armarlo de a kilo
+		if (
+			!fromContext &&
+			full.length === 1 &&
+			inCatalog &&
+			measure.dimension === 'mass' &&
+			measure.base >= PRESENTATION_AMBIGUITY_MIN_GRAMS &&
+			full[0].variants.some(
+				v => v.totalQty > 0 && parseVariantWeightGrams(v.name) === 1000,
+			)
+		) {
+			return null;
+		}
+
+		const others = this.productSearchService.buildProductChoice(
+			hint,
+			quantity,
+			full.map(p => ({
+				...p,
+				variants: p.variants.filter(v => v.price !== null),
+			})),
+		);
+		if (others.options.length === 0) return null;
+
+		console.log(
+			`[WhatsApp Agent] Presentation question: ${label} of "${hint}" → ${inCatalog ? 'out of stock' : 'not in catalog'}`,
+		);
+		return this.askProductChoice(
+			session,
+			ctx,
+			{
+				...others,
+				reason:
+					`El cliente preguntó si hay presentación de ${label} de ${subject}: ` +
+					(inCatalog
+						? 'esa presentación no la tenemos disponible en este momento. '
+						: 'no manejamos esa presentación. ') +
+					'Díselo claro en la primera frase y luego ofrécele las que sí hay.',
+			},
+			currency,
+		);
+	};
+
+	/**
+	 * Confirma lo que se acaba de agregar con el pedido completo, igual que al
+	 * agregar directo ("Le sumé… Su pedido queda así:"). La sesión ya debe tener
+	 * el carrito actualizado
+	 */
+	private confirmAddedToCart = (
+		ctx: IntentContext,
+		added: AddedEntry[],
+		currency: string,
+		extra: Partial<OpenAIContext> = {},
+	): Promise<string> => {
+		const { session } = ctx;
+		const notes = added.map(({ product, variant, quantity }) => {
+			const label = variant.name ? `${product.name} ${variant.name}` : product.name;
+			const lineTotal = variant.price
+				? ` = ${formatPrice(String(Number(variant.price) * quantity), currency)}`
+				: '';
+			return `AGREGADO: ${quantity}x ${label}${lineTotal}`;
+		});
+		const fallback = () => {
+			const cart = session.cart ?? [];
+			const lines = cart.map(item => {
+				const name = item.variantName
+					? `${item.productName} ${item.variantName}`
+					: item.productName;
+				const total = item.unitPrice
+					? ` = ${formatPrice(String(Number(item.unitPrice) * item.quantity), item.currency)}`
+					: '';
+				return `- ${item.quantity}x ${name}${total}`;
+			});
+			const total = cart.reduce(
+				(sum, item) =>
+					sum + (item.unitPrice ? Number(item.unitPrice) * item.quantity : 0),
+				0,
+			);
+			return `Listo. Su pedido queda así:\n\n${lines.join('\n')}\n\nTotal: ${formatPrice(String(total), currency)}\n\n¿Le agrego algo más?`;
+		};
+		return this.openai
+			.generateReply({
+				userMessage: ctx.text,
+				intent: 'edit_cart',
+				cart: session.cart,
+				currency,
+				editOutcomeNotes: notes,
+				isFirstInteraction: ctx.isFirstInteraction,
+				knownCustomerName: ctx.knownCustomerName,
+				askNameAndCity: ctx.awaitingNameAndCity,
+				lastBotMessage: session.lastBotMessage,
+				conversationHistory: session.conversationHistory,
+				...extra,
+			})
+			.catch(fallback);
+	};
+
+	/** La cantidad pedida antes de mostrar opciones, si lo elegido es una de ellas. Se usa una sola vez */
+	private takePendingChoiceQty = (
+		session: UserSession,
+		variant: ProductListEntry['variants'][0] | undefined,
+	): number | undefined => {
+		const pending = session.pendingChoiceQty;
+		if (!pending || !variant) return undefined;
+		session.pendingChoiceQty = null;
+		if (!pending.variantIds.includes(variant.variantId)) return undefined;
+
+		// "4 kilos" y eligió la de 1 kg: 4 unidades
+		if (pending.measure) {
+			const amount = variantAmountIn(variant.name, pending.measure.dimension);
+			if (amount && pending.measure.base % amount === 0) {
+				return pending.measure.base / amount;
+			}
+		}
+		return pending.quantity;
+	};
+
+	/**
 	 * Guarda en sesión una elección de presentación pendiente (kilos sueltos vs
 	 * bloque/caja) y devuelve la pregunta al cliente. La respuesta del cliente se
 	 * resuelve en el siguiente turno vía resolvePendingPresentationChoice.
@@ -3213,8 +3777,17 @@ export class IntentHandlerService {
 		};
 		const lines = [
 			lineFor(choice.kilo, 'en kilos sueltos'),
+			// La forma sale del nombre: una presentación grande no es un bloque
+			// si el catálogo no la llama así
 			...choice.bulk.map(b =>
-				lineFor(b, /caja/i.test(b.variantName) ? 'en caja' : 'en bloque'),
+				lineFor(
+					b,
+					variantHasForm(b.variantName, 'caja')
+						? 'en caja'
+						: variantHasForm(b.variantName, 'bloque')
+							? 'en bloque'
+							: `en presentación de ${b.variantName}`,
+				),
 			),
 		].join('\n');
 		return (
@@ -3487,7 +4060,21 @@ export class IntentHandlerService {
 	private handleIntentRequestQuote = async (
 		ctx: IntentContext,
 	): Promise<string> => {
-		const { session, phoneNumber, text, countryInfo, aiProductList } = ctx;
+		const { session, phoneNumber, text, countryInfo, aiSearchQuery } = ctx;
+		// "Cotízame cera apf": a veces el NLU trae el producto en searchQuery y no
+		// en productList. Sin esto respondía "¿Qué le gustaría cotizar?"
+		const aiProductList =
+			ctx.aiProductList && ctx.aiProductList.length > 0
+				? ctx.aiProductList
+				: aiSearchQuery
+					? [
+							{
+								productHint: aiSearchQuery,
+								quantity: ctx.aiQuantity ?? 1,
+								variantHint: ctx.aiVariantHint,
+							},
+						]
+					: undefined;
 
 		let outOfStockFromList: string[] = [];
 		let outOfStockDetailsFromList: Array<{
@@ -3551,6 +4138,17 @@ export class IntentHandlerService {
 					choice.ambiguous,
 					currency,
 					'add',
+				);
+			}
+
+			// Varios productos o presentaciones posibles: preguntar antes de cotizar
+			if (listResult.productChoices.length > 0) {
+				return this.askProductChoice(
+					session,
+					ctx,
+					listResult.productChoices[0],
+					currency,
+					session.cart ?? [],
 				);
 			}
 		} else if (aiProductList && aiProductList.length > 0 && cartHasItems) {
@@ -3733,6 +4331,8 @@ export class IntentHandlerService {
 		}
 		const currency =
 			session.lastCountryInfo?.currency ?? countryInfo?.currency ?? 'USD';
+		// Para confirmar solo lo que se agregó en este mensaje, no lo que ya había
+		const cartBefore = new Set(session.cart ?? []);
 		const result = await this.productSearchService.processProductListItems(
 			productList,
 			session,
@@ -3791,6 +4391,18 @@ export class IntentHandlerService {
 				return `Le agregué:\n${addedLines}\n\n${question}`;
 			}
 			return question;
+		}
+
+		// Varios productos o presentaciones posibles: preguntar cuál. Lo demás ya
+		// quedó en el carrito y se lista antes de la pregunta
+		if (result.productChoices.length > 0) {
+			return this.askProductChoice(
+				session,
+				ctx,
+				result.productChoices[0],
+				currency,
+				(session.cart ?? []).filter(item => !cartBefore.has(item)),
+			);
 		}
 
 		if (!session.cart || session.cart.length === 0) {
